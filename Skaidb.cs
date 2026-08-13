@@ -46,6 +46,15 @@ public enum SkaidbConsistency : byte
 }
 
 /// <summary>Thrown on any driver or server-reported error.</summary>
+/// <summary>
+/// Statement kind the server declines to prepare (DDL, session statements).
+/// Not an error — the caller falls back to client-side text binding.
+/// </summary>
+public sealed class UnpreparableException : SkaidbException
+{
+    public UnpreparableException(string message) : base(message) { }
+}
+
 public class SkaidbException : Exception
 {
     public SkaidbException(string message) : base(message) { }
@@ -74,6 +83,7 @@ public sealed class SkaidbConnection : IDisposable
     private bool _open;
     private bool _disposed;
     private readonly object _lock = new();
+    private readonly Dictionary<string, (uint Id, int Params)> _prepared = new();
 
     private static int _nonceCounter;
 
@@ -493,11 +503,189 @@ public sealed class SkaidbConnection : IDisposable
         w.U8((byte)consistency);  // consistency
         w.U32((uint)sqlBytes.Length); // sql_len, LITTLE-endian
         w.Raw(sqlBytes);
+        return Roundtrip(w.ToArray());
+    }
+
+    /// <summary>
+    /// Prepare <paramref name="sql"/> on the SERVER, returning
+    /// (statementId, paramCount). Cached per connection — a prepared id is
+    /// only meaningful on the connection that created it. Throws
+    /// <see cref="UnpreparableException"/> for statement kinds the server
+    /// declines (DDL, session statements).
+    /// </summary>
+    internal (uint Id, int Params) PrepareServer(string sql)
+    {
+        if (_prepared.TryGetValue(sql, out var hit)) return hit;
+        if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
+        if (!_open) throw new SkaidbException("connection is not open");
+
+        byte[] sqlBytes = Encoding.UTF8.GetBytes(sql);
+        var w = new BinWriter();
+        w.U8(2);                          // OP_PREPARE
+        w.U32((uint)sqlBytes.Length);
+        w.Raw(sqlBytes);
 
         BinReader r;
         lock (_lock)
         {
             WriteFrame(w.ToArray());
+            r = new BinReader(ReadFrame());
+        }
+        byte tag = r.U8();
+        if (tag == 4)
+        {
+            uint id = r.U32();
+            int n = r.U16();
+            var v = (id, n);
+            if (_prepared.Count < 240) _prepared[sql] = v;
+            return v;
+        }
+        if (tag == 3) throw new UnpreparableException(r.Text());
+        throw new SkaidbException($"unexpected prepare response tag {tag}");
+    }
+
+    /// <summary>
+    /// Execute a prepared statement with TYPED parameters — the only way to
+    /// send an array or a document, neither of which has a SQL literal form.
+    /// </summary>
+    internal QueryResult ExecutePrepared(uint id, IReadOnlyList<object?> parameters,
+                                         SkaidbConsistency consistency)
+    {
+        var w = new BinWriter();
+        w.U8(3);                          // OP_EXECUTE
+        w.U8((byte)consistency);
+        w.U32(id);
+        w.U16((ushort)parameters.Count);
+        foreach (var p in parameters)
+        {
+            byte[] v = EncodeValue(p);
+            w.U32((uint)v.Length);
+            w.Raw(v);
+        }
+        return Roundtrip(w.ToArray());
+    }
+
+    /// <summary>
+    /// Execute a prepared statement once per row in ONE round-trip. Rows
+    /// autocommit individually: a failure names the row and earlier rows stay
+    /// applied, so the statement must be idempotent.
+    /// </summary>
+    internal QueryResult ExecuteBatch(uint id, IReadOnlyList<IReadOnlyList<object?>> rows,
+                                      SkaidbConsistency consistency)
+    {
+        var w = new BinWriter();
+        w.U8(7);                          // OP_EXECUTE_BATCH
+        w.U8((byte)consistency);
+        w.U32(id);
+        w.U32((uint)rows.Count);
+        foreach (var parameters in rows)
+        {
+            w.U16((ushort)parameters.Count);
+            foreach (var p in parameters)
+            {
+                byte[] v = EncodeValue(p);
+                w.U32((uint)v.Length);
+                w.Raw(v);
+            }
+        }
+        return Roundtrip(w.ToArray());
+    }
+
+    /// <summary>
+    /// Encode a value as a TYPED skaidb value (tag + payload) — the inverse
+    /// of DecodeValue. Enumerables become Array, dictionaries become
+    /// Document, nested arbitrarily.
+    /// </summary>
+    internal static byte[] EncodeValue(object? v)
+    {
+        var w = new BinWriter();
+        EncodeInto(v, w);
+        return w.ToArray();
+    }
+
+    private static void EncodeInto(object? v, BinWriter w)
+    {
+        switch (v)
+        {
+            case null:
+            case DBNull:
+                w.U8(0);
+                return;
+            case bool b:
+                w.U8(1); w.U8((byte)(b ? 1 : 0));
+                return;
+            case sbyte or byte or short or ushort or int or uint or long:
+                w.U8(2); w.I64(Convert.ToInt64(v, CultureInfo.InvariantCulture));
+                return;
+            case float or double:
+            {
+                double d = Convert.ToDouble(v, CultureInfo.InvariantCulture);
+                if (double.IsNaN(d) || double.IsInfinity(d))
+                    throw new SkaidbException("cannot bind NaN/Infinity");
+                w.U8(3); w.I64(BitConverter.DoubleToInt64Bits(d));
+                return;
+            }
+            case string str:
+            {
+                byte[] b = Encoding.UTF8.GetBytes(str);
+                w.U8(5); w.U32((uint)b.Length); w.Raw(b);
+                return;
+            }
+            case byte[] raw:
+                w.U8(6); w.U32((uint)raw.Length); w.Raw(raw);
+                return;
+            case Guid g:
+            {
+                // Canonical big-endian byte order, matching the decoder.
+                byte[] le = g.ToByteArray();
+                byte[] be = new byte[16];
+                be[0] = le[3]; be[1] = le[2]; be[2] = le[1]; be[3] = le[0];
+                be[4] = le[5]; be[5] = le[4];
+                be[6] = le[7]; be[7] = le[6];
+                Array.Copy(le, 8, be, 8, 8);
+                w.U8(7); w.Raw(be);
+                return;
+            }
+            case DateTimeOffset dto:
+                w.U8(8); w.I64(dto.ToUnixTimeMilliseconds());
+                return;
+            case DateTime dt:
+                w.U8(8); w.I64(new DateTimeOffset(dt.ToUniversalTime()).ToUnixTimeMilliseconds());
+                return;
+            case System.Collections.IDictionary map:
+            {
+                w.U8(10); w.U32((uint)map.Count);
+                foreach (System.Collections.DictionaryEntry e in map)
+                {
+                    if (e.Key is not string ks)
+                        throw new SkaidbException("document keys must be strings");
+                    byte[] kb = Encoding.UTF8.GetBytes(ks);
+                    w.U32((uint)kb.Length); w.Raw(kb);
+                    EncodeInto(e.Value, w);
+                }
+                return;
+            }
+            case System.Collections.IEnumerable seq:
+            {
+                var items = new List<object?>();
+                foreach (var item in seq) items.Add(item);
+                w.U8(9); w.U32((uint)items.Count);
+                foreach (var item in items) EncodeInto(item, w);
+                return;
+            }
+        }
+        throw new SkaidbException($"cannot bind value of type {v.GetType().Name}");
+    }
+
+    private QueryResult Roundtrip(byte[] request)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
+        if (!_open) throw new SkaidbException("connection is not open");
+
+        BinReader r;
+        lock (_lock)
+        {
+            WriteFrame(request);
             r = new BinReader(ReadFrame());
         }
 
@@ -750,8 +938,44 @@ public sealed class SkaidbCommand : IDisposable
 
     private QueryResult Run()
     {
+        // Server-side prepare so parameters travel as TYPED values; arrays
+        // and documents have no SQL literal form and cannot be interpolated.
+        if (Parameters.Count > 0)
+        {
+            try
+            {
+                var (id, n) = _connection.PrepareServer(CommandText);
+                if (n != Parameters.Count)
+                    throw new SkaidbException(
+                        $"statement expects {n} parameters, got {Parameters.Count}");
+                return _connection.ExecutePrepared(id, Parameters, Consistency);
+            }
+            catch (UnpreparableException)
+            {
+                // Statement kind the server will not prepare: fall back to
+                // client-side text binding.
+            }
+        }
         string sql = ParameterBinder.Bind(CommandText, Parameters);
         return _connection.Query(sql, Consistency);
+    }
+
+    /// <summary>
+    /// Execute this statement once per row in ONE round-trip. Rows autocommit
+    /// individually: a failure names the row and earlier rows stay applied,
+    /// so the statement must be idempotent. Returns total affected rows.
+    /// </summary>
+    public long ExecuteBatch(IReadOnlyList<IReadOnlyList<object?>> rows)
+    {
+        if (rows.Count == 0) return 0;
+        var (id, n) = _connection.PrepareServer(CommandText);
+        foreach (var r in rows)
+        {
+            if (r.Count != n)
+                throw new SkaidbException($"batch row expects {n} parameters, got {r.Count}");
+        }
+        var result = _connection.ExecuteBatch(id, rows, Consistency);
+        return result.Kind == QueryResultKind.Mutation ? (long)result.Affected : 0;
     }
 
     public void Dispose() { /* nothing owned */ }
@@ -1041,6 +1265,7 @@ internal sealed class BinReader
         return _buf[_pos++];
     }
 
+    public ushort U16() => BinaryPrimitives.ReadUInt16LittleEndian(Span(2));
     public uint U32() => BinaryPrimitives.ReadUInt32LittleEndian(Span(4));
     public long I64() => BinaryPrimitives.ReadInt64LittleEndian(Span(8));
     public ulong U64() => BinaryPrimitives.ReadUInt64LittleEndian(Span(8));
@@ -1054,6 +1279,20 @@ internal sealed class BinWriter
     private readonly List<byte> _buf = new();
 
     public void U8(byte b) => _buf.Add(b);
+
+    public void U16(ushort v)
+    {
+        Span<byte> tmp = stackalloc byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(tmp, v);
+        _buf.AddRange(tmp.ToArray());
+    }
+
+    public void I64(long v)
+    {
+        Span<byte> tmp = stackalloc byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(tmp, v);
+        _buf.AddRange(tmp.ToArray());
+    }
 
     public void U32(uint v)
     {
