@@ -102,7 +102,7 @@ public sealed class SkaidbConnection : IDisposable
         TimeSpan? timeout = null;
         string database = "";
         bool tls = false, tlsInsecure = false;
-        string tlsCa = "", tlsServerName = "skaidb";
+        string tlsCa = "", tlsServerName = "skaidb", seeds = "";
 
         foreach (var rawPart in connectionString.Split(';'))
         {
@@ -156,6 +156,9 @@ public sealed class SkaidbConnection : IDisposable
                 case "tls server name":
                     tlsServerName = val;
                     break;
+                case "seeds":
+                    seeds = val;
+                    break;
                 case "timeout":
                 case "connecttimeout":
                 case "connect timeout":
@@ -175,6 +178,9 @@ public sealed class SkaidbConnection : IDisposable
         TlsCa = tlsCa;
         TlsInsecure = tlsInsecure;
         TlsServerName = tlsServerName;
+        Seeds = seeds.Length > 0
+            ? seeds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : new[] { $"{host}:{port}" };
         User = user;
         _password = password;
         Consistency = consistency;
@@ -204,7 +210,14 @@ public sealed class SkaidbConnection : IDisposable
         TlsCa = tlsCa;
         TlsInsecure = tlsInsecure;
         TlsServerName = tlsServerName;
+        Seeds = new[] { $"{host}:{port}" };
     }
+
+    /// <summary>
+    /// Endpoints to try, in shuffled order, until one connects. skaidb is
+    /// leaderless, so any node serves — there is no primary to discover.
+    /// </summary>
+    public IReadOnlyList<string> Seeds { get; } = Array.Empty<string>();
 
     /// <summary>Session database, selected with USE right after connecting.</summary>
     public string Database { get; } = "";
@@ -246,16 +259,41 @@ public sealed class SkaidbConnection : IDisposable
 
         try
         {
-            var tcp = new TcpClient { NoDelay = true };
-            tcp.SendTimeout = (int)Timeout.TotalMilliseconds;
-            tcp.ReceiveTimeout = (int)Timeout.TotalMilliseconds;
-            // Connect with timeout.
-            var connectTask = tcp.ConnectAsync(Host, Port);
-            if (!connectTask.Wait(Timeout))
+            // Try each seed until one connects; a dead node must not swallow
+            // the attempt.
+            var order = new List<string>(Seeds);
+            var rng = new Random();
+            for (int i = order.Count - 1; i > 0; i--)
             {
-                tcp.Dispose();
-                throw new SkaidbException($"connect to {Host}:{Port} timed out");
+                int j = rng.Next(i + 1);
+                (order[i], order[j]) = (order[j], order[i]);
             }
+            TcpClient? tcp = null;
+            Exception? last = null;
+            foreach (var ep in order)
+            {
+                int c = ep.LastIndexOf(':');
+                string h = c > 0 ? ep.Substring(0, c) : ep;
+                int p = c > 0 ? int.Parse(ep.Substring(c + 1), CultureInfo.InvariantCulture) : 7000;
+                var candidate = new TcpClient { NoDelay = true };
+                candidate.SendTimeout = (int)Timeout.TotalMilliseconds;
+                candidate.ReceiveTimeout = (int)Timeout.TotalMilliseconds;
+                try
+                {
+                    var t = candidate.ConnectAsync(h, p);
+                    if (!t.Wait(Timeout)) throw new SkaidbException($"connect to {ep} timed out");
+                    tcp = candidate;
+                    break;
+                }
+                catch (Exception e)
+                {
+                    last = e;
+                    candidate.Dispose();
+                }
+            }
+            if (tcp is null)
+                throw new SkaidbException(
+                    $"no reachable endpoint in {string.Join(", ", order)}: {last?.Message}", last);
             tcp.NoDelay = true;
             var stream = tcp.GetStream();
             stream.ReadTimeout = (int)Timeout.TotalMilliseconds;

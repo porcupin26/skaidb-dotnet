@@ -77,6 +77,14 @@ Parsed case-insensitively; `;`-separated `Key=Value` pairs:
 | `Consistency` | | `Quorum` |
 | `Timeout` | `Connect Timeout` | `10` (seconds) |
 
+### Failover
+
+```csharp
+new SkaidbConnection("User=u;Password=p;Seeds=db1:7000,db2:7000");
+```
+
+Tried in shuffled order until one connects.
+
 ### TLS and database
 
 ```csharp
