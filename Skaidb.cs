@@ -26,9 +26,12 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Numerics;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 
@@ -67,7 +70,7 @@ public sealed class SkaidbConnection : IDisposable
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(10);
 
     private TcpClient? _tcp;
-    private NetworkStream? _stream;
+    private Stream? _stream;
     private bool _open;
     private bool _disposed;
     private readonly object _lock = new();
@@ -87,6 +90,9 @@ public sealed class SkaidbConnection : IDisposable
         string password = "";
         SkaidbConsistency consistency = SkaidbConsistency.Quorum;
         TimeSpan? timeout = null;
+        string database = "";
+        bool tls = false, tlsInsecure = false;
+        string tlsCa = "", tlsServerName = "skaidb";
 
         foreach (var rawPart in connectionString.Split(';'))
         {
@@ -121,6 +127,25 @@ public sealed class SkaidbConnection : IDisposable
                 case "consistency":
                     consistency = ParseConsistency(val);
                     break;
+                case "database":
+                case "db":
+                    database = val;
+                    break;
+                case "tls":
+                    tls = val.Equals("true", StringComparison.OrdinalIgnoreCase) || val == "1";
+                    break;
+                case "tlsca":
+                case "tls ca":
+                    tlsCa = val;
+                    break;
+                case "tlsinsecure":
+                case "tls insecure":
+                    tlsInsecure = val.Equals("true", StringComparison.OrdinalIgnoreCase) || val == "1";
+                    break;
+                case "tlsservername":
+                case "tls server name":
+                    tlsServerName = val;
+                    break;
                 case "timeout":
                 case "connecttimeout":
                 case "connect timeout":
@@ -133,6 +158,13 @@ public sealed class SkaidbConnection : IDisposable
 
         Host = host;
         Port = port;
+        Database = database;
+        // A server with client_tls = required refuses plaintext outright, so
+        // without TLS such a cluster is unreachable. Any knob turns it on.
+        Tls = tls || tlsCa.Length > 0 || tlsInsecure;
+        TlsCa = tlsCa;
+        TlsInsecure = tlsInsecure;
+        TlsServerName = tlsServerName;
         User = user;
         _password = password;
         Consistency = consistency;
@@ -145,14 +177,35 @@ public sealed class SkaidbConnection : IDisposable
         int port = 7000,
         string user = "anonymous",
         string password = "",
-        SkaidbConsistency consistency = SkaidbConsistency.Quorum)
+        SkaidbConsistency consistency = SkaidbConsistency.Quorum,
+        string database = "",
+        bool tls = false,
+        string tlsCa = "",
+        bool tlsInsecure = false,
+        string tlsServerName = "skaidb")
     {
         Host = host;
         Port = port;
         User = user;
         _password = password;
         Consistency = consistency;
+        Database = database;
+        Tls = tls || tlsCa.Length > 0 || tlsInsecure;
+        TlsCa = tlsCa;
+        TlsInsecure = tlsInsecure;
+        TlsServerName = tlsServerName;
     }
+
+    /// <summary>Session database, selected with USE right after connecting.</summary>
+    public string Database { get; } = "";
+    /// <summary>Whether to wrap the connection in TLS.</summary>
+    public bool Tls { get; }
+    /// <summary>PEM CA bundle used to verify the server certificate.</summary>
+    public string TlsCa { get; } = "";
+    /// <summary>Encrypt without verifying the certificate. Development only.</summary>
+    public bool TlsInsecure { get; }
+    /// <summary>SNI name; must match a SAN on the server certificate.</summary>
+    public string TlsServerName { get; } = "skaidb";
 
     private static SkaidbConsistency ParseConsistency(string value)
     {
@@ -199,9 +252,16 @@ public sealed class SkaidbConnection : IDisposable
             stream.WriteTimeout = (int)Timeout.TotalMilliseconds;
 
             _tcp = tcp;
-            _stream = stream;
+            _stream = Tls ? TlsWrap(stream) : stream;
             Handshake(User, _password);
             _open = true;
+            // USE is per-connection session state, so it runs on every open.
+            if (Database.Length > 0)
+            {
+                using var use = CreateCommand();
+                use.CommandText = "USE \"" + Database.Replace("\"", "\"\"") + "\"";
+                use.ExecuteNonQuery();
+            }
         }
         catch (SkaidbException)
         {
@@ -213,6 +273,43 @@ public sealed class SkaidbConnection : IDisposable
             CleanupSocket();
             throw new SkaidbException($"connect failed: {e.Message}", e);
         }
+    }
+
+    /// <summary>
+    /// Upgrade a connected stream to TLS. The SNI/verified name must match a
+    /// SAN on the server certificate — skaidb's own certs carry DNS:skaidb,
+    /// which is usually NOT the address dialled, hence the separate knob.
+    /// </summary>
+    private Stream TlsWrap(NetworkStream raw)
+    {
+        RemoteCertificateValidationCallback? cb = null;
+        X509Certificate2Collection? extra = null;
+        if (TlsInsecure)
+        {
+            // Encrypts, but authenticates nothing: a man in the middle can
+            // present any certificate. Development only.
+            cb = (_, _, _, _) => true;
+        }
+        else if (TlsCa.Length > 0)
+        {
+            extra = new X509Certificate2Collection();
+            extra.ImportFromPemFile(TlsCa);
+            cb = (_, cert, chain, errors) =>
+            {
+                if (errors == SslPolicyErrors.None) return true;
+                if (cert is null) return false;
+                // Verify against the supplied CA bundle rather than the
+                // machine store, which will not contain a private CA.
+                var v = new X509Chain();
+                v.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                v.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                foreach (var c in extra) v.ChainPolicy.CustomTrustStore.Add(c);
+                return v.Build(new X509Certificate2(cert));
+            };
+        }
+        var ssl = new SslStream(raw, leaveInnerStreamOpen: false, cb);
+        ssl.AuthenticateAsClient(TlsServerName);
+        return ssl;
     }
 
     private void CleanupSocket()

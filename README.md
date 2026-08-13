@@ -77,7 +77,19 @@ Parsed case-insensitively; `;`-separated `Key=Value` pairs:
 | `Consistency` | | `Quorum` |
 | `Timeout` | `Connect Timeout` | `10` (seconds) |
 
-### Consistency
+### TLS and database
+
+```csharp
+using var conn = new SkaidbConnection(
+    "Host=db1;Port=7000;User=u;Password=p;Database=app;TlsCa=/etc/skaidb/skai-ca.crt");
+// dev only, encrypts without authenticating:  ...;TlsInsecure=true
+```
+
+A server with `client_tls = required` refuses plaintext, so one of the TLS
+keys is mandatory there. `TlsServerName` (default `skaidb`) must match a SAN
+on the server certificate — usually *not* the address you dialled.
+
+## Consistency
 
 skaidb is leaderless with tunable consistency. Default is `Quorum`:
 
