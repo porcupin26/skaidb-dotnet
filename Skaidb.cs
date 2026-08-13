@@ -292,8 +292,12 @@ public sealed class SkaidbConnection : IDisposable
                 }
             }
             if (tcp is null)
-                throw new SkaidbException(
-                    $"no reachable endpoint in {string.Join(", ", order)}: {last?.Message}", last);
+            {
+                string where = $"no reachable endpoint in {string.Join(", ", order)}";
+                throw last is null
+                    ? new SkaidbException(where)
+                    : new SkaidbException($"{where}: {last.Message}", last);
+            }
             tcp.NoDelay = true;
             var stream = tcp.GetStream();
             stream.ReadTimeout = (int)Timeout.TotalMilliseconds;
@@ -543,6 +547,90 @@ public sealed class SkaidbConnection : IDisposable
         w.Raw(sqlBytes);
         return Roundtrip(w.ToArray());
     }
+
+    /// <summary>
+    /// Stream a result set: rows arrive a chunk at a time instead of the
+    /// whole set being materialised. For exports and large scans.
+    /// <code>
+    /// foreach (var row in conn.Stream("SELECT ...")) { ... }
+    /// </code>
+    /// The connection is busy until the stream ends; abandoning the
+    /// enumeration drains the remaining frames so the connection stays
+    /// usable. Takes no parameters — the opcode carries SQL text.
+    /// </summary>
+    public IEnumerable<object?[]> Stream(string sql, SkaidbConsistency? consistency = null)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
+        if (!_open) throw new SkaidbException("connection is not open");
+
+        byte[] sqlBytes = Encoding.UTF8.GetBytes(sql);
+        var w = new BinWriter();
+        w.U8(5);                                    // OP_QUERY_STREAM
+        w.U8((byte)(consistency ?? Consistency));
+        w.U32((uint)sqlBytes.Length);
+        w.Raw(sqlBytes);
+
+        BinReader first;
+        lock (_lock)
+        {
+            WriteFrame(w.ToArray());
+            first = new BinReader(ReadFrame());
+        }
+        byte tag = first.U8();
+        if (tag == 3)
+        {
+            string msg = first.Text();
+            throw new SkaidbException(msg.Contains("unknown opcode")
+                ? $"server does not support streaming: {msg}" : msg);
+        }
+        if (tag == 1 || tag == 2) yield break;      // not row-producing
+        if (tag != 5) throw new SkaidbException($"unexpected response tag {tag} to stream request");
+        uint ncols = first.U32();
+        var columns = new string[ncols];
+        for (int i = 0; i < ncols; i++) columns[i] = first.Text();
+        StreamColumns = columns;
+
+        bool live = true;
+        try
+        {
+            while (live)
+            {
+                BinReader r;
+                lock (_lock) { r = new BinReader(ReadFrame()); }
+                byte t = r.U8();
+                if (t == 6)
+                {
+                    uint n = r.U32();
+                    for (int i = 0; i < n; i++)
+                    {
+                        uint ncells = r.U32();
+                        var row = new object?[ncells];
+                        for (int c = 0; c < ncells; c++)
+                            row[c] = DecodeValue(new BinReader(r.Blob()));
+                        yield return row;
+                    }
+                }
+                else if (t == 7) { live = false; }
+                else if (t == 3) { live = false; throw new SkaidbException(r.Text()); }
+                else { live = false; throw new SkaidbException($"unexpected frame tag {t} in stream"); }
+            }
+        }
+        finally
+        {
+            // Abandoned early: drain so leftovers are not read as the reply
+            // to the next statement on this connection.
+            while (live)
+            {
+                BinReader r;
+                lock (_lock) { r = new BinReader(ReadFrame()); }
+                byte t = r.U8();
+                if (t == 7 || t == 3) live = false;
+            }
+        }
+    }
+
+    /// <summary>Column names of the most recent <see cref="Stream"/> call.</summary>
+    public IReadOnlyList<string> StreamColumns { get; private set; } = Array.Empty<string>();
 
     /// <summary>
     /// Prepare <paramref name="sql"/> on the SERVER, returning
