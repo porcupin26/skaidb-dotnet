@@ -85,6 +85,9 @@ public sealed class SkaidbConnection : IDisposable
     private readonly object _lock = new();
     private readonly Dictionary<string, (uint Id, int Params)> _prepared = new();
 
+    /// <summary>Transport died; the next statement re-dials (see EnsureLive).</summary>
+    private bool _broken;
+
     private static int _nonceCounter;
 
     /// <summary>Parse a connection string such as
@@ -385,6 +388,37 @@ public sealed class SkaidbConnection : IDisposable
         CleanupSocket();
     }
 
+    /// <summary>
+    /// Re-dial if the transport died since the last statement, BEFORE anything
+    /// is prepared on it.
+    /// </summary>
+    /// <remarks>
+    /// The prepared-statement cache MUST be cleared: an id is only valid on
+    /// the connection that created it, so carrying one across a reconnect
+    /// would run a different statement (or fail obscurely).
+    /// </remarks>
+    internal void EnsureLive()
+    {
+        if (!_broken) return;
+        _prepared.Clear();
+        CleanupSocket();
+        // Open() is idempotent and returns early while _open is set, so the
+        // flag must drop or the re-dial would silently keep the dead socket.
+        _open = false;
+        // Cleared BEFORE dialling: Open() issues USE, which runs a statement
+        // and would otherwise re-enter this method forever.
+        _broken = false;
+        try
+        {
+            Open();
+        }
+        catch
+        {
+            _broken = true;   // still down; the next statement retries
+            throw;
+        }
+    }
+
     // ---- framing -----------------------------------------------------------
 
     private void WriteFrame(byte[] payload)
@@ -392,9 +426,17 @@ public sealed class SkaidbConnection : IDisposable
         if (_stream is null) throw new SkaidbException("connection is not open");
         Span<byte> head = stackalloc byte[4];
         BinaryPrimitives.WriteUInt32BigEndian(head, (uint)payload.Length); // length is BIG-endian
-        _stream.Write(head);
-        _stream.Write(payload, 0, payload.Length);
-        _stream.Flush();
+        try
+        {
+            _stream.Write(head);
+            _stream.Write(payload, 0, payload.Length);
+            _stream.Flush();
+        }
+        catch (IOException e)
+        {
+            _broken = true;
+            throw new SkaidbException($"write failed: {e.Message}", e);
+        }
     }
 
     private byte[] ReadFrame()
@@ -414,8 +456,24 @@ public sealed class SkaidbConnection : IDisposable
         int got = 0;
         while (got < n)
         {
-            int read = _stream.Read(buf, got, n - got);
-            if (read <= 0) throw new SkaidbException("connection closed by server");
+            int read;
+            try
+            {
+                read = _stream.Read(buf, got, n - got);
+            }
+            catch (IOException e)
+            {
+                // The statement may already have executed, so it is NOT
+                // retried here — an ambiguous write must never repeat. The
+                // connection is marked broken and the NEXT statement re-dials.
+                _broken = true;
+                throw new SkaidbException($"read failed: {e.Message}", e);
+            }
+            if (read <= 0)
+            {
+                _broken = true;
+                throw new SkaidbException("connection closed by server");
+            }
             got += read;
         }
         return buf;
@@ -560,6 +618,7 @@ public sealed class SkaidbConnection : IDisposable
     /// </summary>
     public IEnumerable<object?[]> Stream(string sql, SkaidbConsistency? consistency = null)
     {
+        EnsureLive();
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (!_open) throw new SkaidbException("connection is not open");
 
@@ -641,6 +700,7 @@ public sealed class SkaidbConnection : IDisposable
     /// </summary>
     internal (uint Id, int Params) PrepareServer(string sql)
     {
+        EnsureLive();
         if (_prepared.TryGetValue(sql, out var hit)) return hit;
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (!_open) throw new SkaidbException("connection is not open");
@@ -1064,6 +1124,9 @@ public sealed class SkaidbCommand : IDisposable
 
     private QueryResult Run()
     {
+        // Recover a transport that died since the last statement, before
+        // anything is prepared on it.
+        _connection.EnsureLive();
         // Server-side prepare so parameters travel as TYPED values; arrays
         // and documents have no SQL literal form and cannot be interpolated.
         if (Parameters.Count > 0)
