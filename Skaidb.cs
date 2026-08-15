@@ -378,6 +378,56 @@ public sealed class SkaidbConnection : IDisposable
     /// <summary>Create a command bound to this connection.</summary>
     public SkaidbCommand CreateCommand() => new SkaidbCommand(this);
 
+    /// <summary>One change captured by a stream.</summary>
+    public sealed record StreamEvent(string Id, string Op, object? Key, object? Ts, object? Doc);
+
+    /// <summary>
+    /// Yield a stream's events as they arrive, blocking until the enumerator
+    /// is abandoned.
+    /// </summary>
+    /// <remarks>
+    /// A dependency-free helper over the stream's log: it pages the log with
+    /// the keyset cursor. <c>Id</c> is the position — keep the last one and
+    /// pass it as <paramref name="after"/> to resume exactly where you
+    /// stopped, across restarts.
+    ///
+    /// This polls; for push delivery subscribe to <c>$stream/&lt;db&gt;/&lt;name&gt;</c>
+    /// with any MQTT client instead. The events are identical.
+    /// </remarks>
+    public IEnumerable<StreamEvent> Subscribe(string stream, string? after = null, int pollMs = 500)
+    {
+        string log = "_stream_" + stream;
+        string? cur = after;
+        while (true)
+        {
+            int n = 0;
+            using (var cmd = CreateCommand())
+            {
+                if (cur is null)
+                {
+                    cmd.CommandText = $"SELECT id, op, k, ts, doc FROM {log} ORDER BY id LIMIT 500";
+                }
+                else
+                {
+                    cmd.CommandText =
+                        $"SELECT id, op, k, ts, doc FROM {log} WHERE id > ? ORDER BY id LIMIT 500";
+                    cmd.Parameters.Add(cur);
+                }
+                using var r = cmd.ExecuteReader();
+                var batch = new List<StreamEvent>();
+                while (r.Read())
+                {
+                    string id = r.GetString(0);
+                    cur = id;
+                    n++;
+                    batch.Add(new StreamEvent(id, r.GetString(1), r.GetValue(2), r.GetValue(3), r.GetValue(4)));
+                }
+                foreach (var ev in batch) yield return ev;
+            }
+            if (n == 0) Thread.Sleep(pollMs);
+        }
+    }
+
     /// <summary>False once disposed, or once a transport error broke the socket.</summary>
     public bool IsUsable => !_disposed && _open && !_broken;
 
