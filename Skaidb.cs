@@ -378,6 +378,9 @@ public sealed class SkaidbConnection : IDisposable
     /// <summary>Create a command bound to this connection.</summary>
     public SkaidbCommand CreateCommand() => new SkaidbCommand(this);
 
+    /// <summary>False once disposed, or once a transport error broke the socket.</summary>
+    public bool IsUsable => !_disposed && _open && !_broken;
+
     public void Close() => Dispose();
 
     public void Dispose()
@@ -1500,4 +1503,103 @@ internal sealed class BinWriter
     }
 
     public byte[] ToArray() => _buf.ToArray();
+}
+/// <summary>
+/// A thread-safe pool of skaidb connections.
+/// </summary>
+/// <remarks>
+/// <para><c>maxsize</c> bounds the connections kept IDLE, not the number
+/// checked out: a burst creates extras and the surplus is disposed on return.
+/// Connections are built from the same connection string, so pooled ones
+/// inherit seed failover, TLS and the session database.</para>
+/// <code>
+/// using var pool = new SkaidbConnectionPool("Host=h1;Port=7000;Database=app", 8);
+/// long n = pool.WithConnection(c => {
+///     using var cmd = c.CreateCommand();
+///     cmd.CommandText = "SELECT count(*) AS n FROM t";
+///     using var r = cmd.ExecuteReader();
+///     r.Read();
+///     return r.GetInt64(0);
+/// });
+/// </code>
+/// </remarks>
+public sealed class SkaidbConnectionPool : IDisposable
+{
+    private readonly string _connectionString;
+    private readonly int _maxsize;
+    private readonly Stack<SkaidbConnection> _idle = new();
+    private readonly object _gate = new();
+    private bool _closed;
+
+    public SkaidbConnectionPool(string connectionString, int maxsize = 10)
+    {
+        if (maxsize < 1) throw new SkaidbException("maxsize must be >= 1");
+        _connectionString = connectionString;
+        _maxsize = maxsize;
+    }
+
+    /// <summary>Check out a usable connection, reusing an idle one when possible.</summary>
+    public SkaidbConnection Acquire()
+    {
+        while (true)
+        {
+            SkaidbConnection? c = null;
+            lock (_gate)
+            {
+                if (_closed) throw new SkaidbException("pool is closed");
+                if (_idle.Count > 0) c = _idle.Pop();
+            }
+            if (c is null)
+            {
+                var fresh = new SkaidbConnection(_connectionString);
+                fresh.Open();
+                return fresh;
+            }
+            // A connection the server closed while it sat idle still looks
+            // fine locally, so check before handing it out.
+            if (c.IsUsable) return c;
+            c.Dispose();
+        }
+    }
+
+    /// <summary>Return a connection, disposing it if broken or the pool is full.</summary>
+    public void Release(SkaidbConnection c)
+    {
+        lock (_gate)
+        {
+            if (!_closed && c.IsUsable && _idle.Count < _maxsize)
+            {
+                _idle.Push(c);
+                return;
+            }
+        }
+        c.Dispose();
+    }
+
+    /// <summary>Run <paramref name="work"/> with a checked-out connection.</summary>
+    public T WithConnection<T>(Func<SkaidbConnection, T> work)
+    {
+        var c = Acquire();
+        try
+        {
+            return work(c);
+        }
+        finally
+        {
+            Release(c);
+        }
+    }
+
+    /// <summary>Close the pool and every idle connection.</summary>
+    public void Dispose()
+    {
+        List<SkaidbConnection> drained;
+        lock (_gate)
+        {
+            _closed = true;
+            drained = new List<SkaidbConnection>(_idle);
+            _idle.Clear();
+        }
+        foreach (var c in drained) c.Dispose();
+    }
 }
