@@ -310,6 +310,7 @@ public sealed class SkaidbConnection : IDisposable
             _stream = Tls ? TlsWrap(stream) : stream;
             Handshake(User, _password);
             _open = true;
+            SendHello();
             // USE is per-connection session state, so it runs on every open.
             if (Database.Length > 0)
             {
@@ -533,6 +534,33 @@ public sealed class SkaidbConnection : IDisposable
     }
 
     // ---- handshake ---------------------------------------------------------
+
+    /// <summary>
+    /// Best-effort self-identification: fills the server's drivers table
+    /// client_name/client_version. An old server answers the unknown opcode
+    /// with an error frame, which is ignored — identity is telemetry, never
+    /// load-bearing.
+    /// </summary>
+    private void SendHello()
+    {
+        try
+        {
+            var name = System.Text.Encoding.UTF8.GetBytes("dotnet");
+            var ver = System.Text.Encoding.UTF8.GetBytes("0.1.0");
+            var w = new BinWriter();
+            w.U8(8);
+            w.U32((uint)name.Length);
+            w.Raw(name);
+            w.U32((uint)ver.Length);
+            w.Raw(ver);
+            WriteFrame(w.ToArray());
+            ReadFrame();
+        }
+        catch (Exception)
+        {
+            // telemetry only
+        }
+    }
 
     private void Handshake(string user, string password)
     {
