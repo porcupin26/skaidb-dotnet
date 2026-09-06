@@ -981,6 +981,36 @@ public sealed class SkaidbConnection : IDisposable
                 }
                 return new QueryResult(QueryResultKind.Rows, columns, rows, 0);
             }
+            case 8: // ResultSets: a CALL whose body EMITted
+            {
+                uint nsets = r.U32();
+                var sets = new List<QueryResult>((int)nsets);
+                for (int s = 0; s < nsets; s++)
+                {
+                    uint ncols = r.U32();
+                    var columns = new string[ncols];
+                    for (int i = 0; i < ncols; i++) columns[i] = r.Text();
+                    uint nrows = r.U32();
+                    var rows = new List<object?[]>((int)nrows);
+                    for (int ri = 0; ri < nrows; ri++)
+                    {
+                        uint ncells = r.U32();
+                        var row = new object?[ncells];
+                        for (int ci = 0; ci < ncells; ci++)
+                            row[ci] = DecodeValue(new BinReader(r.Blob()));
+                        rows.Add(row);
+                    }
+                    sets.Add(new QueryResult(QueryResultKind.Rows, columns, rows, 0));
+                }
+                if (sets.Count == 0)
+                    return new QueryResult(QueryResultKind.Rows, new string[0], new List<object?[]>(), 0);
+                // The first set is current; the reader's NextResult() walks the rest.
+                var first = sets[0];
+                return new QueryResult(QueryResultKind.Rows, first.Columns, first.Rows, 0)
+                {
+                    MoreSets = sets.GetRange(1, sets.Count - 1)
+                };
+            }
             case 1: // Mutation
                 return new QueryResult(QueryResultKind.Mutation, null, null, r.U64());
             case 2: // Ddl
@@ -1137,6 +1167,8 @@ internal sealed class QueryResult
     public string[]? Columns { get; }
     public List<object?[]>? Rows { get; }
     public ulong Affected { get; }
+    /// <summary>Further result sets of a multi-set reply (a CALL whose body EMITted).</summary>
+    public List<QueryResult> MoreSets { get; set; } = new List<QueryResult>();
 
     public QueryResult(QueryResultKind kind, string[]? columns, List<object?[]>? rows, ulong affected)
     {
@@ -1174,7 +1206,7 @@ public sealed class SkaidbCommand : IDisposable
     {
         var result = Run();
         if (result.Kind == QueryResultKind.Rows)
-            return new SkaidbDataReader(result.Columns!, result.Rows!);
+            return new SkaidbDataReader(result.Columns!, result.Rows!, result.MoreSets);
         // Non-row results expose an empty reader (FieldCount 0, Read() false).
         return new SkaidbDataReader(Array.Empty<string>(), new List<object?[]>());
     }
@@ -1254,14 +1286,29 @@ public sealed class SkaidbCommand : IDisposable
 /// <summary>Forward-only reader over a result set. Created by <see cref="SkaidbCommand.ExecuteReader"/>.</summary>
 public sealed class SkaidbDataReader : IDisposable
 {
-    private readonly string[] _columns;
-    private readonly List<object?[]> _rows;
+    private string[] _columns;
+    private List<object?[]> _rows;
     private int _pos = -1;
+    private readonly List<QueryResult> _more;
 
-    internal SkaidbDataReader(string[] columns, List<object?[]> rows)
+    /// <summary>Advance to the next result set of a multi-set reply (a CALL whose
+    /// body EMITted). Returns false when there is none.</summary>
+    public bool NextResult()
+    {
+        if (_more.Count == 0) return false;
+        var next = _more[0];
+        _more.RemoveAt(0);
+        _columns = next.Columns ?? new string[0];
+        _rows = next.Rows ?? new List<object?[]>();
+        _pos = -1;
+        return true;
+    }
+
+    internal SkaidbDataReader(string[] columns, List<object?[]> rows, List<QueryResult>? more = null)
     {
         _columns = columns;
         _rows = rows;
+        _more = more ?? new List<QueryResult>();
     }
 
     /// <summary>Number of columns in the result.</summary>
