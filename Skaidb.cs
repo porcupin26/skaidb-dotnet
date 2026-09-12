@@ -88,6 +88,25 @@ public sealed class SkaidbConnection : IDisposable
     /// <summary>Transport died; the next statement re-dials (see EnsureLive).</summary>
     private bool _broken;
 
+    /// <summary>
+    /// A <see cref="Stream"/> owns the socket until RowsEnd/Error. Written
+    /// under <see cref="_lock"/>, together with the check that guards a
+    /// request. Volatile because <see cref="IsUsable"/> reads it from whatever
+    /// thread a pool happens to return the connection on.
+    /// </summary>
+    private volatile bool _streaming;
+
+    /// <summary>
+    /// Frames an abandoned stream reads and discards before giving up. At the
+    /// server's 256 KB chunking that drains ~16 MB: enough to finish off a
+    /// stream the caller merely peeked at, and far short of dragging a whole
+    /// abandoned export through the socket just to keep one connection warm.
+    /// Past the cap the connection is broken instead, which is the other half
+    /// of "drain the remaining frames ... or close it" (PROTOCOL.md 3) and
+    /// costs one re-dial.
+    /// </summary>
+    private const int StreamDrainFrames = 64;
+
     private static int _nonceCounter;
 
     /// <summary>Parse a connection string such as
@@ -429,8 +448,14 @@ public sealed class SkaidbConnection : IDisposable
         }
     }
 
-    /// <summary>False once disposed, or once a transport error broke the socket.</summary>
-    public bool IsUsable => !_disposed && _open && !_broken;
+    /// <summary>
+    /// False once disposed, once a transport error broke the socket, or while a
+    /// <see cref="Stream"/> is still in flight. The last case is what keeps a
+    /// pool honest: a connection whose stream was abandoned without being
+    /// disposed still owes unread frames, and handing it out would desync
+    /// whoever got it next.
+    /// </summary>
+    public bool IsUsable => !_disposed && _open && !_broken && !_streaming;
 
     public void Close() => Dispose();
 
@@ -453,6 +478,9 @@ public sealed class SkaidbConnection : IDisposable
     /// </remarks>
     internal void EnsureLive()
     {
+        // Re-dialling would swap the socket out from under an in-flight
+        // stream, so refuse before the caller loses frames.
+        lock (_lock) ThrowIfStreamingLocked();
         if (!_broken) return;
         _prepared.Clear();
         CleanupSocket();
@@ -471,6 +499,20 @@ public sealed class SkaidbConnection : IDisposable
             _broken = true;   // still down; the next statement retries
             throw;
         }
+    }
+
+    /// <summary>
+    /// Refuse a request while a <see cref="Stream"/> holds the connection.
+    /// Call with <see cref="_lock"/> held, so the check and the WriteFrame it
+    /// guards cannot be split by the streaming thread.
+    /// </summary>
+    private void ThrowIfStreamingLocked()
+    {
+        if (_streaming)
+            throw new SkaidbException(
+                "connection is busy streaming: the protocol allows no other request until the "
+                + "stream ends, so finish or dispose the Stream() enumerator (or use a second "
+                + "connection) before running this statement");
     }
 
     // ---- framing -----------------------------------------------------------
@@ -693,10 +735,28 @@ public sealed class SkaidbConnection : IDisposable
     /// <code>
     /// foreach (var row in conn.Stream("SELECT ...")) { ... }
     /// </code>
-    /// The connection is busy until the stream ends; abandoning the
-    /// enumeration drains the remaining frames so the connection stays
-    /// usable. Takes no parameters — the opcode carries SQL text.
+    /// Takes no parameters — the opcode carries SQL text.
     /// </summary>
+    /// <remarks>
+    /// <para>The connection is busy for the whole stream: every other
+    /// statement on it throws until the stream ends. Ending it means running
+    /// the enumeration out, or disposing the enumerator — which
+    /// <c>foreach</c> does on its way out, <c>break</c> and exceptions
+    /// included. Disposal reads and discards the frames the server still
+    /// owes, up to a bounded number of them; past that the connection is
+    /// marked broken and the next statement re-dials, rather than the caller
+    /// paying to receive an export they walked away from.</para>
+    /// <para>An enumerator that is neither finished nor disposed — a
+    /// hand-rolled <c>GetEnumerator()</c> that is simply dropped — claims the
+    /// connection for good, because nothing in .NET runs an iterator's
+    /// <c>finally</c> at collection time. That connection reports
+    /// <see cref="IsUsable"/> false, so a pool discards it instead of handing
+    /// out a socket with rows still queued on it.</para>
+    /// <para>Do not return the enumerable out of
+    /// <see cref="SkaidbConnectionPool.WithConnection"/>: it is lazy, and the
+    /// connection would go back to the pool before the first row is read.
+    /// Enumerate inside the callback.</para>
+    /// </remarks>
     public IEnumerable<object?[]> Stream(string sql, SkaidbConsistency? consistency = null)
     {
         EnsureLive();
@@ -710,29 +770,51 @@ public sealed class SkaidbConnection : IDisposable
         w.U32((uint)sqlBytes.Length);
         w.Raw(sqlBytes);
 
-        BinReader first;
+        // A busy flag, not a held lock, is what serialises the exchange.
+        // Holding _lock for the stream's duration is not available to an
+        // iterator: it yields control between frames, so the Monitor would be
+        // held across arbitrary caller code (any other thread touching the
+        // connection blocks for as long as the loop body feels like running)
+        // and would be released on whichever thread happened to call
+        // MoveNext last. The flag instead makes a concurrent statement fail
+        // loudly; _lock keeps its old job of guarding one frame's bytes.
         lock (_lock)
         {
-            WriteFrame(w.ToArray());
-            first = new BinReader(ReadFrame());
+            ThrowIfStreamingLocked();
+            _streaming = true;
         }
-        byte tag = first.U8();
-        if (tag == 3)
-        {
-            string msg = first.Text();
-            throw new SkaidbException(msg.Contains("unknown opcode")
-                ? $"server does not support streaming: {msg}" : msg);
-        }
-        if (tag == 1 || tag == 2) yield break;      // not row-producing
-        if (tag != 5) throw new SkaidbException($"unexpected response tag {tag} to stream request");
-        uint ncols = first.U32();
-        var columns = new string[ncols];
-        for (int i = 0; i < ncols; i++) columns[i] = first.Text();
-        StreamColumns = columns;
 
-        bool live = true;
+        bool live = false;   // true while the server still owes frames
         try
         {
+            BinReader first;
+            lock (_lock)
+            {
+                WriteFrame(w.ToArray());
+                first = new BinReader(ReadFrame());
+            }
+            byte tag = first.U8();
+            if (tag == 3)
+            {
+                string msg = first.Text();
+                throw new SkaidbException(msg.Contains("unknown opcode")
+                    ? $"server does not support streaming: {msg}" : msg);
+            }
+            if (tag == 1 || tag == 2) yield break;      // not row-producing
+            if (tag != 5)
+            {
+                // The server is not answering the stream contract, so there is
+                // no telling whether more frames follow; draining could block
+                // on one that never comes. Break the socket instead.
+                _broken = true;
+                throw new SkaidbException($"unexpected response tag {tag} to stream request");
+            }
+            uint ncols = first.U32();
+            var columns = new string[ncols];
+            for (int i = 0; i < ncols; i++) columns[i] = first.Text();
+            StreamColumns = columns;
+
+            live = true;
             while (live)
             {
                 BinReader r;
@@ -752,20 +834,48 @@ public sealed class SkaidbConnection : IDisposable
                 }
                 else if (t == 7) { live = false; }
                 else if (t == 3) { live = false; throw new SkaidbException(r.Text()); }
-                else { live = false; throw new SkaidbException($"unexpected frame tag {t} in stream"); }
+                else
+                {
+                    // As above: an out-of-contract tag says nothing about what
+                    // still follows, so do not wait around draining for it.
+                    live = false;
+                    _broken = true;
+                    throw new SkaidbException($"unexpected frame tag {t} in stream");
+                }
             }
         }
         finally
         {
-            // Abandoned early: drain so leftovers are not read as the reply
-            // to the next statement on this connection.
+            // Abandoned early — break, exception, or an explicit Dispose of
+            // the enumerator. Read off what the server still owes, so the next
+            // statement on this connection does not decode a leftover
+            // RowsChunk as its own reply.
+            int budget = StreamDrainFrames;
             while (live)
             {
-                BinReader r;
-                lock (_lock) { r = new BinReader(ReadFrame()); }
-                byte t = r.U8();
-                if (t == 7 || t == 3) live = false;
+                if (budget-- == 0) { _broken = true; break; }
+                try
+                {
+                    BinReader r;
+                    lock (_lock) { r = new BinReader(ReadFrame()); }
+                    byte t = r.U8();
+                    if (t == 7 || t == 3) live = false;
+                    else if (t != 6) { _broken = true; break; }
+                }
+                catch (Exception)
+                {
+                    // Whatever stopped the drain leaves the socket at an
+                    // unknown offset, and this runs inside a finally: throwing
+                    // here would bury the caller's own exception, or turn a
+                    // plain `break` into one. Break the connection and let
+                    // EnsureLive() re-dial on the next statement.
+                    _broken = true;
+                    break;
+                }
             }
+            // Released last: until this drops, IsUsable is false and every
+            // other statement on the connection is refused.
+            lock (_lock) { _streaming = false; }
         }
     }
 
@@ -795,6 +905,7 @@ public sealed class SkaidbConnection : IDisposable
         BinReader r;
         lock (_lock)
         {
+            ThrowIfStreamingLocked();
             WriteFrame(w.ToArray());
             r = new BinReader(ReadFrame());
         }
@@ -952,6 +1063,7 @@ public sealed class SkaidbConnection : IDisposable
         BinReader r;
         lock (_lock)
         {
+            ThrowIfStreamingLocked();
             WriteFrame(request);
             r = new BinReader(ReadFrame());
         }
