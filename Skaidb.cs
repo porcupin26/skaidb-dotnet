@@ -97,13 +97,19 @@ public sealed class SkaidbConnection : IDisposable
     private volatile bool _streaming;
 
     /// <summary>
-    /// Frames an abandoned stream reads and discards before giving up. At the
-    /// server's 256 KB chunking that drains ~16 MB: enough to finish off a
-    /// stream the caller merely peeked at, and far short of dragging a whole
-    /// abandoned export through the socket just to keep one connection warm.
-    /// Past the cap the connection is broken instead, which is the other half
-    /// of "drain the remaining frames ... or close it" (PROTOCOL.md 3) and
-    /// costs one re-dial.
+    /// Frames an abandoned stream reads and discards before giving up:
+    /// enough to finish off a stream the caller merely peeked at, and far
+    /// short of dragging a whole abandoned export through the socket just to
+    /// keep one connection warm. Past the cap the connection is broken
+    /// instead, which is the other half of "drain the remaining frames ...
+    /// or close it" (PROTOCOL.md 3) and costs one re-dial.
+    ///
+    /// This bounds FRAMES, not bytes. At the server's current 256 KB
+    /// chunking it is ~16 MB, but that is the server's constant and not one
+    /// this driver can see; <see cref="ReadFrame"/> accepts up to 64 MB, so
+    /// the arithmetic worst case is far larger. Quoting the megabytes as a
+    /// guarantee would be asserting a property of a number we do not
+    /// control.
     /// </summary>
     private const int StreamDrainFrames = 64;
 
@@ -479,7 +485,11 @@ public sealed class SkaidbConnection : IDisposable
     internal void EnsureLive()
     {
         // Re-dialling would swap the socket out from under an in-flight
-        // stream, so refuse before the caller loses frames.
+        // stream, so refuse before the caller loses frames. Unlocked
+        // first: the lock is held for the whole of each frame read, so
+        // waiting for it means waiting out a socket timeout to be told
+        // about a mistake the flag already knows about.
+        ThrowIfStreamingUnlocked();
         lock (_lock) ThrowIfStreamingLocked();
         if (!_broken) return;
         _prepared.Clear();
@@ -499,6 +509,27 @@ public sealed class SkaidbConnection : IDisposable
             _broken = true;   // still down; the next statement retries
             throw;
         }
+    }
+
+    /// <summary>
+    /// Refuse a request while a <see cref="Stream"/> holds the connection,
+    /// WITHOUT waiting for the lock.
+    ///
+    /// The locked check below is the authority, but reaching it means
+    /// blocking on the Monitor until the streaming thread is between
+    /// frames — so a caller who made a threading mistake waits out a socket
+    /// timeout before learning what they did wrong. `_streaming` is
+    /// volatile precisely so it can be read here first. A false negative
+    /// (the flag set just after this reads it) is harmless: the locked
+    /// check still catches it.
+    /// </summary>
+    private void ThrowIfStreamingUnlocked()
+    {
+        if (_streaming)
+            throw new SkaidbException(
+                "connection is busy streaming: the protocol allows no other request until the "
+                + "stream ends, so finish or dispose the Stream() enumerator (or use a second "
+                + "connection) before running this statement");
     }
 
     /// <summary>
@@ -903,6 +934,9 @@ public sealed class SkaidbConnection : IDisposable
         w.Raw(sqlBytes);
 
         BinReader r;
+        // Unlocked first so a threading mistake is reported now rather
+        // than after the streaming thread's current frame read.
+        ThrowIfStreamingUnlocked();
         lock (_lock)
         {
             ThrowIfStreamingLocked();
@@ -1061,6 +1095,9 @@ public sealed class SkaidbConnection : IDisposable
         if (!_open) throw new SkaidbException("connection is not open");
 
         BinReader r;
+        // Unlocked first so a threading mistake is reported now rather
+        // than after the streaming thread's current frame read.
+        ThrowIfStreamingUnlocked();
         lock (_lock)
         {
             ThrowIfStreamingLocked();
