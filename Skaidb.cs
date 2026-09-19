@@ -18,9 +18,10 @@
 //         Console.WriteLine($"{reader.GetInt64(0)} {reader.GetString(1)}");
 //
 // Placeholders use the `?` (qmark) style, bound positionally from Parameters.
-// The wire protocol is documented in ../PROTOCOL.md; this driver is verified
-// against the live-tested Python reference in ../python/skaidb/__init__.py and
-// is byte-for-byte compatible with it.
+// The wire protocol is documented in ../../docs/PROTOCOL.md; this driver is
+// verified against the live-tested Python reference
+// (https://github.com/porcupin26/skaidb-python) and is byte-for-byte
+// compatible with it.
 
 using System;
 using System.Buffers.Binary;
