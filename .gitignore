@@ -1,0 +1,15 @@
+# .NET build output
+bin/
+obj/
+*.nupkg
+*.snupkg
+artifacts/
+TestResults/
+
+# IDE and tooling
+.vs/
+.idea/
+*.user
+*.suo
+*.swp
+.DS_Store

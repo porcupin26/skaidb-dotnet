@@ -1,18 +1,43 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- The ONE place the driver version lives. The Hello frame reads it
+         back from the assembly's informational version; the publish
+         workflow refuses a tag that does not match it. -->
+    <Version>1.0.0</Version>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <PackageId>Skaidb</PackageId>
-    <Version>0.1.0</Version>
-    <Authors>skaidb</Authors>
-    <Description>Official C# / .NET driver for skaidb (binary wire protocol). Pure BCL, no dependencies. ADO.NET-shaped API.</Description>
+    <Authors>porcupin26</Authors>
+    <Company>skaidb</Company>
+    <Product>skaidb</Product>
+    <Description>Official C# / .NET driver for skaidb: an ADO.NET-shaped API over the binary wire protocol. Pure BCL, no dependencies.</Description>
+    <PackageTags>skaidb;database;driver;ado.net;client</PackageTags>
     <PackageLicenseExpression>SSPL-1.0</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/skaidb/skaidb</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/porcupin26/skaidb-dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/porcupin26/skaidb-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>See https://github.com/porcupin26/skaidb-dotnet/blob/main/CHANGELOG.md</PackageReleaseNotes>
+    <Copyright>Copyright (c) skaidb contributors</Copyright>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The library is the ONE source file at the repo root; everything
+         else under here is examples and tests with their own projects. -->
+    <Compile Remove="examples/**;tests/**" />
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="LICENSE" Pack="true" PackagePath="/" />
+    <InternalsVisibleTo Include="Skaidb.Tests" />
+  </ItemGroup>
 
 </Project>
