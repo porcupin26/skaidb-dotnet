@@ -25,17 +25,20 @@ Full documentation: this README, the [`docs/`](docs/) folder
 
 ## Install
 
-The package is `Skaidb`. Until it is on NuGet.org, installs come from the
-GitHub release: download `Skaidb.1.0.0.nupkg` from
-<https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.0.0> into a
-folder and use that folder as a package source:
+The package is `Skaidb`. Until it is on NuGet.org (the publish workflow
+pushes every tagged version there as soon as the repository has a NuGet
+credential), installs come from the GitHub release: every release at
+<https://github.com/porcupin26/skaidb-dotnet/releases> attaches
+`Skaidb.X.Y.Z.nupkg` (and the `.snupkg` symbols package). Download it into
+a folder and use that folder as a package source:
 
 ```sh
+V=1.0.1
 mkdir -p ~/nuget-local
-curl -L -o ~/nuget-local/Skaidb.1.0.0.nupkg \
-  https://github.com/porcupin26/skaidb-dotnet/releases/download/v1.0.0/Skaidb.1.0.0.nupkg
+curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
+  https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
 dotnet nuget add source ~/nuget-local --name skaidb-local
-dotnet add package Skaidb --version 1.0.0
+dotnet add package Skaidb --version $V
 ```
 
 Or reference the source directly, from a clone or a git submodule:
@@ -393,7 +396,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.0.0
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.0.1
 ```
 
 ## Compatibility
@@ -419,10 +422,17 @@ dotnet run --project examples/Basic -- host 7000 user password database
 
 CI builds and tests on .NET 8 for every push and pull request and checks that
 the Hello version equals the package version. Tagging `vX.Y.Z` runs the
-publish workflow: it refuses a tag that differs from `<Version>`, builds
-`Skaidb.X.Y.Z.nupkg`, attaches it to a GitHub Release, and pushes to NuGet.org
-only when the `NUGET_API_KEY` secret is present (otherwise it says so and the
-release asset is the install channel).
+publish workflow (`.github/workflows/publish.yml`): it refuses a tag that
+differs from `<Version>`, builds and tests, packs `Skaidb.X.Y.Z.nupkg` and
+the `Skaidb.X.Y.Z.snupkg` symbols package, pushes both to NuGet.org and
+creates a GitHub Release with both attached. The NuGet.org credential is
+either the `NUGET_API_KEY` repository secret (an API key from nuget.org) or
+the `NUGET_USER` secret with a Trusted Publishing policy on nuget.org for
+`publish.yml` (a short-lived key from the job's OIDC token, nothing to
+rotate); with neither, the push is skipped with a notice and the release
+asset is the install channel. The package declares its license as the packed
+`LICENSE` file rather than an SPDX expression: nuget.org only accepts OSI- or
+FSF-approved licenses in an expression, and SSPL-1.0 is neither.
 
 ## License
 

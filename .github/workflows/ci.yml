@@ -35,6 +35,8 @@ jobs:
           ver="$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' Skaidb.csproj)"
           test -n "$ver" || { echo "::error::Skaidb.csproj has no <Version>"; exit 1; }
           test -f "artifacts/Skaidb.$ver.nupkg" || { echo "::error::expected artifacts/Skaidb.$ver.nupkg"; ls artifacts; exit 1; }
+          test -f "artifacts/Skaidb.$ver.snupkg" || { echo "::error::expected artifacts/Skaidb.$ver.snupkg (symbols package)"; ls artifacts; exit 1; }
+          unzip -p "artifacts/Skaidb.$ver.nupkg" Skaidb.nuspec | grep -q '<license type="file">LICENSE</license>' || { echo "::error::the package must declare its license as the packed LICENSE file: nuget.org rejects the SSPL-1.0 expression (not OSI/FSF-approved)"; exit 1; }
           unzip -p "artifacts/Skaidb.$ver.nupkg" Skaidb.nuspec | grep -q "<version>$ver</version>" || { echo "::error::nuspec version differs from $ver"; exit 1; }
           unzip -l "artifacts/Skaidb.$ver.nupkg" | grep -q ' README.md' || { echo "::error::README.md is not packed"; exit 1; }
           grep -q 'AssemblyInformationalVersionAttribute' Skaidb.cs || { echo "::error::Skaidb.cs no longer derives the Hello version from the assembly"; exit 1; }
@@ -46,4 +48,4 @@ jobs:
         if: matrix.dotnet == '8.0.x'
         with:
           name: nupkg
-          path: artifacts/*.nupkg
+          path: artifacts/*nupkg

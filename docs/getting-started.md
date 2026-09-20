@@ -10,14 +10,17 @@ The driver has no dependencies: one assembly, pure BCL.
 
 ## Install
 
-From the GitHub release (the package is not on NuGet.org yet):
+From the GitHub release (the package is not on NuGet.org yet; every release
+at <https://github.com/porcupin26/skaidb-dotnet/releases> attaches
+`Skaidb.X.Y.Z.nupkg`):
 
 ```sh
+V=1.0.1
 mkdir -p ~/nuget-local
-curl -L -o ~/nuget-local/Skaidb.1.0.0.nupkg \
-  https://github.com/porcupin26/skaidb-dotnet/releases/download/v1.0.0/Skaidb.1.0.0.nupkg
+curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
+  https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
 dotnet nuget add source ~/nuget-local --name skaidb-local
-dotnet add package Skaidb --version 1.0.0
+dotnet add package Skaidb --version $V
 ```
 
 From source, as a project reference (a clone or a git submodule):

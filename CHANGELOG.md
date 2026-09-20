@@ -4,6 +4,25 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.0.1] - 2026-09-20
+
+Release automation: published from GitHub Actions. No driver code changed.
+
+### Changed
+- The package declares its license as the packed `LICENSE` file
+  (`PackageLicenseFile`) instead of the `SSPL-1.0` SPDX expression:
+  NuGet.org accepts only OSI- or FSF-approved licenses in an expression and
+  rejects the push otherwise. The license itself is unchanged.
+- The package ships a symbols package, `Skaidb.X.Y.Z.snupkg` (portable PDB
+  with Source Link), next to the `.nupkg`; the publish workflow attaches both
+  to the GitHub Release and pushes both to NuGet.org, and CI asserts both
+  are produced.
+- The publish workflow pushes to NuGet.org with either the `NUGET_API_KEY`
+  secret or NuGet Trusted Publishing (`NUGET_USER` secret plus a policy on
+  nuget.org for `publish.yml`); with neither it skips the push with a notice
+  and stays green. The release body now says which install path applies and
+  carries this changelog's section for the version.
+
 ## [1.0.0] - 2026-09-20
 
 First release as a standalone repository
@@ -86,4 +105,5 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.0.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.0.0

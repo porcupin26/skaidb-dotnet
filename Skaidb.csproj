@@ -13,7 +13,7 @@
     <!-- The ONE place the driver version lives. The Hello frame reads it
          back from the assembly's informational version; the publish
          workflow refuses a tag that does not match it. -->
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <PackageId>Skaidb</PackageId>
@@ -22,13 +22,23 @@
     <Product>skaidb</Product>
     <Description>Official C# / .NET driver for skaidb: an ADO.NET-shaped API over the binary wire protocol. Pure BCL, no dependencies.</Description>
     <PackageTags>skaidb;database;driver;ado.net;client</PackageTags>
-    <PackageLicenseExpression>SSPL-1.0</PackageLicenseExpression>
+    <!-- nuget.org accepts only OSI- or FSF-approved licenses in a license
+         EXPRESSION and rejects the push otherwise; SSPL-1.0 is neither, so
+         the license is the packed LICENSE file (same text, SSPL-1.0). -->
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageProjectUrl>https://github.com/porcupin26/skaidb-dotnet</PackageProjectUrl>
     <RepositoryUrl>https://github.com/porcupin26/skaidb-dotnet</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageReleaseNotes>See https://github.com/porcupin26/skaidb-dotnet/blob/main/CHANGELOG.md</PackageReleaseNotes>
     <Copyright>Copyright (c) skaidb contributors</Copyright>
+
+    <!-- Symbols: a portable PDB in Skaidb.X.Y.Z.snupkg next to the .nupkg
+         (the .NET 8 SDK adds Source Link for the GitHub checkout; the CI
+         build normalises source paths so the mapping works anywhere). -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
   <ItemGroup>

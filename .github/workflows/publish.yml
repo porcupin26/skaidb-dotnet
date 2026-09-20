@@ -1,10 +1,22 @@
 name: Publish
 
-# Runs on every v* tag: refuses a tag that differs from <Version> in
-# Skaidb.csproj, builds and tests, packs Skaidb.X.Y.Z.nupkg, attaches it to a
-# GitHub Release for the tag, and pushes to NuGet.org only when the
-# NUGET_API_KEY repository secret exists. Without it the push step explains
-# itself and exits green: the release asset is the install channel.
+# Runs on every v* tag. Refuses a tag that differs from <Version> in
+# Skaidb.csproj, builds and tests, packs Skaidb.X.Y.Z.nupkg plus the
+# Skaidb.X.Y.Z.snupkg symbols package, pushes both to NuGet.org, and creates
+# a GitHub Release for the tag with both files attached.
+#
+# The NuGet.org credential is one of these repository secrets, in this order:
+#   NUGET_API_KEY  a long-lived API key: nuget.org → <username> → API Keys →
+#                  Create; scope "Push new packages and package versions",
+#                  glob pattern Skaidb*.
+#   NUGET_USER     the nuget.org profile name (not the e-mail) for Trusted
+#                  Publishing: nuget.org → <username> → Trusted Publishing →
+#                  add a policy with Repository Owner porcupin26, Repository
+#                  skaidb-dotnet, Workflow File publish.yml, no environment.
+#                  The job then exchanges its GitHub OIDC token for a one-hour
+#                  API key; there is no long-lived secret to rotate.
+# With neither secret the push is skipped with a notice and the run stays
+# green: the release asset is the install channel and the release body says so.
 
 on:
   push:
@@ -14,15 +26,19 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # the GitHub Release and its assets
+      id-token: write   # NuGet Trusted Publishing (OIDC); unused without NUGET_USER
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: 1
       DOTNET_NOLOGO: 1
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+      NUGET_USER: ${{ secrets.NUGET_USER }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
       - name: Tag matches the package version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -31,43 +47,103 @@ jobs:
             echo "::error::tag v$tag does not match Skaidb.csproj <Version>$ver</Version>"
             exit 1
           fi
+          if ! grep -q "^## \[$ver\]" CHANGELOG.md; then
+            echo "::warning::CHANGELOG.md has no '## [$ver]' section; the release body will only link the changelog"
+          fi
           echo "VERSION=$ver" >> "$GITHUB_ENV"
+
       - name: Build and test
         run: |
           dotnet build Skaidb.sln -c Release
           dotnet test tests/Skaidb.Tests -c Release --no-build
-      - name: Pack
+
+      - name: Pack (.nupkg + .snupkg)
         run: |
           dotnet pack Skaidb.csproj -c Release --no-build -o artifacts
           ls -l artifacts
           test -f "artifacts/Skaidb.$VERSION.nupkg"
+          test -f "artifacts/Skaidb.$VERSION.snupkg"
+          unzip -p "artifacts/Skaidb.$VERSION.nupkg" Skaidb.nuspec | grep -q "<version>$VERSION</version>"
+          # nuget.org rejects a license EXPRESSION that is not OSI/FSF-approved
+          # (SSPL-1.0 is neither); the package must carry the LICENSE file.
+          unzip -p "artifacts/Skaidb.$VERSION.nupkg" Skaidb.nuspec | grep -q '<license type="file">LICENSE</license>'
+
       - uses: actions/upload-artifact@v4
         with:
           name: nupkg
-          path: artifacts/*.nupkg
+          path: artifacts/*nupkg
+
+      - name: NuGet login (Trusted Publishing; only with NUGET_USER and no NUGET_API_KEY)
+        id: login
+        if: env.NUGET_API_KEY == '' && env.NUGET_USER != ''
+        uses: NuGet/login@v1
+        with:
+          user: ${{ env.NUGET_USER }}
+
+      - name: Push to NuGet.org
+        id: nuget
+        env:
+          OIDC_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          if [ -n "$NUGET_API_KEY" ]; then
+            key="$NUGET_API_KEY"; how="the NUGET_API_KEY secret"
+          elif [ -n "$OIDC_API_KEY" ]; then
+            key="$OIDC_API_KEY"; how="Trusted Publishing (NUGET_USER)"
+          else
+            echo "::notice title=NuGet push skipped::Neither the NUGET_API_KEY nor the NUGET_USER secret is set, so Skaidb $VERSION was not pushed to NuGet.org. Install from the GitHub release asset instead; the release body explains how."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Pushing Skaidb $VERSION (and its symbols package) to NuGet.org with $how"
+          dotnet nuget push "artifacts/Skaidb.$VERSION.nupkg" \
+            --api-key "$key" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        env:
+          PUBLISHED: ${{ steps.nuget.outputs.published }}
+        run: |
+          {
+            echo "skaidb C# / .NET driver $VERSION."
+            echo
+            if [ "$PUBLISHED" = "true" ]; then
+              echo "Install from NuGet.org:"
+              echo
+              echo '```sh'
+              echo "dotnet add package Skaidb --version $VERSION"
+              echo '```'
+            else
+              echo "This version was not pushed to NuGet.org (the workflow has no NuGet credential). Install from the package attached to this release:"
+              echo
+              echo '```sh'
+              echo "mkdir -p ~/nuget-local"
+              echo "curl -L -o ~/nuget-local/Skaidb.$VERSION.nupkg \\"
+              echo "  https://github.com/porcupin26/skaidb-dotnet/releases/download/v$VERSION/Skaidb.$VERSION.nupkg"
+              echo "dotnet nuget add source ~/nuget-local --name skaidb-local"
+              echo "dotnet add package Skaidb --version $VERSION"
+              echo '```'
+            fi
+            echo
+            if grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+              echo "## Changes"
+              echo
+              awk -v v="$VERSION" '
+                $0 ~ ("^## \\[" v "\\]") { on = 1; next }
+                on && /^## \[/ { exit }
+                on && /^\[[^]]*\]: http/ { next }
+                on { print }' CHANGELOG.md
+            else
+              echo "See [CHANGELOG.md](https://github.com/porcupin26/skaidb-dotnet/blob/main/CHANGELOG.md)."
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ env.VERSION }}
-          body: |
-            skaidb C# / .NET driver ${{ env.VERSION }}. See CHANGELOG.md for details.
-
-            Install from this release (until the package is on NuGet.org):
-
-            ```sh
-            mkdir -p ~/nuget-local
-            curl -L -o ~/nuget-local/Skaidb.${{ env.VERSION }}.nupkg \
-              https://github.com/porcupin26/skaidb-dotnet/releases/download/v${{ env.VERSION }}/Skaidb.${{ env.VERSION }}.nupkg
-            dotnet nuget add source ~/nuget-local --name skaidb-local
-            dotnet add package Skaidb --version ${{ env.VERSION }}
-            ```
-          files: artifacts/Skaidb.${{ env.VERSION }}.nupkg
-      - name: Push to NuGet.org (only with NUGET_API_KEY)
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          if [ -z "$NUGET_API_KEY" ]; then
-            echo "::notice title=NuGet push skipped::NUGET_API_KEY secret is not set; nothing was pushed to NuGet.org. Install from the GitHub release asset instead."
-            exit 0
-          fi
-          dotnet nuget push "artifacts/Skaidb.$VERSION.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          body_path: release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/Skaidb.${{ env.VERSION }}.nupkg
+            artifacts/Skaidb.${{ env.VERSION }}.snupkg
