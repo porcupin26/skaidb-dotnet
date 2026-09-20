@@ -48,6 +48,11 @@ run against a live server: the fixes below are what that found.
   Stream, Tls, Pool, Subscribe).
 
 ### Fixed
+- README: the in-page `[pool](#pooling)` link in the Statements section
+  pointed nowhere — the heading was ``## Pooling — `SkaidbConnectionPool` ``,
+  whose generated anchor differs per renderer (GitHub: `pooling--skaidbconnectionpool`).
+  The heading is plain `## Pooling` now, so the link resolves on GitHub and
+  in the README packed into the NuGet package alike.
 - Documentation: a document's keys come back in the server's sorted order,
   not the order they were bound in (the server canonicalises documents on
   write; the driver keeps the wire order). The README and `docs/types.md`

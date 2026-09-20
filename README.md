@@ -301,7 +301,7 @@ dispose the enumerator); the connection is idle between polls, so a stop takes
 effect within `pollMs`. For push delivery subscribe to `$stream/<db>/<name>`
 with any MQTT client instead — the events are identical.
 
-## Pooling — `SkaidbConnectionPool`
+## Pooling
 
 ```csharp
 using var pool = new SkaidbConnectionPool(
