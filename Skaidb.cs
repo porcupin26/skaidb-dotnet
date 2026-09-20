@@ -18,10 +18,7 @@
 //         Console.WriteLine($"{reader.GetInt64(0)} {reader.GetString(1)}");
 //
 // Placeholders use the `?` (qmark) style, bound positionally from Parameters.
-// The wire protocol is documented in ../../docs/PROTOCOL.md; this driver is
-// verified against the live-tested Python reference
-// (https://github.com/porcupin26/skaidb-python) and is byte-for-byte
-// compatible with it.
+// The wire protocol is documented at https://skaidb.org/docs/PROTOCOL.html.
 
 using System;
 using System.Buffers.Binary;
@@ -31,6 +28,7 @@ using System.IO;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Numerics;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -47,6 +45,12 @@ public enum SkaidbConsistency : byte
 }
 
 /// <summary>Thrown on any driver or server-reported error.</summary>
+public class SkaidbException : Exception
+{
+    public SkaidbException(string message) : base(message) { }
+    public SkaidbException(string message, Exception inner) : base(message, inner) { }
+}
+
 /// <summary>
 /// Statement kind the server declines to prepare (DDL, session statements).
 /// Not an error — the caller falls back to client-side text binding.
@@ -54,12 +58,6 @@ public enum SkaidbConsistency : byte
 public sealed class UnpreparableException : SkaidbException
 {
     public UnpreparableException(string message) : base(message) { }
-}
-
-public class SkaidbException : Exception
-{
-    public SkaidbException(string message) : base(message) { }
-    public SkaidbException(string message, Exception inner) : base(message, inner) { }
 }
 
 /// <summary>
@@ -115,6 +113,30 @@ public sealed class SkaidbConnection : IDisposable
     private const int StreamDrainFrames = 64;
 
     private static int _nonceCounter;
+
+    /// <summary>Name the driver reports in its Hello frame (the drivers table's client_name).</summary>
+    public const string DriverName = "dotnet";
+
+    /// <summary>
+    /// The driver's package version, as the Hello frame reports it: the
+    /// assembly's informational version, which the build derives from the
+    /// single <c>&lt;Version&gt;</c> in Skaidb.csproj. Never a literal.
+    /// </summary>
+    public static string DriverVersion { get; } = ComputeDriverVersion();
+
+    private static string ComputeDriverVersion()
+    {
+        var asm = typeof(SkaidbConnection).Assembly;
+        string? info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrEmpty(info))
+        {
+            // "1.0.0+<sha>" when source-revision stamping is on: keep the version part.
+            int plus = info.IndexOf('+');
+            return plus >= 0 ? info.Substring(0, plus) : info;
+        }
+        var v = asm.GetName().Version ?? new Version(0, 0, 0);
+        return $"{v.Major}.{v.Minor}.{v.Build}";
+    }
 
     /// <summary>Parse a connection string such as
     /// "Host=localhost;Port=7000;User=skaidb;Password=secret;Consistency=Quorum".
@@ -316,7 +338,8 @@ public sealed class SkaidbConnection : IDisposable
                 }
                 catch (Exception e)
                 {
-                    last = e;
+                    last = e is AggregateException agg && agg.InnerExceptions.Count == 1
+                        ? agg.InnerExceptions[0] : e;
                     candidate.Dispose();
                 }
             }
@@ -353,7 +376,9 @@ public sealed class SkaidbConnection : IDisposable
         catch (Exception e)
         {
             CleanupSocket();
-            throw new SkaidbException($"connect failed: {e.Message}", e);
+            Exception root = e is AggregateException agg && agg.InnerExceptions.Count == 1
+                ? agg.InnerExceptions[0] : e;
+            throw new SkaidbException($"connect failed: {root.Message}", root);
         }
     }
 
@@ -462,7 +487,29 @@ public sealed class SkaidbConnection : IDisposable
     /// disposed still owes unread frames, and handing it out would desync
     /// whoever got it next.
     /// </summary>
-    public bool IsUsable => !_disposed && _open && !_broken && !_streaming;
+    public bool IsUsable => !_disposed && _open && !_broken && !_streaming && !SocketDead();
+
+    /// <summary>
+    /// True when the peer has closed the socket while it sat idle: readable
+    /// with nothing to read means EOF. A zero-timeout poll, so cheap enough
+    /// for a pool to ask on every Acquire/Release. Only meaningful between
+    /// requests; while one is in flight the flags above answer first.
+    /// </summary>
+    private bool SocketDead()
+    {
+        var tcp = _tcp;
+        if (tcp is null) return true;
+        try
+        {
+            var s = tcp.Client;
+            if (!s.Connected) return true;
+            return s.Poll(0, SelectMode.SelectRead) && s.Available == 0;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
 
     public void Close() => Dispose();
 
@@ -492,6 +539,10 @@ public sealed class SkaidbConnection : IDisposable
         // about a mistake the flag already knows about.
         ThrowIfStreamingUnlocked();
         lock (_lock) ThrowIfStreamingLocked();
+        // A peer that closed the socket while it sat idle (a node restart, an
+        // idle timeout) is safe to re-dial now: nothing has been sent yet, so
+        // there is no ambiguous write to worry about.
+        if (!_broken && _open && SocketDead()) _broken = true;
         if (!_broken) return;
         _prepared.Clear();
         CleanupSocket();
@@ -552,12 +603,14 @@ public sealed class SkaidbConnection : IDisposable
     private void WriteFrame(byte[] payload)
     {
         if (_stream is null) throw new SkaidbException("connection is not open");
-        Span<byte> head = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(head, (uint)payload.Length); // length is BIG-endian
+        // One write for header + payload: with NoDelay set, two writes would
+        // be two segments on the wire for every request.
+        var frame = new byte[4 + payload.Length];
+        BinaryPrimitives.WriteUInt32BigEndian(frame, (uint)payload.Length); // length is BIG-endian
+        Array.Copy(payload, 0, frame, 4, payload.Length);
         try
         {
-            _stream.Write(head);
-            _stream.Write(payload, 0, payload.Length);
+            _stream.Write(frame, 0, frame.Length);
             _stream.Flush();
         }
         catch (IOException e)
@@ -619,8 +672,8 @@ public sealed class SkaidbConnection : IDisposable
     {
         try
         {
-            var name = System.Text.Encoding.UTF8.GetBytes("dotnet");
-            var ver = System.Text.Encoding.UTF8.GetBytes("0.1.0");
+            var name = Encoding.UTF8.GetBytes(DriverName);
+            var ver = Encoding.UTF8.GetBytes(DriverVersion);
             var w = new BinWriter();
             w.U8(8);
             w.U32((uint)name.Length);
@@ -953,7 +1006,19 @@ public sealed class SkaidbConnection : IDisposable
             if (_prepared.Count < 240) _prepared[sql] = v;
             return v;
         }
-        if (tag == 3) throw new UnpreparableException(r.Text());
+        if (tag == 3)
+        {
+            string msg = r.Text();
+            // Only a statement KIND the server refuses (DDL, USE, SHOW …) or
+            // a server too old for OP_PREPARE falls back to client-side
+            // binding. Any other prepare error — a parse error, an unknown
+            // column — is the statement's real error and surfaces as such;
+            // retrying it as text would fail again, or fail on a value the
+            // text binder cannot render and hide the real message.
+            if (msg.Contains("cannot be prepared") || msg.Contains("unknown opcode"))
+                throw new UnpreparableException(msg);
+            throw new SkaidbException(msg);
+        }
         throw new SkaidbException($"unexpected prepare response tag {tag}");
     }
 
@@ -1030,6 +1095,16 @@ public sealed class SkaidbConnection : IDisposable
             case sbyte or byte or short or ushort or int or uint or long:
                 w.U8(2); w.I64(Convert.ToInt64(v, CultureInfo.InvariantCulture));
                 return;
+            case ulong ul:
+                // Int is i64; the upper half of ulong's range travels as an
+                // exact Decimal (scale 0) rather than being truncated.
+                if (ul <= long.MaxValue) { w.U8(2); w.I64((long)ul); }
+                else EncodeDecimal(new BigInteger(ul), 0, w);
+                return;
+            case BigInteger bi:
+                if (bi >= long.MinValue && bi <= long.MaxValue) { w.U8(2); w.I64((long)bi); }
+                else EncodeDecimal(bi, 0, w);
+                return;
             case float or double:
             {
                 double d = Convert.ToDouble(v, CultureInfo.InvariantCulture);
@@ -1038,9 +1113,28 @@ public sealed class SkaidbConnection : IDisposable
                 w.U8(3); w.I64(BitConverter.DoubleToInt64Bits(d));
                 return;
             }
+            case decimal m:
+            {
+                // System.Decimal is a 96-bit magnitude, a sign and a scale of
+                // 0..28: exactly a (mantissa, scale) pair, so no rounding.
+                int[] bits = decimal.GetBits(m);
+                uint scale = (uint)((bits[3] >> 16) & 0x7F);
+                bool negative = (bits[3] & unchecked((int)0x80000000)) != 0;
+                BigInteger mag = ((BigInteger)(uint)bits[2] << 64)
+                               | ((BigInteger)(uint)bits[1] << 32)
+                               | (uint)bits[0];
+                EncodeDecimal(negative ? -mag : mag, scale, w);
+                return;
+            }
             case string str:
             {
                 byte[] b = Encoding.UTF8.GetBytes(str);
+                w.U8(5); w.U32((uint)b.Length); w.Raw(b);
+                return;
+            }
+            case char ch:
+            {
+                byte[] b = Encoding.UTF8.GetBytes(ch.ToString());
                 w.U8(5); w.U32((uint)b.Length); w.Raw(b);
                 return;
             }
@@ -1063,8 +1157,15 @@ public sealed class SkaidbConnection : IDisposable
                 w.U8(8); w.I64(dto.ToUnixTimeMilliseconds());
                 return;
             case DateTime dt:
-                w.U8(8); w.I64(new DateTimeOffset(dt.ToUniversalTime()).ToUnixTimeMilliseconds());
+            {
+                // An Unspecified kind is taken as UTC, matching the client-side
+                // binder; Local is converted.
+                var utc = dt.Kind == DateTimeKind.Unspecified
+                    ? DateTime.SpecifyKind(dt, DateTimeKind.Utc)
+                    : dt.ToUniversalTime();
+                w.U8(8); w.I64(new DateTimeOffset(utc).ToUnixTimeMilliseconds());
                 return;
+            }
             case System.Collections.IDictionary map:
             {
                 w.U8(10); w.U32((uint)map.Count);
@@ -1088,6 +1189,19 @@ public sealed class SkaidbConnection : IDisposable
             }
         }
         throw new SkaidbException($"cannot bind value of type {v.GetType().Name}");
+    }
+
+    /// <summary>Decimal (tag 4): i128 little-endian mantissa, then u32 scale.</summary>
+    private static void EncodeDecimal(BigInteger mantissa, uint scale, BinWriter w)
+    {
+        byte[] le = mantissa.ToByteArray(isUnsigned: false, isBigEndian: false);
+        if (le.Length > 16)
+            throw new SkaidbException("cannot bind decimal: mantissa does not fit 128 bits");
+        var wide = new byte[16];
+        Array.Copy(le, wide, le.Length);
+        if (mantissa.Sign < 0)
+            for (int i = le.Length; i < 16; i++) wide[i] = 0xFF;   // sign-extend
+        w.U8(4); w.Raw(wide); w.U32(scale);
     }
 
     private QueryResult Roundtrip(byte[] request)
