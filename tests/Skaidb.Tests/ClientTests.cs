@@ -86,7 +86,7 @@ public class ClientTests
             .Answer("SELECT id, name FROM t", F.Rows(new[] { "id", "name" }, new object?[] { 1L, "Ada" }, new object?[] { 2L, null }))
             .Answer("INSERT INTO t VALUES (1)", F.Mutation(3))
             .Answer("CREATE TABLE t (PRIMARY KEY (id))", F.Ddl())
-            .Answer("SELECT nope", F.Error("no such column nope"))
+            .Answer("SELECT 1 FROM no_such_table", F.Error("table \"no_such_table\" does not exist"))
             .Answer("SELECT 1 AT LEVEL", req => F.Rows(new[] { "c" }, new object?[] { (long)req.Consistency }));
         using var srv = new FakeServer(s.Handle);
         using var c = Connect(srv, "Consistency=One");
@@ -131,9 +131,9 @@ public class ClientTests
         }
         using (var cmd = c.CreateCommand())
         {
-            cmd.CommandText = "SELECT nope";
+            cmd.CommandText = "SELECT 1 FROM no_such_table";
             var e = Assert.Throws<SkaidbException>(() => cmd.ExecuteReader());
-            Assert.Equal("no such column nope", e.Message);
+            Assert.Equal("table \"no_such_table\" does not exist", e.Message);
         }
         Assert.True(c.IsUsable);                                         // a statement error keeps the connection
         Assert.Equal(0L, Scalar(c, "SELECT 1 AT LEVEL"));                // connection default One

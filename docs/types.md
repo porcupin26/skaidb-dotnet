@@ -18,7 +18,7 @@ command has parameters).
 | Uuid | `Guid` | `Guid` (sent in RFC 4122 byte order, not `Guid.ToByteArray()` order) |
 | Timestamp | `DateTimeOffset`, offset zero, millisecond precision (may predate 1970) | `DateTimeOffset` (any offset; the instant is kept), `DateTime` (`Utc` and `Unspecified` kinds are taken as UTC, `Local` is converted) |
 | Array | `object?[]` of mapped values | any `IEnumerable` that is not a `string`, `byte[]` or dictionary (`object[]`, `List<T>`, `T[]`…), nested |
-| Document | `Dictionary<string, object?>`, insertion order kept | any `IDictionary` whose keys are `string` (`Dictionary<string, object?>`…); non-string keys throw |
+| Document | `Dictionary<string, object?>`, keys in the server's order: the server stores a document with its keys sorted, so that is how they come back, whatever order you bound them in | any `IDictionary` whose keys are `string` (`Dictionary<string, object?>`…); non-string keys throw |
 
 Notes:
 
@@ -26,6 +26,10 @@ Notes:
   culture; `GetValue(i)` gives you the `string` so nothing is rounded.
 - `GetInt32(i)` on a `long` that does not fit throws `OverflowException`
   (from `Convert`).
+- A document's keys come back sorted (`{"z":1,"a":2}` reads back as `a`, `z`):
+  the server canonicalises documents on write, and the driver keeps the
+  order it receives. Look keys up by name; do not rely on enumeration order
+  matching the order you inserted.
 - A `byte[]` result is a copy; mutating it does not affect the driver.
 - `Guid` round-trips exactly: the driver encodes big-endian on the wire and
   builds the `Guid` from its canonical string form on the way back.

@@ -101,6 +101,9 @@ try
         Check(gotDoc is not null && (string)gotDoc["name"]! == "Ada" && (long)gotDoc["n"]! == 42
               && gotDoc["tags"] is object?[] tg && tg.Length == 2 && (string)tg[1]! == "y",
               "document round-trip: " + (gotDoc is null ? r.GetValue(6).GetType().Name : string.Join(", ", gotDoc.Select(kv => kv.Key + "=" + kv.Value))));
+        // Bound as name, n, tags; the server stores documents with sorted keys.
+        Check(gotDoc is not null && gotDoc.Keys.SequenceEqual(new[] { "n", "name", "tags" }),
+              "document keys come back in the server's sorted order: " + (gotDoc is null ? "-" : string.Join(",", gotDoc.Keys)));
         object decVal = r.GetValue(7);
         Check(decVal is decimal dd && dd == dec, $"decimal round-trip: {decVal} ({decVal.GetType().Name})");
         Check(r.GetDecimal(7) == dec, "GetDecimal");
@@ -176,12 +179,12 @@ try
     // ---- errors -------------------------------------------------------------
     try
     {
-        Exec(conn, "SELECT nope FROM dotnet_no_such_table");
-        Check(false, "error did not throw");
+        Exec(conn, "SELECT 1 FROM dotnet_no_such_table");
+        Check(false, "missing table did not throw");
     }
     catch (SkaidbException e)
     {
-        Check(true, $"server error is a SkaidbException: {e.Message}");
+        Check(e.Message.Contains("does not exist"), $"server error is a SkaidbException: {e.Message}");
     }
     Check(conn.IsUsable, "connection usable after a statement error");
     try

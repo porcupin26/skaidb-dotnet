@@ -2,7 +2,7 @@
 
 All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
-[Semantic Versioning](https://semver.org/).
+[Semantic Versioning](https://semver.org/). Release dates are UTC.
 
 ## [1.0.0] - 2026-09-20
 
@@ -48,6 +48,14 @@ run against a live server: the fixes below are what that found.
   Stream, Tls, Pool, Subscribe).
 
 ### Fixed
+- Documentation: a document's keys come back in the server's sorted order,
+  not the order they were bound in (the server canonicalises documents on
+  write; the driver keeps the wire order). The README and `docs/types.md`
+  claimed "insertion order kept"; the live test now asserts the sorted order.
+- Documentation: the statement-error example was `SELECT nope` →
+  `no such column …`, which the server does not raise (an unknown bare column
+  yields a NULL column). The example is now a missing table
+  (`table "…" does not exist`), which is what the live test exercises.
 - Binding a `decimal` parameter to a prepared statement threw `cannot bind
   value of type Decimal`: the typed encoder had no Decimal case. It now
   encodes the exact (mantissa, scale) pair, as does a `BigInteger` or `ulong`

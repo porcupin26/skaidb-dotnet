@@ -187,8 +187,11 @@ public class CodecTests
     }
 
     [Fact]
-    public void Document_keeps_insertion_order_and_requires_string_keys()
+    public void Document_keeps_wire_order_and_requires_string_keys()
     {
+        // In-process encode -> decode keeps the order the keys were written in.
+        // A stored document comes back from the server with its keys sorted
+        // (the server canonicalises on write); tests/Live asserts that.
         var doc = new Dictionary<string, object?> { ["z"] = 1L, ["a"] = "x", ["n"] = null, ["sub"] = new Dictionary<string, object?> { ["k"] = 2.5 } };
         byte[] b = Enc(doc);
         Assert.Equal(10, b[0]);

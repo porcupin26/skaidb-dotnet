@@ -1337,8 +1337,9 @@ public sealed class SkaidbConnection : IDisposable
             case TagDocument:
             {
                 uint count = r.U32();
-                // Preserve insertion order. Dictionary preserves insertion order
-                // for enumeration as long as nothing is removed.
+                // Keep the wire order (a Dictionary enumerates in insertion order
+                // as long as nothing is removed). The server stores documents with
+                // their keys sorted, so that is the order a stored document has here.
                 var doc = new Dictionary<string, object?>((int)count);
                 for (int i = 0; i < count; i++)
                 {

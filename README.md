@@ -331,8 +331,11 @@ pool before the first row is read. More in [docs/pooling.md](docs/pooling.md).
 
 Every error the driver raises is a `SkaidbException`.
 
-- **Statement errors** (`SELECT nope` → `no such column …`) throw; the
-  connection stays usable.
+- **Statement errors** (`SELECT 1 FROM no_such_table` →
+  `table "no_such_table" does not exist`, a parse error, a constraint
+  violation) throw; the connection stays usable. Note that an unknown bare
+  column name in a select list is *not* an error on the server: `SELECT nope
+  FROM t` returns a column `nope` of NULLs.
 - **Transport errors** throw `read failed: …` / `write failed: …` /
   `connection closed by server` from the in-flight statement and mark the
   connection *broken*, not closed. The next statement **re-dials** (through
@@ -370,7 +373,7 @@ streaming: …`, `unknown connection string key: …`.
 | Uuid | `Guid` | `Guid` |
 | Timestamp | `DateTimeOffset` (UTC, millisecond precision) | `DateTimeOffset`, `DateTime` (Unspecified kind is taken as UTC) |
 | Array | `object?[]` (nested values follow this table) | any `IEnumerable` (except `string`/`byte[]`/dictionaries) |
-| Document | `Dictionary<string, object?>`, insertion order kept | any `IDictionary` with `string` keys |
+| Document | `Dictionary<string, object?>`, keys in the server's order (sorted by key, not the order you inserted them) | any `IDictionary` with `string` keys |
 
 Typed getters: `GetBoolean`, `GetInt32`, `GetInt64`, `GetDouble`,
 `GetDecimal`, `GetString`, `GetGuid`, `GetDateTimeOffset`, `GetBytes`,
