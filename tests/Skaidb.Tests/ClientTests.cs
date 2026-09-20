@@ -160,7 +160,7 @@ public class ClientTests
         var doc = new Dictionary<string, object?> { ["k"] = DateTimeOffset.FromUnixTimeMilliseconds(5), ["n"] = null, ["b"] = new byte[] { 0x7a } };
         Assert.Equal(true, Scalar(c, sql, 1L << 62, new object?[] { "a", "b" }, doc));
         Assert.Equal(true, Scalar(c, sql, 1, Array.Empty<object>(), new Dictionary<string, object?>()));
-        Assert.Single(srv.Requests.Where(q => q.Op == 2));                // prepared once
+        Assert.Single(srv.Requests, q => q.Op == 2);                     // prepared once
         Assert.Equal(2, executed.Count);
         Assert.Equal(2, executed[0].Consistency);
         Assert.Equal(1L << 62, executed[0].Params[0]);
@@ -211,7 +211,7 @@ public class ClientTests
         cmd.Parameters.Add(new object?[] { "x" });
         var e = Assert.Throws<SkaidbException>(() => cmd.ExecuteNonQuery());
         Assert.Contains("Keyword(By)", e.Message);
-        Assert.Empty(srv.Requests.Where(q => q.Op == 1));                 // no text retry
+        Assert.DoesNotContain(srv.Requests, q => q.Op == 1);              // no text retry
         Assert.True(c.IsUsable);
     }
 
