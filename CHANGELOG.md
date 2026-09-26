@@ -4,6 +4,61 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.1.0] - 2026-09-26
+
+### Added
+- A genuine ADO.NET provider. `SkaidbConnection` now derives from
+  `DbConnection`, `SkaidbCommand` from `DbCommand`, `SkaidbDataReader` from
+  `DbDataReader` and `SkaidbException` from `DbException`; new
+  `SkaidbParameter`/`SkaidbParameterCollection` (`DbParameter`),
+  `SkaidbConnectionStringBuilder` (`DbConnectionStringBuilder`),
+  `SkaidbBatch`/`SkaidbBatchCommand` (`DbBatch`, merging runs of one
+  parameterised statement into a single `OP_EXECUTE_BATCH`) and
+  `SkaidbFactory` (`DbProviderFactory`, static `Instance`, invariant name
+  `Skaidb` in `SkaidbFactory.ProviderInvariantName`). Register with
+  `DbProviderFactories.RegisterFactory("Skaidb", SkaidbFactory.Instance)`.
+  Dapper works as-is.
+- `@name` and `$N` placeholders, rewritten to the server's `?` before
+  preparing; `Parameters.AddWithValue(name, value)`.
+  `CommandType.StoredProcedure` runs `CALL name(?, …)`.
+- Reader: `GetFieldValue<T>`, `GetSchemaTable()`, `GetFieldType`,
+  `GetDataTypeName`, `RecordsAffected`, `HasRows`, `GetDateTime`,
+  `GetValues`, chunked `GetBytes`/`GetChars`, `CommandBehavior.CloseConnection`.
+- Connection strings: `Host` takes a comma list of `host[:port]` seeds
+  (`[v6]:port` too), values may be quoted, `Username` is the canonical key
+  name. `SkaidbConnection()` plus a settable `ConnectionString`,
+  `State`/`StateChange`, `DataSource`, `ChangeDatabase()`.
+- Certificate login (wire mechanism EXTERNAL): `TlsClientCert` /
+  `TlsClientKey` present a PEM client certificate, and
+  `AuthMechanism=Certificate` makes it the login. Without an explicit
+  `Username` the AuthStart carries an empty name, so the certificate's CN
+  decides (the `anonymous` default is never sent).
+- `SkaidbConnection.StreamAffected`: the affected-row count of a streamed
+  mutation.
+- The shared wire-protocol conformance suite (`conformance/vectors.json`,
+  vendored from https://skaidb.org/conformance/vectors.json) runs in the
+  unit tests; CI fails when the vendored copy differs from the published one.
+
+### Changed
+- `Close()` releases the socket but no longer disposes the connection:
+  `Open()` dials again. `Dispose()` stays final.
+- `SkaidbCommand.Parameters` is a `SkaidbParameterCollection` (was
+  `List<object?>`); `Parameters.Add(value)` still adds a positional value.
+  Code that used other `List<T>` members, or that was compiled against 1.0.x,
+  needs a rebuild.
+- `BeginTransaction()` throws `NotSupportedException` (the protocol has no
+  transactions; every statement autocommits).
+- An invalid `Port` or `Timeout` in a connection string throws
+  `SkaidbException` (was a raw `FormatException`); `Port` must be 1-65535 and
+  `Timeout` positive.
+
+### Fixed
+- Found by the conformance suite: a streamed mutation's affected-row count
+  was lost (`Stream()` yielded nothing and exposed no count), and
+  `StreamColumns` kept the previous stream's columns after a non-row or
+  failed stream.
+- A `Host` value carrying a port (`Host=db1:7001`) dialled `db1:7001:7000`.
+
 ## [1.0.1] - 2026-09-20
 
 Release automation: published from GitHub Actions. No driver code changed.

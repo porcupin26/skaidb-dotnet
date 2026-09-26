@@ -55,9 +55,29 @@ new SkaidbConnectionPool("Seeds=db1:7000,db2:7000,db3:7000;TlsCa=/etc/skaidb/ca.
 
 ## Client certificates
 
-The driver does not present a client certificate; identity is the SCRAM
-user. A server configured to require client certificates on the binary port
-will reject this driver's handshake.
+`TlsClientCert` / `TlsClientKey` (PEM files) make the driver present a
+client certificate in the TLS handshake, which a server with
+`client_tls = "required"` and client verification needs. The key may live in
+the certificate file; then leave `TlsClientKey` out. Either key implies
+`Tls`. On its own the certificate only opens the TLS session; the login is
+still the SCRAM user.
+
+With `AuthMechanism=Certificate` the certificate IS the login (wire
+mechanism EXTERNAL): the server maps its Common Name to a role and no
+password is sent. The server needs `auth.x509_enabled`, and its client CA
+must have signed the certificate.
+
+```csharp
+new SkaidbConnection("Host=db1;TlsCa=/etc/skaidb/ca.crt;" +
+                     "TlsClientCert=/etc/app/app.crt;TlsClientKey=/etc/app/app.key;" +
+                     "AuthMechanism=Certificate;Database=app");
+```
+
+Give `Username` only to assert the expected identity: it must equal the
+certificate's CN, and a certificate mapped to a different role fails the
+connect. Without it the driver sends an empty name (not the `anonymous`
+default) and the CN decides. `AuthMechanism=Certificate` without
+`TlsClientCert` fails before dialing.
 
 ## Failure modes
 
@@ -67,6 +87,7 @@ will reject this driver's handshake.
 | `connect failed: … handshake` on a server without TLS | TLS was requested on a plaintext listener. Drop the TLS keys. |
 | `connection closed by server` during `Open()` without TLS | The server has `client_tls = required`. Add `TlsCa`. |
 | `connect failed: Could not find file '/etc/skaidb/ca.crt'` | `TlsCa` path unreadable. |
+| `authentication denied: …` with `AuthMechanism=Certificate` | The server does not accept the certificate as a login: `auth.x509_enabled` is off, its CN maps to no role, or `Username` differs from the CN. |
 
 The example in [`examples/Tls`](../examples/Tls/Program.cs) opens a verified
 connection and lists the databases.

@@ -2,21 +2,24 @@
 
 [![CI](https://github.com/porcupin26/skaidb-dotnet/actions/workflows/ci.yml/badge.svg)](https://github.com/porcupin26/skaidb-dotnet/actions/workflows/ci.yml)
 
-The official [skaidb](https://skaidb.org/) driver for .NET. The API is
-[ADO.NET](https://learn.microsoft.com/dotnet/framework/data/adonet/)-shaped —
-`SkaidbConnection`, `SkaidbCommand`, `SkaidbDataReader` — so if you have used
-`SqlConnection`/`SqlCommand`/`SqlDataReader` you already know it. **Pure BCL**:
-no NuGet dependencies, one source file, targets `net8.0`.
+The official [skaidb](https://skaidb.org/) driver for .NET: a genuine
+[ADO.NET](https://learn.microsoft.com/dotnet/framework/data/adonet/) provider.
+`SkaidbConnection`, `SkaidbCommand`, `SkaidbParameter`, `SkaidbDataReader`,
+`SkaidbBatch` and `SkaidbFactory` derive from `System.Data.Common`, so the
+driver works wherever a `DbConnection` does — `DbProviderFactories`, Dapper,
+provider-agnostic data layers. **Pure BCL**: no NuGet dependencies, one source
+file, targets `net8.0`.
 
 - Speaks skaidb's binary protocol directly: SCRAM-SHA-256 authentication,
   server-side prepared statements with typed parameters, streaming result
   sets, one-round-trip batches, full type fidelity (`long`, `decimal`, `Guid`,
   `byte[]`, `DateTimeOffset`, arrays, documents).
-- Multi-seed failover, transparent reconnect, TLS, connection pooling,
-  stream subscriptions, multiple result sets.
+- Multi-seed failover, transparent reconnect, TLS (including client
+  certificate login), connection pooling, stream subscriptions, multiple
+  result sets.
 
 Full documentation: this README, the [`docs/`](docs/) folder
-([getting started](docs/getting-started.md) · [API reference](docs/api.md) ·
+([getting started](docs/getting-started.md) · [ADO.NET](docs/adonet.md) · [API reference](docs/api.md) ·
 [types](docs/types.md) · [TLS](docs/tls.md) · [streaming](docs/streaming.md) ·
 [pooling](docs/pooling.md)), runnable [`examples/`](examples/), the
 [changelog](CHANGELOG.md), the
@@ -33,7 +36,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.0.1
+V=1.1.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -56,7 +59,7 @@ dotnet add reference path/to/skaidb-dotnet/Skaidb.csproj
 using Skaidb;
 
 using var conn = new SkaidbConnection(
-    "Host=localhost;Port=7000;User=skaidb;Password=secret;Database=app");
+    "Host=localhost;Port=7000;Username=skaidb;Password=secret;Database=app");
 conn.Open();   // TCP connect + SCRAM-SHA-256 handshake
 
 using (var cmd = conn.CreateCommand())
@@ -90,27 +93,37 @@ wrap them in `using`. Every error the driver raises is a `SkaidbException`.
 ## Connecting
 
 ```csharp
-new SkaidbConnection("Host=db1;Port=7000;User=app;Password=secret;Database=app;Consistency=Quorum;Timeout=10");
+new SkaidbConnection("Host=db1,db2,db3:7001;Port=7000;Username=app;Password=secret;Database=app;Consistency=Quorum;Timeout=10");
 new SkaidbConnection(host: "db1", port: 7000, user: "app", password: "secret", database: "app");
+
+var csb = new SkaidbConnectionStringBuilder { Host = "db1,db2", Username = "app", Password = "p;w" };
+new SkaidbConnection(csb.ConnectionString);
 ```
 
-Connection strings are `;`-separated `Key=Value` pairs, keys case-insensitive:
+Connection strings are `;`-separated `Key=Value` pairs, keys case-insensitive,
+values may be quoted (`Password='a;b'`). `SkaidbConnectionStringBuilder`
+parses and builds them with typed properties; an unknown key or an invalid
+value is an error (`SkaidbException` from the connection, `ArgumentException`
+from the builder).
 
 | Key | Aliases | Default | Meaning |
 |---|---|---|---|
-| `Host` | `Server`, `Data Source` | `localhost` | Host to dial when `Seeds` is not given. |
-| `Port` | | `7000` | Port to dial. |
-| `Seeds` | | — | `db1:7000,db2:7000,db3:7000`; overrides `Host`/`Port`. Shuffled on every connect. |
-| `User` | `Username`, `User Id`, `Uid` | `anonymous` | User name. |
+| `Host` | `Server`, `Data Source`, `DataSource` | `localhost` | One host or a comma list `a,b:7001,[::1]:7002`: every entry is a seed; one without a port gets `Port`. |
+| `Port` | | `7000` | Port for hosts that carry none. |
+| `Seeds` | | — | `db1:7000,db2:7000`; an explicit seed list that overrides `Host`/`Port`. Shuffled on every connect. |
+| `Username` | `User`, `User Id`, `UserId`, `Uid` | `anonymous` | User name. |
 | `Password` | `Pwd` | *(empty)* | Password. Empty means anonymous; mutual authentication is skipped. |
 | `Database` | `Db` | — | Selected with `USE` after every (re)connect. |
 | `Consistency` | | `Quorum` | `One`, `Quorum` or `All` (or `0`/`1`/`2`); the default for every command. |
-| `Timeout` | `Connect Timeout` | `10` | Seconds; applies to the connect and to every socket read and write. |
+| `Timeout` | `Connect Timeout`, `ConnectTimeout` | `10` | Seconds; applies to the connect and to every socket read and write. |
 | `Tls`, `TlsCa`, `TlsInsecure`, `TlsServerName` | | | See [TLS](#tls). |
+| `TlsClientCert`, `TlsClientKey` | `Tls Client Cert`, `Tls Client Key` | — | PEM client certificate (and key) to present; see [TLS](#tls). |
+| `AuthMechanism` | `Auth Mechanism` | `Scram` | `Scram`, or `Certificate`: the TLS client certificate is the login. |
 
 `Open()` is idempotent. `IsOpen` says whether the handshake completed;
 `IsUsable` additionally reports that the socket is alive, no stream is in
-flight and no transport error is pending.
+flight and no transport error is pending. `Close()` releases the socket and
+keeps the settings — `Open()` dials again; `Dispose()` is final.
 
 ### Seeds and failover
 
@@ -129,9 +142,12 @@ survives the node it was talking to going away.
 | `TlsCa=/path/ca.crt` | TLS, certificate verified against this PEM bundle. Implies `Tls`. |
 | `TlsInsecure=true` | TLS with **no** certificate verification: encrypts, authenticates nothing. Development only. Implies `Tls`. |
 | `TlsServerName` | SNI / name to verify (default `skaidb`). Must match a SAN on the server certificate, which is usually *not* the address you dialled — skaidb's own certificates carry `DNS:skaidb`. |
+| `TlsClientCert`, `TlsClientKey` | Present this PEM client certificate (the key may live in the certificate file; then omit `TlsClientKey`). Implies `Tls`. |
+| `AuthMechanism=Certificate` | The client certificate IS the login (wire mechanism EXTERNAL): no password is sent, the server maps the certificate's Common Name to a role. Needs `auth.x509_enabled` on the server. `Username`, when given, must equal the CN; left unset, an empty name is sent and the CN decides. |
 
 ```csharp
 new SkaidbConnection("Seeds=db1:7000,db2:7000;User=app;Password=secret;TlsCa=/etc/skaidb/skai-ca.crt");
+new SkaidbConnection("Host=db1;TlsCa=/etc/skaidb/ca.crt;TlsClientCert=/etc/app/app.crt;TlsClientKey=/etc/app/app.key;AuthMechanism=Certificate");
 ```
 
 More in [docs/tls.md](docs/tls.md).
@@ -177,8 +193,20 @@ waits for the lock, or — while a stream is open — is refused. Use a
 
 ### Parameters and prepared statements
 
-Placeholders are `?`, bound positionally from `cmd.Parameters` in order. A
-`?` inside a string literal is left alone.
+Three placeholder styles:
+
+| Style | Bound from |
+|---|---|
+| `?` | `cmd.Parameters` in order: `cmd.Parameters.Add(value)` |
+| `@name` | the parameter whose `ParameterName` is `name` or `@name` (exact match first, then case-insensitive): `cmd.Parameters.AddWithValue("@name", value)`; a name may repeat |
+| `$1`, `$2`, … | `cmd.Parameters[N-1]`, whatever its name |
+
+The server's prepared statements only know `?`: the driver rewrites `@name`
+and `$N` to `?` (outside `'…'` literals, `"…"` identifiers and comments) and
+sends the values in placeholder order. One statement uses one style; mixing
+`?` with the others is an error, as is an `@name` with no parameter.
+`cmd.Parameters.Add(x)` takes a bare value (a positional parameter) or a
+`SkaidbParameter`.
 
 With parameters the driver **prepares the statement on the server** (once per
 distinct SQL text per connection, cached up to 240 entries) and sends the
@@ -233,11 +261,48 @@ do
 
 ### Transactions
 
-Every statement autocommits; the driver adds no transaction API of its own.
-Whatever transaction statements your server version supports are plain SQL
-sent through a command on one connection — but on a **cluster** `BEGIN` is
-not supported, and every statement is applied on its own. `ExecuteBatch` rows
-autocommit one by one, as described above.
+Every statement autocommits. The wire protocol has no transactions, so
+`BeginTransaction()` throws `NotSupportedException` (and setting a non-null
+`DbCommand.Transaction` does too). Whatever transaction statements your
+server version supports are plain SQL sent through a command on one
+connection — but on a **cluster** `BEGIN` is not supported, and every
+statement is applied on its own. `ExecuteBatch` rows autocommit one by one,
+as described above.
+
+## ADO.NET
+
+The driver is a registered-style ADO.NET provider. Register the factory once
+at startup to resolve it by name:
+
+```csharp
+using System.Data.Common;
+using Skaidb;
+
+DbProviderFactories.RegisterFactory(SkaidbFactory.ProviderInvariantName, SkaidbFactory.Instance);   // "Skaidb"
+
+DbProviderFactory factory = DbProviderFactories.GetFactory("Skaidb");
+using DbConnection conn = factory.CreateConnection()!;
+conn.ConnectionString = "Host=db1,db2;Username=app;Password=secret;Database=app";
+conn.Open();
+```
+
+- `SkaidbConnection : DbConnection`, `SkaidbCommand : DbCommand`,
+  `SkaidbParameter : DbParameter`, `SkaidbParameterCollection`,
+  `SkaidbDataReader : DbDataReader` (`GetFieldValue<T>`, `GetSchemaTable()`,
+  `NextResult()`, `RecordsAffected`), `SkaidbConnectionStringBuilder`,
+  `SkaidbFactory : DbProviderFactory`, and `SkaidbBatch : DbBatch`.
+- **Dapper** works as-is: `conn.Query<User>("SELECT id, name FROM users
+  WHERE id = @id", new { id = 1L })`.
+- **`DbBatch`**: consecutive batch commands with the same parameterised
+  statement go to the server as ONE `OP_EXECUTE_BATCH` round-trip; anything
+  else runs one statement at a time, in order. A merged command reports
+  `RecordsAffected` -1 (the server returns only the run's total, which
+  `ExecuteNonQuery()` sums).
+- **Async**: the driver's I/O is synchronous, so the `…Async` methods are
+  the ADO.NET base implementations (they complete synchronously).
+- **Errors**: `SkaidbException` derives from `DbException`.
+
+Details in [docs/adonet.md](docs/adonet.md).
 
 ## Streaming large results — `conn.Stream(sql, consistency?)`
 
@@ -252,7 +317,8 @@ Console.WriteLine(string.Join(",", conn.StreamColumns));   // set once the heade
 ```
 
 It takes **no parameters** (the streaming opcode carries SQL text only). A
-non-row statement streamed this way yields nothing. An error before any row
+non-row statement streamed this way yields nothing (`conn.StreamAffected`
+then holds a mutation's count). An error before any row
 is an ordinary statement error; an error partway through (a node dying
 mid-scan, a scan budget tripping) is thrown after the rows already yielded,
 which are valid.
@@ -332,7 +398,7 @@ pool before the first row is read. More in [docs/pooling.md](docs/pooling.md).
 
 ## Reconnect and errors
 
-Every error the driver raises is a `SkaidbException`.
+Every error the driver raises is a `SkaidbException` (a `DbException`).
 
 - **Statement errors** (`SELECT 1 FROM no_such_table` →
   `table "no_such_table" does not exist`, a parse error, a constraint
@@ -352,8 +418,8 @@ Every error the driver raises is a `SkaidbException`.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   (`IsUsable` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.
-- `Close()`/`Dispose()` are terminal: a disposed connection never reconnects
-  (`ObjectDisposedException`).
+- `Close()` releases the socket and `Open()` dials again; `Dispose()` is
+  terminal: a disposed connection never reconnects (`ObjectDisposedException`).
 
 Common messages: `connect failed: …`, `connect to … timed out`, `no reachable
 endpoint in …`, `authentication denied: …`, `server signature mismatch
@@ -378,10 +444,11 @@ streaming: …`, `unknown connection string key: …`.
 | Array | `object?[]` (nested values follow this table) | any `IEnumerable` (except `string`/`byte[]`/dictionaries) |
 | Document | `Dictionary<string, object?>`, keys in the server's order (sorted by key, not the order you inserted them) | any `IDictionary` with `string` keys |
 
-Typed getters: `GetBoolean`, `GetInt32`, `GetInt64`, `GetDouble`,
-`GetDecimal`, `GetString`, `GetGuid`, `GetDateTimeOffset`, `GetBytes`,
+Typed getters: `GetBoolean`, `GetInt16`, `GetInt32`, `GetInt64`,
+`GetFloat`, `GetDouble`, `GetDecimal`, `GetString`, `GetGuid`,
+`GetDateTime` (UTC), `GetDateTimeOffset`, `GetBytes`, `GetFieldValue<T>`,
 `GetValue`, `this[int]`, `this[string]`; they throw `SkaidbException` on a
-NULL cell. In the client-side fallback (unpreparable statements) a
+NULL cell (`GetFieldValue<T>` returns `null` for a nullable `T`). In the client-side fallback (unpreparable statements) a
 `DateTimeOffset` renders as its epoch milliseconds, a `byte[]` as a hex
 string, and arrays/documents cannot be bound at all. Details in
 [docs/types.md](docs/types.md).
@@ -396,7 +463,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.0.1
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.1.0
 ```
 
 ## Compatibility
@@ -408,6 +475,25 @@ SELECT client_name, client_version FROM drivers;   -- dotnet | 1.0.1
   `server does not support streaming`), multiple result sets a server with
   `EMIT`, the `drivers` row a server ≥ 0.203.0.
 - **Wire protocol**: <https://skaidb.org/docs/PROTOCOL.html>.
+
+## Conformance
+
+`tests/Skaidb.Tests/ConformanceTests.cs` runs skaidb's shared wire-protocol
+conformance suite: `conformance/vectors.json`, generated from the server's
+reference encoders and vendored byte-identical from
+<https://skaidb.org/conformance/vectors.json> (contract in
+[conformance/README.md](conformance/README.md); CI fails when the vendored
+copy differs from the published one). It checks every value vector through
+the driver's decoder and encoder, the SCRAM computations, the auth outcomes
+(including a forged server signature, which must fail the connect), and
+every case through the public API against a scripted fake server that
+verifies the client proof independently and replays the reference bytes.
+
+Nothing is skipped by call method: `query`, `query_stream`,
+`execute_prepared`, `execute_batch` and `sequence` all run. One value is
+checked only one way: `decimal_wide` (31 digits) decodes to its documented
+form, a decimal string, but has no bindable .NET value, so its encode is
+skipped.
 
 ## Development
 

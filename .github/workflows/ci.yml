@@ -22,9 +22,13 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ matrix.dotnet }}
+      - name: Conformance vectors match the published copy
+        run: |
+          curl -fsSL https://skaidb.org/conformance/vectors.json -o "$RUNNER_TEMP/published-vectors.json"
+          cmp conformance/vectors.json "$RUNNER_TEMP/published-vectors.json" || { echo "::error::conformance/vectors.json differs from https://skaidb.org/conformance/vectors.json: re-vendor it byte-identical"; exit 1; }
       - name: Build (library, tests, examples; library warnings are errors)
         run: dotnet build Skaidb.sln -c Release
-      - name: Unit tests (xunit, in-process fake server, no skaidb needed)
+      - name: Unit tests (xunit, in-process fake server, no skaidb needed; includes the conformance suite)
         run: dotnet test tests/Skaidb.Tests -c Release --no-build --logger "console;verbosity=normal"
       - name: Live test is skipped without a server
         run: dotnet run --project tests/Live -c Release --no-build

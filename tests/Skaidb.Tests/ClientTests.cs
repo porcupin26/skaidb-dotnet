@@ -63,6 +63,12 @@ public class ClientTests
         Assert.Single(srv.Hellos);
         c.Close();
         Assert.False(c.IsUsable);
+        Assert.False(c.IsOpen);
+        c.Open();                                   // Close is not final: it re-dials
+        Assert.True(c.IsUsable);
+        Assert.Equal(2, srv.Hellos.Count);
+        c.Dispose();                                // Dispose is
+        Assert.False(c.IsUsable);
         Assert.Throws<ObjectDisposedException>(() => c.Open());
     }
 

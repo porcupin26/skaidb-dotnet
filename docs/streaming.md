@@ -22,11 +22,15 @@ Console.WriteLine($"{n} rows, columns {string.Join(",", conn.StreamColumns)}");
 - Rows are `object?[]` cell arrays in column order (see [types.md](types.md)
   for the values); NULL is `null` here, not `DBNull`.
 - `conn.StreamColumns` holds the column names once the header has arrived,
-  i.e. after the first `MoveNext()`.
+  i.e. after the first `MoveNext()`. Each `Stream()` starts it empty, so it
+  stays empty for a statement that returns no rows or fails before its
+  header.
 - The optional consistency overrides the connection's for this statement.
 - It takes **no parameters**: the streaming opcode carries SQL text only.
   Quote values yourself or select a wider range and filter client-side.
-- A non-row statement (`INSERT`, DDL) streamed this way yields nothing.
+- A non-row statement (`INSERT`, DDL) streamed this way yields nothing; for
+  a mutation `conn.StreamAffected` then holds the affected-row count (it is
+  `null` for rows and DDL).
 - An error *before* the header is an ordinary statement error thrown from
   the first `MoveNext()`. An error *after* the header (a node dying mid-scan,
   a scan budget tripping) is thrown from the `MoveNext()` that meets it; the

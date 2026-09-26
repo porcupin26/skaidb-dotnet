@@ -1,6 +1,7 @@
 # skaidb C# / .NET driver — documentation
 
 - [Getting started](getting-started.md) — install, connect, first statements, failover, TLS.
+- [ADO.NET](adonet.md) — the provider: factory registration, connection strings, placeholders, readers, `DbBatch`, Dapper.
 - [API reference](api.md) — every public type, member, connection-string key and result shape.
 - [Types](types.md) — the value mapping in both directions.
 - [TLS](tls.md) — the three modes, the server name, failure modes.

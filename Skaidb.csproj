@@ -13,14 +13,14 @@
     <!-- The ONE place the driver version lives. The Hello frame reads it
          back from the assembly's informational version; the publish
          workflow refuses a tag that does not match it. -->
-    <Version>1.0.1</Version>
+    <Version>1.1.0</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <PackageId>Skaidb</PackageId>
     <Authors>porcupin26</Authors>
     <Company>skaidb</Company>
     <Product>skaidb</Product>
-    <Description>Official C# / .NET driver for skaidb: an ADO.NET-shaped API over the binary wire protocol. Pure BCL, no dependencies.</Description>
+    <Description>Official C# / .NET driver for skaidb: an ADO.NET provider (DbConnection, DbCommand, DbDataReader, DbBatch, DbProviderFactory) over the binary wire protocol. Pure BCL, no dependencies.</Description>
     <PackageTags>skaidb;database;driver;ado.net;client</PackageTags>
     <!-- nuget.org accepts only OSI- or FSF-approved licenses in a license
          EXPRESSION and rejects the push otherwise; SSPL-1.0 is neither, so

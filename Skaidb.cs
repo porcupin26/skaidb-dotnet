@@ -1,8 +1,11 @@
 // skaidb — official C# / .NET driver.
 //
-// Pure BCL (no NuGet packages). ADO.NET-shaped API with concrete Skaidb* types:
+// Pure BCL (no NuGet packages). A genuine ADO.NET provider: SkaidbConnection,
+// SkaidbCommand, SkaidbParameter, SkaidbDataReader, SkaidbBatch and
+// SkaidbFactory derive from System.Data.Common, so the driver works anywhere a
+// DbConnection does (DbProviderFactories, Dapper, ...).
 //
-//     using var conn = new SkaidbConnection("Host=localhost;Port=7000;User=skaidb;Password=secret");
+//     using var conn = new SkaidbConnection("Host=localhost;Port=7000;Username=skaidb;Password=secret");
 //     conn.Open();
 //     using var cmd = conn.CreateCommand();
 //     cmd.CommandText = "INSERT INTO users (id, name) VALUES (?, ?)";
@@ -11,18 +14,25 @@
 //     cmd.ExecuteNonQuery();
 //
 //     cmd = conn.CreateCommand();
-//     cmd.CommandText = "SELECT id, name FROM users WHERE id = ?";
-//     cmd.Parameters.Add(1);
+//     cmd.CommandText = "SELECT id, name FROM users WHERE id = @id";
+//     cmd.Parameters.AddWithValue("@id", 1);
 //     using var reader = cmd.ExecuteReader();
 //     while (reader.Read())
 //         Console.WriteLine($"{reader.GetInt64(0)} {reader.GetString(1)}");
 //
-// Placeholders use the `?` (qmark) style, bound positionally from Parameters.
+// Placeholders: `?` (bound positionally), `@name` (bound by ParameterName) or
+// `$1` (bound by position); the driver rewrites the latter two to `?` for the
+// server's prepared statements.
 // The wire protocol is documented at https://skaidb.org/docs/PROTOCOL.html.
 
 using System;
 using System.Buffers.Binary;
+using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
 using System.Net.Security;
@@ -33,6 +43,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Skaidb;
 
@@ -44,8 +55,20 @@ public enum SkaidbConsistency : byte
     All = 2,
 }
 
-/// <summary>Thrown on any driver or server-reported error.</summary>
-public class SkaidbException : Exception
+/// <summary>How <see cref="SkaidbConnection"/> authenticates (connection-string key <c>AuthMechanism</c>).</summary>
+public enum SkaidbAuthMechanism : byte
+{
+    /// <summary>SCRAM-SHA-256 with <c>Username</c>/<c>Password</c> (wire mechanism 0). The default.</summary>
+    Scram = 0,
+    /// <summary>The TLS client certificate is the login (wire mechanism 2, EXTERNAL).</summary>
+    Certificate = 2,
+}
+
+/// <summary>
+/// Thrown on any driver or server-reported error. A <see cref="DbException"/>,
+/// so provider-agnostic code can catch it as one.
+/// </summary>
+public class SkaidbException : DbException
 {
     public SkaidbException(string message) : base(message) { }
     public SkaidbException(string message, Exception inner) : base(message, inner) { }
@@ -61,15 +84,28 @@ public sealed class UnpreparableException : SkaidbException
 }
 
 /// <summary>
-/// A connection to one skaidb node. Construct with a connection string or named
-/// arguments, then call <see cref="Open"/> (idempotent) to run the SCRAM handshake.
+/// A connection to a skaidb cluster: an ADO.NET <see cref="DbConnection"/>.
+/// Construct with a connection string (see <see cref="SkaidbConnectionStringBuilder"/>)
+/// or named arguments, then call <see cref="Open"/> (idempotent) to dial a seed
+/// and authenticate. <see cref="Close"/> releases the socket and the connection
+/// can be opened again; <see cref="IDisposable.Dispose"/> is final.
 /// </summary>
-public sealed class SkaidbConnection : IDisposable
+public sealed class SkaidbConnection : DbConnection
 {
-    public string Host { get; }
-    public int Port { get; }
-    public string User { get; }
-    private readonly string _password;
+    /// <summary>First host of the <c>Host</c> key (without a port).</summary>
+    public string Host { get; private set; } = "localhost";
+    /// <summary>Default port for hosts that carry none.</summary>
+    public int Port { get; private set; } = 7000;
+    /// <summary>The login user.</summary>
+    public string User { get; private set; } = "anonymous";
+    private string _password = "";
+    /// <summary>
+    /// Whether a user was given explicitly. Certificate login sends the
+    /// username only then: an empty one lets the certificate's Common Name
+    /// decide, a non-empty one must equal it.
+    /// </summary>
+    private bool _userExplicit;
+    private string _connectionString = "";
 
     /// <summary>Default consistency for commands created from this connection.</summary>
     public SkaidbConsistency Consistency { get; set; }
@@ -139,103 +175,23 @@ public sealed class SkaidbConnection : IDisposable
     }
 
     /// <summary>Parse a connection string such as
-    /// "Host=localhost;Port=7000;User=skaidb;Password=secret;Consistency=Quorum".
-    /// Keys are case-insensitive.</summary>
+    /// "Host=db1,db2:7001;Port=7000;Username=skaidb;Password=secret;Consistency=Quorum".
+    /// Keys are case-insensitive; see <see cref="SkaidbConnectionStringBuilder"/>
+    /// for every key and its aliases.</summary>
     public SkaidbConnection(string connectionString)
     {
         if (connectionString is null) throw new ArgumentNullException(nameof(connectionString));
+        Configure(connectionString);
+    }
 
-        string host = "localhost";
-        int port = 7000;
-        string user = "anonymous";
-        string password = "";
-        SkaidbConsistency consistency = SkaidbConsistency.Quorum;
-        TimeSpan? timeout = null;
-        string database = "";
-        bool tls = false, tlsInsecure = false;
-        string tlsCa = "", tlsServerName = "skaidb", seeds = "";
-
-        foreach (var rawPart in connectionString.Split(';'))
-        {
-            var part = rawPart.Trim();
-            if (part.Length == 0) continue;
-            int eq = part.IndexOf('=');
-            if (eq < 0) throw new SkaidbException($"malformed connection string segment: '{part}'");
-            string key = part.Substring(0, eq).Trim();
-            string val = part.Substring(eq + 1).Trim();
-            switch (key.ToLowerInvariant())
-            {
-                case "host":
-                case "server":
-                case "datasource":
-                case "data source":
-                    host = val;
-                    break;
-                case "port":
-                    port = int.Parse(val, CultureInfo.InvariantCulture);
-                    break;
-                case "user":
-                case "username":
-                case "userid":
-                case "user id":
-                case "uid":
-                    user = val;
-                    break;
-                case "password":
-                case "pwd":
-                    password = val;
-                    break;
-                case "consistency":
-                    consistency = ParseConsistency(val);
-                    break;
-                case "database":
-                case "db":
-                    database = val;
-                    break;
-                case "tls":
-                    tls = val.Equals("true", StringComparison.OrdinalIgnoreCase) || val == "1";
-                    break;
-                case "tlsca":
-                case "tls ca":
-                    tlsCa = val;
-                    break;
-                case "tlsinsecure":
-                case "tls insecure":
-                    tlsInsecure = val.Equals("true", StringComparison.OrdinalIgnoreCase) || val == "1";
-                    break;
-                case "tlsservername":
-                case "tls server name":
-                    tlsServerName = val;
-                    break;
-                case "seeds":
-                    seeds = val;
-                    break;
-                case "timeout":
-                case "connecttimeout":
-                case "connect timeout":
-                    timeout = TimeSpan.FromSeconds(double.Parse(val, CultureInfo.InvariantCulture));
-                    break;
-                default:
-                    throw new SkaidbException($"unknown connection string key: '{key}'");
-            }
-        }
-
-        Host = host;
-        Port = port;
-        Database = database;
-        // A server with client_tls = required refuses plaintext outright, so
-        // without TLS such a cluster is unreachable. Any knob turns it on.
-        Tls = tls || tlsCa.Length > 0 || tlsInsecure;
-        TlsCa = tlsCa;
-        TlsInsecure = tlsInsecure;
-        TlsServerName = tlsServerName;
-        Seeds = seeds.Length > 0
-            ? seeds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            : new[] { $"{host}:{port}" };
-        User = user;
-        _password = password;
-        Consistency = consistency;
-        if (timeout.HasValue) Timeout = timeout.Value;
+    /// <summary>
+    /// A closed connection with every setting at its default; set
+    /// <see cref="ConnectionString"/> before <see cref="Open"/>. This is what
+    /// <see cref="SkaidbFactory.CreateConnection"/> returns.
+    /// </summary>
+    public SkaidbConnection()
+    {
+        Configure("");
     }
 
     /// <summary>Construct from named arguments.</summary>
@@ -251,37 +207,165 @@ public sealed class SkaidbConnection : IDisposable
         bool tlsInsecure = false,
         string tlsServerName = "skaidb")
     {
-        Host = host;
+        var b = new SkaidbConnectionStringBuilder
+        {
+            Host = host,
+            Port = port,
+            Username = user,
+            Password = password,
+            Consistency = consistency,
+            Database = database,
+            Tls = tls,
+            TlsCa = tlsCa,
+            TlsInsecure = tlsInsecure,
+            TlsServerName = tlsServerName,
+        };
+        Apply(b);
+        _userExplicit = user != "anonymous";
+    }
+
+    /// <summary>Parse and apply a connection string; any parse error is a <see cref="SkaidbException"/>.</summary>
+    private void Configure(string connectionString)
+    {
+        SkaidbConnectionStringBuilder b;
+        try
+        {
+            b = new SkaidbConnectionStringBuilder(connectionString);
+        }
+        catch (ArgumentException e)
+        {
+            throw new SkaidbException(e.Message, e);
+        }
+        Apply(b);
+    }
+
+    private void Apply(SkaidbConnectionStringBuilder b)
+    {
+        int port = b.Port;
+        var hosts = b.Host.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (hosts.Length == 0) hosts = new[] { "localhost" };
+        var (firstHost, _) = SplitEndpoint(hosts[0], port);
+        Host = firstHost;
         Port = port;
-        User = user;
-        _password = password;
-        Consistency = consistency;
-        Database = database;
-        Tls = tls || tlsCa.Length > 0 || tlsInsecure;
-        TlsCa = tlsCa;
-        TlsInsecure = tlsInsecure;
-        TlsServerName = tlsServerName;
-        Seeds = new[] { $"{host}:{port}" };
+        _database = b.Database;
+        _tlsClientCert = b.TlsClientCert;
+        _tlsClientKey = b.TlsClientKey;
+        AuthMechanism = b.AuthMechanism;
+        // A server with client_tls = required refuses plaintext outright, so
+        // without TLS such a cluster is unreachable. Any knob turns it on.
+        Tls = b.Tls || b.TlsCa.Length > 0 || b.TlsInsecure || _tlsClientCert.Length > 0
+              || AuthMechanism == SkaidbAuthMechanism.Certificate;
+        TlsCa = b.TlsCa;
+        TlsInsecure = b.TlsInsecure;
+        TlsServerName = b.TlsServerName;
+        string seeds = b.Seeds;
+        if (seeds.Length > 0)
+        {
+            Seeds = seeds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        }
+        else
+        {
+            // Every Host entry is a seed; one without a port gets Port.
+            var list = new List<string>(hosts.Length);
+            foreach (var h in hosts)
+            {
+                var (hh, pp) = SplitEndpoint(h, port);
+                list.Add(hh.Contains(':') ? $"[{hh}]:{pp}" : $"{hh}:{pp}");
+            }
+            Seeds = list;
+        }
+        User = b.Username;
+        _userExplicit = b.ContainsKey("Username");
+        _password = b.Password;
+        Consistency = b.Consistency;
+        Timeout = b.Timeout ?? TimeSpan.FromSeconds(10);
+        _connectionString = b.ConnectionString;
+    }
+
+    /// <summary>
+    /// Split "host", "host:port" or "[v6]:port" into its parts; a bare IPv6
+    /// address (several colons, no brackets) is all host.
+    /// </summary>
+    internal static (string Host, int Port) SplitEndpoint(string endpoint, int defaultPort)
+    {
+        string ep = endpoint.Trim();
+        if (ep.StartsWith('['))
+        {
+            int close = ep.IndexOf(']');
+            if (close < 0) throw new SkaidbException($"malformed endpoint '{endpoint}'");
+            string h6 = ep.Substring(1, close - 1);
+            string rest = ep.Substring(close + 1);
+            if (rest.Length == 0) return (h6, defaultPort);
+            if (!rest.StartsWith(':')) throw new SkaidbException($"malformed endpoint '{endpoint}'");
+            return (h6, ParsePort(rest.Substring(1), endpoint));
+        }
+        int first = ep.IndexOf(':');
+        if (first < 0 || first != ep.LastIndexOf(':')) return (ep, defaultPort);
+        return (ep.Substring(0, first), ParsePort(ep.Substring(first + 1), endpoint));
+    }
+
+    private static int ParsePort(string s, string endpoint)
+    {
+        if (!int.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out int p) || p < 1 || p > 65535)
+            throw new SkaidbException($"invalid port in endpoint '{endpoint}'");
+        return p;
+    }
+
+    /// <summary>
+    /// The connection string. Setting it re-reads every setting and is only
+    /// allowed while the connection is closed. Reading it back gives the
+    /// normalised form (canonical key names), password included.
+    /// </summary>
+    [AllowNull]
+    public override string ConnectionString
+    {
+        get => _connectionString;
+        set
+        {
+            if (_open) throw new InvalidOperationException("the connection string cannot change while the connection is open");
+            Configure(value ?? "");
+        }
     }
 
     /// <summary>
     /// Endpoints to try, in shuffled order, until one connects. skaidb is
     /// leaderless, so any node serves — there is no primary to discover.
+    /// From the <c>Seeds</c> key, else every entry of <c>Host</c>.
     /// </summary>
-    public IReadOnlyList<string> Seeds { get; } = Array.Empty<string>();
+    public IReadOnlyList<string> Seeds { get; private set; } = Array.Empty<string>();
 
-    /// <summary>Session database, selected with USE right after connecting.</summary>
-    public string Database { get; } = "";
+    private string _database = "";
+    /// <summary>Session database, selected with USE right after connecting (and after every re-dial).</summary>
+    public override string Database => _database;
+    /// <summary>The seed list, comma-separated.</summary>
+    public override string DataSource => string.Join(",", Seeds);
+    /// <summary>
+    /// The wire protocol does not report a server version, so this is empty;
+    /// <c>SELECT version()</c> returns it.
+    /// </summary>
+    public override string ServerVersion => "";
+    /// <summary>Open, Closed, or Open|Fetching while a <see cref="Stream"/> holds the connection.</summary>
+    public override ConnectionState State =>
+        !_open ? ConnectionState.Closed
+        : _streaming ? ConnectionState.Open | ConnectionState.Fetching
+        : ConnectionState.Open;
+    /// <summary><see cref="Timeout"/> in whole seconds.</summary>
+    public override int ConnectionTimeout => (int)Timeout.TotalSeconds;
+
     /// <summary>Whether to wrap the connection in TLS.</summary>
-    public bool Tls { get; }
+    public bool Tls { get; private set; }
     /// <summary>PEM CA bundle used to verify the server certificate.</summary>
-    public string TlsCa { get; } = "";
+    public string TlsCa { get; private set; } = "";
     /// <summary>Encrypt without verifying the certificate. Development only.</summary>
-    public bool TlsInsecure { get; }
+    public bool TlsInsecure { get; private set; }
     /// <summary>SNI name; must match a SAN on the server certificate.</summary>
-    public string TlsServerName { get; } = "skaidb";
+    public string TlsServerName { get; private set; } = "skaidb";
+    private string _tlsClientCert = "";
+    private string _tlsClientKey = "";
+    /// <summary>How the connection authenticates: SCRAM (default) or the TLS client certificate.</summary>
+    public SkaidbAuthMechanism AuthMechanism { get; private set; }
 
-    private static SkaidbConsistency ParseConsistency(string value)
+    internal static SkaidbConsistency ParseConsistency(string value)
     {
         switch (value.Trim().ToUpperInvariant())
         {
@@ -298,15 +382,30 @@ public sealed class SkaidbConnection : IDisposable
                 throw new SkaidbException($"invalid consistency '{value}'");
         }
     }
-
     /// <summary>True once <see cref="Open"/> has completed successfully.</summary>
     public bool IsOpen => _open;
 
-    /// <summary>Connect and run the SCRAM-SHA-256 handshake. Idempotent.</summary>
-    public void Open()
+    /// <summary>
+    /// Dial a seed and authenticate (SCRAM-SHA-256, or the TLS client
+    /// certificate with <c>AuthMechanism=Certificate</c>). Idempotent; works
+    /// again after <see cref="Close"/>.
+    /// </summary>
+    public override void Open()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (_open) return;
+        OpenCore();
+        OnStateChange(new StateChangeEventArgs(ConnectionState.Closed, ConnectionState.Open));
+    }
+
+    private void OpenCore()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
+        if (_open) return;
+        _broken = false;   // whatever broke the old socket died with it
+        if (AuthMechanism == SkaidbAuthMechanism.Certificate && _tlsClientCert.Length == 0)
+            throw new SkaidbException(
+                "certificate authentication needs TLS with a client certificate (TlsClientCert, TlsClientKey)");
 
         try
         {
@@ -323,9 +422,7 @@ public sealed class SkaidbConnection : IDisposable
             Exception? last = null;
             foreach (var ep in order)
             {
-                int c = ep.LastIndexOf(':');
-                string h = c > 0 ? ep.Substring(0, c) : ep;
-                int p = c > 0 ? int.Parse(ep.Substring(c + 1), CultureInfo.InvariantCulture) : 7000;
+                var (h, p) = SplitEndpoint(ep, Port);
                 var candidate = new TcpClient { NoDelay = true };
                 candidate.SendTimeout = (int)Timeout.TotalMilliseconds;
                 candidate.ReceiveTimeout = (int)Timeout.TotalMilliseconds;
@@ -357,7 +454,10 @@ public sealed class SkaidbConnection : IDisposable
 
             _tcp = tcp;
             _stream = Tls ? TlsWrap(stream) : stream;
-            Handshake(User, _password);
+            if (AuthMechanism == SkaidbAuthMechanism.Certificate)
+                HandshakeCertificate(_userExplicit ? User : "");
+            else
+                Handshake(User, _password);
             _open = true;
             SendHello();
             // USE is per-connection session state, so it runs on every open.
@@ -414,9 +514,45 @@ public sealed class SkaidbConnection : IDisposable
                 return v.Build(new X509Certificate2(cert));
             };
         }
-        var ssl = new SslStream(raw, leaveInnerStreamOpen: false, cb);
-        ssl.AuthenticateAsClient(TlsServerName);
+        var ssl = new SslStream(raw, leaveInnerStreamOpen: false);
+        var options = new SslClientAuthenticationOptions
+        {
+            TargetHost = TlsServerName,
+            RemoteCertificateValidationCallback = cb,
+        };
+        if (_tlsClientCert.Length > 0)
+        {
+            var client = LoadClientCertificate(_tlsClientCert, _tlsClientKey);
+            options.ClientCertificates = new X509CertificateCollection { client };
+            // Always offer it: the default selection drops a certificate
+            // whose issuer is not in the server's acceptable-CA list, and
+            // then the server sees no certificate at all.
+            options.LocalCertificateSelectionCallback = (_, _, _, _, _) => client;
+        }
+        ssl.AuthenticateAsClient(options);
         return ssl;
+    }
+
+    /// <summary>
+    /// Load the PEM client certificate and its private key (a separate key
+    /// file, or both in <paramref name="certPath"/> when the key path is empty).
+    /// </summary>
+    internal static X509Certificate2 LoadClientCertificate(string certPath, string keyPath)
+    {
+        var cert = keyPath.Length > 0
+            ? X509Certificate2.CreateFromPemFile(certPath, keyPath)
+            : X509Certificate2.CreateFromPemFile(certPath);
+        if (OperatingSystem.IsWindows())
+        {
+            // SChannel will not use an ephemeral (never persisted) key for
+            // client authentication; a PKCS#12 round-trip gives it one.
+            var pfx = cert.Export(X509ContentType.Pkcs12);
+            cert.Dispose();
+#pragma warning disable SYSLIB0057 // X509CertificateLoader is .NET 9+
+            cert = new X509Certificate2(pfx);
+#pragma warning restore SYSLIB0057
+        }
+        return cert;
     }
 
     private void CleanupSocket()
@@ -428,7 +564,43 @@ public sealed class SkaidbConnection : IDisposable
     }
 
     /// <summary>Create a command bound to this connection.</summary>
-    public SkaidbCommand CreateCommand() => new SkaidbCommand(this);
+    public new SkaidbCommand CreateCommand() => new SkaidbCommand(this);
+
+    protected override DbCommand CreateDbCommand() => CreateCommand();
+
+    /// <summary>Create a <see cref="SkaidbBatch"/> bound to this connection.</summary>
+    public new SkaidbBatch CreateBatch() => new SkaidbBatch(this);
+
+    public override bool CanCreateBatch => true;
+
+    protected override DbBatch CreateDbBatch() => CreateBatch();
+
+    protected override DbProviderFactory DbProviderFactory => SkaidbFactory.Instance;
+
+    /// <summary>
+    /// Not supported: the wire protocol has no transactions. Every statement
+    /// autocommits (and a batch commits row by row).
+    /// </summary>
+    protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
+        throw new NotSupportedException(
+            "skaidb connections have no transactions: every statement autocommits");
+
+    /// <summary>
+    /// Switch the session database: runs USE now when open, and on every
+    /// later (re-)dial.
+    /// </summary>
+    public override void ChangeDatabase(string databaseName)
+    {
+        if (string.IsNullOrEmpty(databaseName))
+            throw new ArgumentException("database name must not be empty", nameof(databaseName));
+        if (_open)
+        {
+            using var use = CreateCommand();
+            use.CommandText = "USE \"" + databaseName.Replace("\"", "\"\"") + "\"";
+            use.ExecuteNonQuery();
+        }
+        _database = databaseName;
+    }
 
     /// <summary>One change captured by a stream.</summary>
     public sealed record StreamEvent(string Id, string Op, object? Key, object? Ts, object? Doc);
@@ -511,14 +683,28 @@ public sealed class SkaidbConnection : IDisposable
         }
     }
 
-    public void Close() => Dispose();
-
-    public void Dispose()
+    /// <summary>
+    /// Release the socket. The connection keeps its settings and
+    /// <see cref="Open"/> dials again; prepared statements die with the socket.
+    /// </summary>
+    public override void Close()
     {
-        if (_disposed) return;
-        _disposed = true;
+        bool wasOpen = _open;
         _open = false;
+        _broken = false;
+        _prepared.Clear();
         CleanupSocket();
+        if (wasOpen) OnStateChange(new StateChangeEventArgs(ConnectionState.Open, ConnectionState.Closed));
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_disposed)
+        {
+            Close();
+            _disposed = true;
+        }
+        base.Dispose(disposing);
     }
 
     /// <summary>
@@ -554,7 +740,7 @@ public sealed class SkaidbConnection : IDisposable
         _broken = false;
         try
         {
-            Open();
+            OpenCore();
         }
         catch
         {
@@ -694,14 +880,9 @@ public sealed class SkaidbConnection : IDisposable
         int counter = Interlocked.Increment(ref _nonceCounter);
         string clientNonce = $"cs{Environment.CurrentManagedThreadId}.{counter}.{Environment.TickCount64}";
 
-        // AuthStart: u8 10, str username, str client_nonce
-        {
-            var w = new BinWriter();
-            w.U8(10);
-            w.Str(user);
-            w.Str(clientNonce);
-            WriteFrame(w.ToArray());
-        }
+        // AuthStart: u8 10, str username, str client_nonce (no mechanism
+        // byte: its absence means SCRAM-SHA-256 to every server version)
+        WriteFrame(BuildAuthStart(user, clientNonce, null));
 
         // AuthChallenge: u8 11, blob salt, u32 iterations, str server_nonce
         byte[] salt;
@@ -749,15 +930,51 @@ public sealed class SkaidbConnection : IDisposable
         }
     }
 
-    private static (byte[] proof, byte[] serverSig) ScramProof(
+    /// <summary>
+    /// AuthStart (PROTOCOL.md 2, 2.4): u8 10, str username, str client_nonce,
+    /// then the optional mechanism byte.
+    /// </summary>
+    internal static byte[] BuildAuthStart(string user, string clientNonce, SkaidbAuthMechanism? mechanism)
+    {
+        var w = new BinWriter();
+        w.U8(10);
+        w.Str(user);
+        w.Str(clientNonce);
+        if (mechanism.HasValue) w.U8((byte)mechanism.Value);
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// EXTERNAL (PROTOCOL.md 2.4): the TLS client certificate is the
+    /// credential and its Common Name the username (<paramref name="user"/>
+    /// may be empty, or must equal it). No exchange follows AuthStart; the
+    /// server answers AuthOutcome at once, and the 32 zero bytes it sends as
+    /// the signature are NOT verified: TLS already authenticated the server.
+    /// </summary>
+    private void HandshakeCertificate(string user)
+    {
+        if (!Tls) throw new SkaidbException("certificate authentication needs TLS with a client certificate");
+        WriteFrame(BuildAuthStart(user, "", SkaidbAuthMechanism.Certificate));
+        CheckCertificateOutcome(ReadFrame());
+    }
+
+    /// <summary>Parse the AuthOutcome that answers an EXTERNAL AuthStart.</summary>
+    internal static void CheckCertificateOutcome(byte[] payload)
+    {
+        var r = new BinReader(payload);
+        if (r.U8() != 13) throw new SkaidbException("bad handshake outcome");
+        if (r.U8() != 1) throw new SkaidbException($"authentication denied: {r.Text()}");
+        r.Take(32);   // the placeholder signature: present, deliberately unchecked
+    }
+
+    /// <summary>PBKDF2-HMAC-SHA-256(password, salt, iterations, dkLen = 32).</summary>
+    internal static byte[] SaltedPassword(string password, byte[] salt, int iterations) =>
+        Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, iterations, HashAlgorithmName.SHA256, 32);
+
+    internal static (byte[] proof, byte[] serverSig) ScramProof(
         string password, byte[] salt, int iterations, byte[] authMessage)
     {
-        byte[] pw = Encoding.UTF8.GetBytes(password);
-        byte[] salted;
-        using (var pbkdf2 = new Rfc2898DeriveBytes(pw, salt, iterations, HashAlgorithmName.SHA256))
-        {
-            salted = pbkdf2.GetBytes(32); // dkLen = 32
-        }
+        byte[] salted = SaltedPassword(password, salt, iterations);
 
         byte[] clientKey = HmacSha256(salted, Encoding.ASCII.GetBytes("Client Key"));
         byte[] storedKey = Sha256(clientKey);
@@ -848,6 +1065,11 @@ public sealed class SkaidbConnection : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (!_open) throw new SkaidbException("connection is not open");
 
+        // Nothing from the previous stream may leak into this one: a
+        // non-row reply sets no columns.
+        StreamColumns = Array.Empty<string>();
+        StreamAffected = null;
+
         byte[] sqlBytes = Encoding.UTF8.GetBytes(sql);
         var w = new BinWriter();
         w.U8(5);                                    // OP_QUERY_STREAM
@@ -885,7 +1107,8 @@ public sealed class SkaidbConnection : IDisposable
                 throw new SkaidbException(msg.Contains("unknown opcode")
                     ? $"server does not support streaming: {msg}" : msg);
             }
-            if (tag == 1 || tag == 2) yield break;      // not row-producing
+            if (tag == 1) { StreamAffected = (long)first.U64(); yield break; }   // Mutation
+            if (tag == 2) yield break;                                           // Ddl
             if (tag != 5)
             {
                 // The server is not answering the stream contract, so there is
@@ -964,8 +1187,19 @@ public sealed class SkaidbConnection : IDisposable
         }
     }
 
-    /// <summary>Column names of the most recent <see cref="Stream"/> call.</summary>
+    /// <summary>
+    /// Column names of the most recent <see cref="Stream"/> call; empty when
+    /// that statement produced no rows (a mutation or DDL) or failed before
+    /// its header.
+    /// </summary>
     public IReadOnlyList<string> StreamColumns { get; private set; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Affected-row count of the most recent <see cref="Stream"/> call when
+    /// the statement was a mutation (the server answers a streamed
+    /// INSERT/UPDATE/DELETE with a count, not rows); null otherwise.
+    /// </summary>
+    public long? StreamAffected { get; private set; }
 
     /// <summary>
     /// Prepare <paramref name="sql"/> on the SERVER, returning
@@ -1020,6 +1254,44 @@ public sealed class SkaidbConnection : IDisposable
             throw new SkaidbException(msg);
         }
         throw new SkaidbException($"unexpected prepare response tag {tag}");
+    }
+
+    /// <summary>
+    /// Run one statement with `?` placeholders: with values, through a
+    /// server-side prepared statement so they travel TYPED (arrays and
+    /// documents have no SQL literal form); a statement kind the server will
+    /// not prepare falls back to client-side text binding.
+    /// </summary>
+    internal QueryResult RunStatement(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency)
+    {
+        if (values.Count > 0)
+        {
+            try
+            {
+                var (id, n) = PrepareServer(sql);
+                if (n != values.Count)
+                    throw new SkaidbException($"statement expects {n} parameters, got {values.Count}");
+                return ExecutePrepared(id, values, consistency);
+            }
+            catch (UnpreparableException)
+            {
+                // Statement kind the server will not prepare: bind as text.
+            }
+        }
+        return Query(ParameterBinder.Bind(sql, values), consistency);
+    }
+
+    /// <summary>Prepare <paramref name="sql"/> and run it once per row in one OP_EXECUTE_BATCH; the total affected.</summary>
+    internal long RunBatch(string sql, IReadOnlyList<IReadOnlyList<object?>> rows, SkaidbConsistency consistency)
+    {
+        var (id, n) = PrepareServer(sql);
+        foreach (var r in rows)
+        {
+            if (r.Count != n)
+                throw new SkaidbException($"batch row expects {n} parameters, got {r.Count}");
+        }
+        var result = ExecuteBatch(id, rows, consistency);
+        return result.Kind == QueryResultKind.Mutation ? (long)result.Affected : 0;
     }
 
     /// <summary>
@@ -1444,40 +1716,156 @@ internal sealed class QueryResult
     }
 }
 
+// ---- ADO.NET: commands ------------------------------------------------------
+
 /// <summary>
-/// A SQL command. Set <see cref="CommandText"/> with `?` placeholders and add
-/// values to <see cref="Parameters"/> in order, then execute.
+/// A SQL command: an ADO.NET <see cref="DbCommand"/>. Set
+/// <see cref="CommandText"/> and add values to <see cref="Parameters"/>, then
+/// execute. Placeholders are <c>?</c> (bound in order), <c>@name</c> (bound by
+/// <see cref="DbParameter.ParameterName"/>) or <c>$1</c>, <c>$2</c>, ... (bound
+/// by position); a statement with parameters runs as a server-side prepared
+/// statement with typed values.
 /// </summary>
-public sealed class SkaidbCommand : IDisposable
+public sealed class SkaidbCommand : DbCommand
 {
-    private readonly SkaidbConnection _connection;
+    private SkaidbConnection? _connection;
+    private SkaidbConsistency? _consistency;
+    private string _commandText = "";
+    private CommandType _commandType = CommandType.Text;
 
-    public string CommandText { get; set; } = "";
-
-    /// <summary>Positional parameters, bound to `?` placeholders in order.</summary>
-    public List<object?> Parameters { get; } = new();
-
-    /// <summary>Per-command consistency override. Defaults to the connection's.</summary>
-    public SkaidbConsistency Consistency { get; set; }
-
+    /// <summary>A command bound to <paramref name="connection"/>, at its consistency.</summary>
     public SkaidbCommand(SkaidbConnection connection)
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
-        Consistency = connection.Consistency;
+        _consistency = connection.Consistency;
+    }
+
+    /// <summary>An unbound command; set <see cref="Connection"/> before executing.</summary>
+    public SkaidbCommand() { }
+
+    /// <summary>A command with its text, optionally bound to a connection.</summary>
+    public SkaidbCommand(string commandText, SkaidbConnection? connection = null)
+    {
+        _commandText = commandText ?? "";
+        _connection = connection;
+        _consistency = connection?.Consistency;
+    }
+
+    [AllowNull]
+    public override string CommandText
+    {
+        get => _commandText;
+        set => _commandText = value ?? "";
+    }
+
+    /// <summary>
+    /// Kept for ADO.NET callers; the connection's <see cref="SkaidbConnection.Timeout"/>
+    /// is what bounds a request.
+    /// </summary>
+    public override int CommandTimeout { get; set; } = 30;
+
+    /// <summary>
+    /// <see cref="System.Data.CommandType.Text"/>, or
+    /// <see cref="System.Data.CommandType.StoredProcedure"/>: <see cref="CommandText"/>
+    /// is then a procedure name, run as <c>CALL name(?, ...)</c> with one
+    /// placeholder per parameter.
+    /// </summary>
+    public override CommandType CommandType
+    {
+        get => _commandType;
+        set
+        {
+            if (value != CommandType.Text && value != CommandType.StoredProcedure)
+                throw new NotSupportedException($"CommandType.{value} is not supported");
+            _commandType = value;
+        }
+    }
+
+    public override bool DesignTimeVisible { get; set; }
+
+    public override UpdateRowSource UpdatedRowSource { get; set; } = UpdateRowSource.None;
+
+    /// <summary>The connection the command runs on.</summary>
+    public new SkaidbConnection? Connection
+    {
+        get => _connection;
+        set => _connection = value;
+    }
+
+    protected override DbConnection? DbConnection
+    {
+        get => _connection;
+        set => _connection = value switch
+        {
+            null => null,
+            SkaidbConnection c => c,
+            _ => throw new ArgumentException("a SkaidbCommand runs on a SkaidbConnection"),
+        };
+    }
+
+    /// <summary>Parameters, bound to the statement's placeholders.</summary>
+    public new SkaidbParameterCollection Parameters { get; } = new();
+
+    protected override DbParameterCollection DbParameterCollection => Parameters;
+
+    /// <summary>Always null: skaidb has no transactions (setting one throws).</summary>
+    protected override DbTransaction? DbTransaction
+    {
+        get => null;
+        set
+        {
+            if (value is not null)
+                throw new NotSupportedException("skaidb connections have no transactions");
+        }
+    }
+
+    /// <summary>Per-command consistency override. Defaults to the connection's.</summary>
+    public SkaidbConsistency Consistency
+    {
+        get => _consistency ?? _connection?.Consistency ?? SkaidbConsistency.Quorum;
+        set => _consistency = value;
+    }
+
+    /// <summary>A no-op: a request cannot be cancelled once sent.</summary>
+    public override void Cancel() { }
+
+    public new SkaidbParameter CreateParameter() => new SkaidbParameter();
+
+    protected override DbParameter CreateDbParameter() => CreateParameter();
+
+    /// <summary>
+    /// Prepare the statement on the server now (it is otherwise prepared on
+    /// first execution). A statement kind the server does not prepare is left
+    /// to run as text.
+    /// </summary>
+    public override void Prepare()
+    {
+        var conn = RequireOpen();
+        var (sql, _) = Bound();
+        try { conn.PrepareServer(sql); }
+        catch (UnpreparableException) { /* runs as text */ }
     }
 
     /// <summary>Execute and return a reader over the result rows. One reader per execution.</summary>
-    public SkaidbDataReader ExecuteReader()
+    public new SkaidbDataReader ExecuteReader() => ExecuteReader(CommandBehavior.Default);
+
+    /// <summary>
+    /// Execute and return a reader. The result is fully received, so the
+    /// connection is free again as soon as this returns. With
+    /// <see cref="CommandBehavior.CloseConnection"/> closing the reader
+    /// closes the connection.
+    /// </summary>
+    public new SkaidbDataReader ExecuteReader(CommandBehavior behavior)
     {
         var result = Run();
-        if (result.Kind == QueryResultKind.Rows)
-            return new SkaidbDataReader(result.Columns!, result.Rows!, result.MoreSets);
-        // Non-row results expose an empty reader (FieldCount 0, Read() false).
-        return new SkaidbDataReader(Array.Empty<string>(), new List<object?[]>());
+        var close = (behavior & CommandBehavior.CloseConnection) != 0 ? _connection : null;
+        return SkaidbDataReader.FromResult(result, close);
     }
 
+    protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => ExecuteReader(behavior);
+
     /// <summary>Execute a statement and return the number of affected rows (0 for DDL/SELECT).</summary>
-    public int ExecuteNonQuery()
+    public override int ExecuteNonQuery()
     {
         var result = Run();
         if (result.Kind == QueryResultKind.Mutation)
@@ -1489,7 +1877,7 @@ public sealed class SkaidbCommand : IDisposable
     }
 
     /// <summary>Execute and return the first column of the first row (or null).</summary>
-    public object? ExecuteScalar()
+    public override object? ExecuteScalar()
     {
         var result = Run();
         if (result.Kind == QueryResultKind.Rows && result.Rows is { Count: > 0 } rows)
@@ -1500,31 +1888,34 @@ public sealed class SkaidbCommand : IDisposable
         return null;
     }
 
-    private QueryResult Run()
+    private SkaidbConnection RequireOpen()
     {
+        var conn = _connection ?? throw new InvalidOperationException("the command has no Connection");
+        if (!conn.IsOpen) throw new SkaidbException("connection is not open");
+        return conn;
+    }
+
+    /// <summary>The statement as the server sees it (`?` placeholders) and the values in order.</summary>
+    internal (string Sql, IReadOnlyList<object?> Values) Bound()
+    {
+        string text = _commandText;
+        if (_commandType == CommandType.StoredProcedure)
+        {
+            var qs = new string[Parameters.Count];
+            Array.Fill(qs, "?");
+            return ($"CALL {text}({string.Join(", ", qs)})", Parameters.Values());
+        }
+        return Placeholders.Rewrite(text, Parameters);
+    }
+
+    internal QueryResult Run()
+    {
+        var conn = RequireOpen();
         // Recover a transport that died since the last statement, before
         // anything is prepared on it.
-        _connection.EnsureLive();
-        // Server-side prepare so parameters travel as TYPED values; arrays
-        // and documents have no SQL literal form and cannot be interpolated.
-        if (Parameters.Count > 0)
-        {
-            try
-            {
-                var (id, n) = _connection.PrepareServer(CommandText);
-                if (n != Parameters.Count)
-                    throw new SkaidbException(
-                        $"statement expects {n} parameters, got {Parameters.Count}");
-                return _connection.ExecutePrepared(id, Parameters, Consistency);
-            }
-            catch (UnpreparableException)
-            {
-                // Statement kind the server will not prepare: fall back to
-                // client-side text binding.
-            }
-        }
-        string sql = ParameterBinder.Bind(CommandText, Parameters);
-        return _connection.Query(sql, Consistency);
+        conn.EnsureLive();
+        var (sql, values) = Bound();
+        return conn.RunStatement(sql, values, Consistency);
     }
 
     /// <summary>
@@ -1535,31 +1926,364 @@ public sealed class SkaidbCommand : IDisposable
     public long ExecuteBatch(IReadOnlyList<IReadOnlyList<object?>> rows)
     {
         if (rows.Count == 0) return 0;
-        var (id, n) = _connection.PrepareServer(CommandText);
-        foreach (var r in rows)
-        {
-            if (r.Count != n)
-                throw new SkaidbException($"batch row expects {n} parameters, got {r.Count}");
-        }
-        var result = _connection.ExecuteBatch(id, rows, Consistency);
-        return result.Kind == QueryResultKind.Mutation ? (long)result.Affected : 0;
+        var conn = RequireOpen();
+        var (sql, _) = Bound();
+        return conn.RunBatch(sql, rows, Consistency);
     }
-
-    public void Dispose() { /* nothing owned */ }
 }
 
-/// <summary>Forward-only reader over a result set. Created by <see cref="SkaidbCommand.ExecuteReader"/>.</summary>
-public sealed class SkaidbDataReader : IDisposable
+// ---- ADO.NET: parameters ----------------------------------------------------
+
+/// <summary>
+/// One statement parameter. Only input parameters exist. <see cref="DbType"/>
+/// is informational: the value's own .NET type decides its wire type (see
+/// docs/types.md).
+/// </summary>
+public sealed class SkaidbParameter : DbParameter
+{
+    private string _name = "";
+    private DbType? _dbType;
+    private ParameterDirection _direction = ParameterDirection.Input;
+
+    public SkaidbParameter() { }
+
+    public SkaidbParameter(string? parameterName, object? value)
+    {
+        _name = parameterName ?? "";
+        Value = value;
+    }
+
+    /// <summary>
+    /// Name for <c>@name</c> placeholders; a leading <c>@</c>, <c>:</c> or
+    /// <c>$</c> is ignored when matching. Empty for a positional parameter.
+    /// </summary>
+    [AllowNull]
+    public override string ParameterName
+    {
+        get => _name;
+        set => _name = value ?? "";
+    }
+
+    public override object? Value { get; set; }
+
+    /// <summary>The set DbType, else the one inferred from <see cref="Value"/>.</summary>
+    public override DbType DbType
+    {
+        get => _dbType ?? InferDbType(Value);
+        set => _dbType = value;
+    }
+
+    public override void ResetDbType() => _dbType = null;
+
+    /// <summary>Only <see cref="ParameterDirection.Input"/> is supported.</summary>
+    public override ParameterDirection Direction
+    {
+        get => _direction;
+        set
+        {
+            if (value != ParameterDirection.Input)
+                throw new NotSupportedException("skaidb parameters are input-only");
+            _direction = value;
+        }
+    }
+
+    public override bool IsNullable { get; set; } = true;
+
+    public override int Size { get; set; }
+
+    [AllowNull]
+    public override string SourceColumn { get; set; } = "";
+
+    public override bool SourceColumnNullMapping { get; set; }
+
+    /// <summary>The name without its placeholder prefix.</summary>
+    internal string Key => _name.TrimStart('@', ':', '$');
+
+    private static DbType InferDbType(object? v) => v switch
+    {
+        null or DBNull => DbType.Object,
+        bool => DbType.Boolean,
+        byte => DbType.Byte,
+        sbyte => DbType.SByte,
+        short => DbType.Int16,
+        ushort => DbType.UInt16,
+        int => DbType.Int32,
+        uint => DbType.UInt32,
+        long => DbType.Int64,
+        ulong => DbType.UInt64,
+        float => DbType.Single,
+        double => DbType.Double,
+        decimal => DbType.Decimal,
+        string or char => DbType.String,
+        byte[] => DbType.Binary,
+        Guid => DbType.Guid,
+        DateTimeOffset => DbType.DateTimeOffset,
+        DateTime => DbType.DateTime,
+        _ => DbType.Object,
+    };
+}
+
+/// <summary>
+/// The parameters of a <see cref="SkaidbCommand"/>. <see cref="Add(object?)"/>
+/// takes either a <see cref="SkaidbParameter"/> or a bare value, which becomes
+/// a positional parameter.
+/// </summary>
+public sealed class SkaidbParameterCollection : DbParameterCollection
+{
+    private readonly List<SkaidbParameter> _items = new();
+
+    public override int Count => _items.Count;
+
+    public override object SyncRoot => ((ICollection)_items).SyncRoot;
+
+    /// <summary>
+    /// Add a parameter: a <see cref="DbParameter"/> is added as itself (a
+    /// foreign one is copied), anything else is a positional value.
+    /// </summary>
+    public override int Add(object? value)
+    {
+        _items.Add(Wrap(value));
+        return _items.Count - 1;
+    }
+
+    /// <summary>Add a parameter (a null adds a positional NULL value).</summary>
+    public SkaidbParameter Add(SkaidbParameter? parameter)
+    {
+        var p = parameter ?? new SkaidbParameter(null, null);
+        _items.Add(p);
+        return p;
+    }
+
+    /// <summary>Add a named parameter, for an <c>@name</c> placeholder.</summary>
+    public SkaidbParameter AddWithValue(string parameterName, object? value) =>
+        Add(new SkaidbParameter(parameterName, value));
+
+    public override void AddRange(Array values)
+    {
+        foreach (var v in values) Add(v);
+    }
+
+    public override void Clear() => _items.Clear();
+
+    public override bool Contains(object? value) => IndexOf(value) >= 0;
+
+    public override bool Contains(string value) => IndexOf(value) >= 0;
+
+    public override void CopyTo(Array array, int index) => ((ICollection)_items).CopyTo(array, index);
+
+    public override IEnumerator GetEnumerator() => _items.GetEnumerator();
+
+    public override int IndexOf(object? value) =>
+        value is SkaidbParameter p ? _items.IndexOf(p) : -1;
+
+    public override int IndexOf(string parameterName)
+    {
+        string key = parameterName.TrimStart('@', ':', '$');
+        for (int i = 0; i < _items.Count; i++)
+            if (string.Equals(_items[i].Key, key, StringComparison.Ordinal)) return i;
+        for (int i = 0; i < _items.Count; i++)
+            if (string.Equals(_items[i].Key, key, StringComparison.OrdinalIgnoreCase)) return i;
+        return -1;
+    }
+
+    public override void Insert(int index, object? value) => _items.Insert(index, Wrap(value));
+
+    public override void Remove(object? value)
+    {
+        if (value is SkaidbParameter p) _items.Remove(p);
+    }
+
+    public override void RemoveAt(int index) => _items.RemoveAt(index);
+
+    public override void RemoveAt(string parameterName) => _items.RemoveAt(IndexOfOrThrow(parameterName));
+
+    protected override DbParameter GetParameter(int index) => _items[index];
+
+    protected override DbParameter GetParameter(string parameterName) => _items[IndexOfOrThrow(parameterName)];
+
+    protected override void SetParameter(int index, DbParameter value) => _items[index] = Wrap(value);
+
+    protected override void SetParameter(string parameterName, DbParameter value) =>
+        _items[IndexOfOrThrow(parameterName)] = Wrap(value);
+
+    public new SkaidbParameter this[int index]
+    {
+        get => _items[index];
+        set => _items[index] = value;
+    }
+
+    public new SkaidbParameter this[string parameterName]
+    {
+        get => _items[IndexOfOrThrow(parameterName)];
+        set => _items[IndexOfOrThrow(parameterName)] = value;
+    }
+
+    private int IndexOfOrThrow(string parameterName)
+    {
+        int i = IndexOf(parameterName);
+        if (i < 0) throw new IndexOutOfRangeException($"no parameter named '{parameterName}'");
+        return i;
+    }
+
+    private static SkaidbParameter Wrap(object? value) => value switch
+    {
+        SkaidbParameter p => p,
+        DbParameter other => new SkaidbParameter(other.ParameterName, other.Value),
+        _ => new SkaidbParameter(null, value),
+    };
+
+    internal SkaidbParameter At(int i) => _items[i];
+
+    /// <summary>The values in collection order.</summary>
+    internal IReadOnlyList<object?> Values()
+    {
+        var v = new object?[_items.Count];
+        for (int i = 0; i < v.Length; i++) v[i] = _items[i].Value;
+        return v;
+    }
+}
+
+/// <summary>
+/// Maps <c>@name</c> and <c>$N</c> placeholders onto the server's positional
+/// <c>?</c>. Text inside '...' literals, "..." identifiers and comments is
+/// left alone; a statement with only <c>?</c> placeholders passes unchanged.
+/// </summary>
+internal static class Placeholders
+{
+    public static (string Sql, IReadOnlyList<object?> Values) Rewrite(string sql, SkaidbParameterCollection ps)
+    {
+        if (ps.Count == 0) return (sql, Array.Empty<object?>());
+        var sb = new StringBuilder(sql.Length);
+        var values = new List<object?>();
+        bool rewrote = false, sawQmark = false;
+        int i = 0, n = sql.Length;
+        while (i < n)
+        {
+            char ch = sql[i];
+            if (ch == '\'' || ch == '"')
+            {
+                int end = i + 1;
+                while (end < n)
+                {
+                    if (sql[end] == ch)
+                    {
+                        if (end + 1 < n && sql[end + 1] == ch) { end += 2; continue; }   // doubled = escaped
+                        break;
+                    }
+                    end++;
+                }
+                end = Math.Min(end + 1, n);
+                sb.Append(sql, i, end - i);
+                i = end;
+                continue;
+            }
+            if (ch == '-' && i + 1 < n && sql[i + 1] == '-')
+            {
+                int end = sql.IndexOf('\n', i);
+                end = end < 0 ? n : end;
+                sb.Append(sql, i, end - i);
+                i = end;
+                continue;
+            }
+            if (ch == '/' && i + 1 < n && sql[i + 1] == '*')
+            {
+                int end = sql.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                end = end < 0 ? n : end + 2;
+                sb.Append(sql, i, end - i);
+                i = end;
+                continue;
+            }
+            if (ch == '?') { sawQmark = true; values.Add(null); sb.Append(ch); i++; continue; }
+            if (ch == '@' && i + 1 < n && IsIdentStart(sql[i + 1]) && (i == 0 || !IsIdentPart(sql[i - 1])))
+            {
+                int j = i + 1;
+                while (j < n && IsIdentPart(sql[j])) j++;
+                string name = sql.Substring(i + 1, j - i - 1);
+                int idx = ps.IndexOf(name);
+                if (idx < 0) throw new SkaidbException($"no parameter named '@{name}'");
+                values.Add(ps.At(idx).Value);
+                sb.Append('?');
+                rewrote = true;
+                i = j;
+                continue;
+            }
+            if (ch == '$' && i + 1 < n && char.IsAsciiDigit(sql[i + 1]) && (i == 0 || !IsIdentPart(sql[i - 1])))
+            {
+                int j = i + 1;
+                while (j < n && char.IsAsciiDigit(sql[j])) j++;
+                int pos = int.Parse(sql.AsSpan(i + 1, j - i - 1), NumberStyles.None, CultureInfo.InvariantCulture);
+                if (pos < 1 || pos > ps.Count)
+                    throw new SkaidbException($"placeholder ${pos} has no parameter ({ps.Count} given)");
+                values.Add(ps.At(pos - 1).Value);
+                sb.Append('?');
+                rewrote = true;
+                i = j;
+                continue;
+            }
+            sb.Append(ch);
+            i++;
+        }
+        if (!rewrote) return (sql, ps.Values());
+        if (sawQmark)
+            throw new SkaidbException("a statement cannot mix ? placeholders with @name or $N placeholders");
+        return (sb.ToString(), values);
+    }
+
+    private static bool IsIdentStart(char c) => char.IsLetter(c) || c == '_';
+
+    private static bool IsIdentPart(char c) => char.IsLetterOrDigit(c) || c == '_';
+}
+
+// ---- ADO.NET: data reader ---------------------------------------------------
+
+/// <summary>
+/// Forward-only reader over a result: an ADO.NET <see cref="DbDataReader"/>.
+/// Created by <see cref="SkaidbCommand.ExecuteReader()"/>. The whole result
+/// is already received, so reading never touches the socket.
+/// </summary>
+public sealed class SkaidbDataReader : DbDataReader
 {
     private string[] _columns;
     private List<object?[]> _rows;
     private int _pos = -1;
     private readonly List<QueryResult> _more;
+    private readonly int _recordsAffected;
+    private readonly SkaidbConnection? _closeOnClose;
+    private bool _closed;
+
+    internal SkaidbDataReader(string[] columns, List<object?[]> rows, List<QueryResult>? more = null,
+                              int recordsAffected = -1, SkaidbConnection? closeOnClose = null)
+    {
+        _columns = columns;
+        _rows = rows;
+        _more = more ?? new List<QueryResult>();
+        _recordsAffected = recordsAffected;
+        _closeOnClose = closeOnClose;
+    }
+
+    internal static SkaidbDataReader FromResult(QueryResult result, SkaidbConnection? closeOnClose)
+    {
+        switch (result.Kind)
+        {
+            case QueryResultKind.Rows:
+                return new SkaidbDataReader(result.Columns!, result.Rows!, result.MoreSets, -1, closeOnClose);
+            case QueryResultKind.Mutation:
+            {
+                ulong n = result.Affected;
+                return new SkaidbDataReader(Array.Empty<string>(), new List<object?[]>(), null,
+                    n > int.MaxValue ? int.MaxValue : (int)n, closeOnClose);
+            }
+            default:
+                // Non-row results expose an empty reader (FieldCount 0, Read() false).
+                return new SkaidbDataReader(Array.Empty<string>(), new List<object?[]>(), null, -1, closeOnClose);
+        }
+    }
 
     /// <summary>Advance to the next result set of a multi-set reply (a CALL whose
-    /// body EMITted). Returns false when there is none.</summary>
-    public bool NextResult()
+    /// body EMITted, or a <see cref="SkaidbBatch"/>). Returns false when there is none.</summary>
+    public override bool NextResult()
     {
+        ThrowIfClosed();
         if (_more.Count == 0) return false;
         var next = _more[0];
         _more.RemoveAt(0);
@@ -1569,37 +2293,46 @@ public sealed class SkaidbDataReader : IDisposable
         return true;
     }
 
-    internal SkaidbDataReader(string[] columns, List<object?[]> rows, List<QueryResult>? more = null)
-    {
-        _columns = columns;
-        _rows = rows;
-        _more = more ?? new List<QueryResult>();
-    }
+    /// <summary>Number of columns in the current result set (0 for a mutation or DDL).</summary>
+    public override int FieldCount => _columns.Length;
 
-    /// <summary>Number of columns in the result.</summary>
-    public int FieldCount => _columns.Length;
+    /// <summary>Rows changed by a mutation; -1 for a SELECT or DDL.</summary>
+    public override int RecordsAffected => _recordsAffected;
+
+    public override bool HasRows => _rows.Count > 0;
+
+    public override bool IsClosed => _closed;
+
+    public override int Depth => 0;
 
     /// <summary>Advance to the next row. Returns false when exhausted.</summary>
-    public bool Read()
+    public override bool Read()
     {
+        ThrowIfClosed();
         if (_pos + 1 >= _rows.Count) { _pos = _rows.Count; return false; }
         _pos++;
         return true;
+    }
+
+    private void ThrowIfClosed()
+    {
+        if (_closed) throw new InvalidOperationException("the reader is closed");
     }
 
     private object?[] Current
     {
         get
         {
+            ThrowIfClosed();
             if (_pos < 0) throw new SkaidbException("call Read() before accessing fields");
             if (_pos >= _rows.Count) throw new SkaidbException("no current row");
             return _rows[_pos];
         }
     }
 
-    public string GetName(int i) => _columns[i];
+    public override string GetName(int ordinal) => _columns[ordinal];
 
-    public int GetOrdinal(string name)
+    public override int GetOrdinal(string name)
     {
         for (int i = 0; i < _columns.Length; i++)
             if (string.Equals(_columns[i], name, StringComparison.Ordinal))
@@ -1610,36 +2343,164 @@ public sealed class SkaidbDataReader : IDisposable
         throw new SkaidbException($"no column named '{name}'");
     }
 
-    public bool IsDBNull(int i) => Current[i] is null;
+    public override bool IsDBNull(int ordinal) => Current[ordinal] is null;
 
     /// <summary>Raw value; null maps to <see cref="DBNull.Value"/>.</summary>
-    public object GetValue(int i) => Current[i] ?? DBNull.Value;
+    public override object GetValue(int ordinal) => Current[ordinal] ?? DBNull.Value;
 
-    public bool GetBoolean(int i) => Convert.ToBoolean(NonNull(i), CultureInfo.InvariantCulture);
-
-    public long GetInt64(int i) => Convert.ToInt64(NonNull(i), CultureInfo.InvariantCulture);
-
-    public int GetInt32(int i) => Convert.ToInt32(NonNull(i), CultureInfo.InvariantCulture);
-
-    public double GetDouble(int i) => Convert.ToDouble(NonNull(i), CultureInfo.InvariantCulture);
-
-    public decimal GetDecimal(int i) => Convert.ToDecimal(NonNull(i), CultureInfo.InvariantCulture);
-
-    public string GetString(int i)
+    public override int GetValues(object[] values)
     {
-        object v = NonNull(i);
+        var row = Current;
+        int n = Math.Min(values.Length, row.Length);
+        for (int i = 0; i < n; i++) values[i] = row[i] ?? DBNull.Value;
+        return n;
+    }
+
+    public override bool GetBoolean(int ordinal) => Convert.ToBoolean(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override byte GetByte(int ordinal) => Convert.ToByte(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override short GetInt16(int ordinal) => Convert.ToInt16(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override long GetInt64(int ordinal) => Convert.ToInt64(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override int GetInt32(int ordinal) => Convert.ToInt32(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override double GetDouble(int ordinal) => Convert.ToDouble(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override float GetFloat(int ordinal) => Convert.ToSingle(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override decimal GetDecimal(int ordinal) => Convert.ToDecimal(NonNull(ordinal), CultureInfo.InvariantCulture);
+
+    public override string GetString(int ordinal)
+    {
+        object v = NonNull(ordinal);
         return v as string ?? Convert.ToString(v, CultureInfo.InvariantCulture) ?? "";
     }
 
-    public Guid GetGuid(int i)
+    public override char GetChar(int ordinal)
     {
-        object v = NonNull(i);
+        string s = GetString(ordinal);
+        if (s.Length == 0) throw new InvalidCastException($"column {ordinal} is an empty string");
+        return s[0];
+    }
+
+    public override Guid GetGuid(int ordinal)
+    {
+        object v = NonNull(ordinal);
         return v is Guid g ? g : Guid.Parse(Convert.ToString(v, CultureInfo.InvariantCulture)!);
     }
+
+    /// <summary>A timestamp as a UTC <see cref="DateTime"/>.</summary>
+    public override DateTime GetDateTime(int ordinal) => NonNull(ordinal) switch
+    {
+        DateTimeOffset dto => dto.UtcDateTime,
+        DateTime dt => dt,
+        var v => Convert.ToDateTime(v, CultureInfo.InvariantCulture),
+    };
 
     public DateTimeOffset GetDateTimeOffset(int i) => (DateTimeOffset)NonNull(i);
 
     public byte[] GetBytes(int i) => (byte[])NonNull(i);
+
+    public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
+    {
+        byte[] data = GetBytes(ordinal);
+        if (buffer is null) return data.Length;
+        int n = (int)Math.Max(0, Math.Min(length, data.Length - dataOffset));
+        Array.Copy(data, dataOffset, buffer, bufferOffset, n);
+        return n;
+    }
+
+    public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
+    {
+        string data = GetString(ordinal);
+        if (buffer is null) return data.Length;
+        int n = (int)Math.Max(0, Math.Min(length, data.Length - dataOffset));
+        data.CopyTo((int)dataOffset, buffer, bufferOffset, n);
+        return n;
+    }
+
+    /// <summary>
+    /// The value as <typeparamref name="T"/>. Beyond an exact match it
+    /// converts numbers, a timestamp to <see cref="DateTime"/> (UTC), a
+    /// wide-decimal string to <see cref="decimal"/> when it fits, and text to
+    /// <see cref="Guid"/>. NULL gives default for a reference or nullable
+    /// <typeparamref name="T"/> and throws otherwise.
+    /// </summary>
+    public override T GetFieldValue<T>(int ordinal)
+    {
+        object? v = Current[ordinal];
+        if (v is null)
+        {
+            if (default(T) is null) return default!;
+            if (typeof(T) == typeof(DBNull)) return (T)(object)DBNull.Value;
+            throw new SkaidbException($"column {ordinal} is NULL");
+        }
+        if (v is T t) return t;
+        var target = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
+        object converted = target switch
+        {
+            _ when target == typeof(DateTime) => GetDateTime(ordinal),
+            _ when target == typeof(Guid) => GetGuid(ordinal),
+            _ when target == typeof(string) => GetString(ordinal),
+            _ when target == typeof(decimal) && v is string s =>
+                decimal.Parse(s, NumberStyles.Number, CultureInfo.InvariantCulture),
+            _ when v is IConvertible => Convert.ChangeType(v, target, CultureInfo.InvariantCulture),
+            _ => throw new InvalidCastException($"column {ordinal} is {v.GetType().Name}, not {typeof(T).Name}"),
+        };
+        return (T)converted;
+    }
+
+    /// <summary>
+    /// The CLR type of a column. The wire format carries no column types, so
+    /// this is the type of the column's first non-NULL value in the current
+    /// result set (<see cref="object"/> when there is none).
+    /// </summary>
+    public override Type GetFieldType(int ordinal)
+    {
+        if (ordinal < 0 || ordinal >= _columns.Length) throw new IndexOutOfRangeException($"no column {ordinal}");
+        foreach (var row in _rows)
+            if (ordinal < row.Length && row[ordinal] is { } v) return v.GetType();
+        return typeof(object);
+    }
+
+    /// <summary>The skaidb type name of <see cref="GetFieldType"/> (int, float, decimal, string, ...).</summary>
+    public override string GetDataTypeName(int ordinal)
+    {
+        var t = GetFieldType(ordinal);
+        if (t == typeof(long)) return "int";
+        if (t == typeof(double)) return "float";
+        if (t == typeof(decimal)) return "decimal";
+        if (t == typeof(string)) return "string";
+        if (t == typeof(bool)) return "bool";
+        if (t == typeof(byte[])) return "bytes";
+        if (t == typeof(Guid)) return "uuid";
+        if (t == typeof(DateTimeOffset)) return "timestamp";
+        if (t == typeof(object[])) return "array";
+        if (t == typeof(Dictionary<string, object?>)) return "document";
+        return "unknown";
+    }
+
+    /// <summary>
+    /// A minimal schema table: ColumnName, ColumnOrdinal, ColumnSize (-1),
+    /// DataType, DataTypeName and AllowDBNull (always true) per column.
+    /// </summary>
+    public override DataTable GetSchemaTable()
+    {
+        var table = new DataTable("SchemaTable");
+        table.Columns.Add(SchemaTableColumn.ColumnName, typeof(string));
+        table.Columns.Add(SchemaTableColumn.ColumnOrdinal, typeof(int));
+        table.Columns.Add(SchemaTableColumn.ColumnSize, typeof(int));
+        table.Columns.Add(SchemaTableColumn.DataType, typeof(Type));
+        table.Columns.Add("DataTypeName", typeof(string));
+        table.Columns.Add(SchemaTableColumn.AllowDBNull, typeof(bool));
+        for (int i = 0; i < _columns.Length; i++)
+            table.Rows.Add(_columns[i], i, -1, GetFieldType(i), GetDataTypeName(i), true);
+        return table;
+    }
+
+    public override IEnumerator GetEnumerator() => new DbEnumerator(this, closeReader: false);
 
     private object NonNull(int i)
     {
@@ -1649,13 +2510,532 @@ public sealed class SkaidbDataReader : IDisposable
     }
 
     /// <summary>Value by ordinal (DBNull for null).</summary>
-    public object this[int i] => GetValue(i);
+    public override object this[int ordinal] => GetValue(ordinal);
 
     /// <summary>Value by column name (DBNull for null).</summary>
-    public object this[string column] => GetValue(GetOrdinal(column));
+    public override object this[string name] => GetValue(GetOrdinal(name));
 
-    public void Dispose() { /* nothing owned */ }
+    /// <summary>Close the reader (and the connection, under <see cref="CommandBehavior.CloseConnection"/>).</summary>
+    public override void Close()
+    {
+        if (_closed) return;
+        _closed = true;
+        _closeOnClose?.Close();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) Close();
+        base.Dispose(disposing);
+    }
 }
+
+// ---- ADO.NET: batches -------------------------------------------------------
+
+/// <summary>
+/// Several statements in one call: an ADO.NET <see cref="DbBatch"/>. Runs of
+/// consecutive commands with the same parameterised statement go to the
+/// server as ONE <c>OP_EXECUTE_BATCH</c> round-trip; everything else runs one
+/// statement at a time. There are no transactions: each statement (each row
+/// of a merged run) autocommits, and a failure leaves earlier ones applied.
+/// </summary>
+public sealed class SkaidbBatch : DbBatch
+{
+    private SkaidbConnection? _connection;
+
+    public SkaidbBatch() { }
+
+    public SkaidbBatch(SkaidbConnection connection) { _connection = connection; }
+
+    public new SkaidbBatchCommandCollection BatchCommands { get; } = new();
+
+    protected override DbBatchCommandCollection DbBatchCommands => BatchCommands;
+
+    /// <summary>Kept for ADO.NET callers; the connection's timeout bounds each request.</summary>
+    public override int Timeout { get; set; }
+
+    public new SkaidbConnection? Connection
+    {
+        get => _connection;
+        set => _connection = value;
+    }
+
+    protected override DbConnection? DbConnection
+    {
+        get => _connection;
+        set => _connection = value switch
+        {
+            null => null,
+            SkaidbConnection c => c,
+            _ => throw new ArgumentException("a SkaidbBatch runs on a SkaidbConnection"),
+        };
+    }
+
+    protected override DbTransaction? DbTransaction
+    {
+        get => null;
+        set
+        {
+            if (value is not null) throw new NotSupportedException("skaidb connections have no transactions");
+        }
+    }
+
+    public override void Cancel() { }
+
+    protected override DbBatchCommand CreateDbBatchCommand() => new SkaidbBatchCommand();
+
+    public override void Prepare() { }
+
+    public override Task PrepareAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+    /// <summary>Run every command; the sum of the rows they changed.</summary>
+    public override int ExecuteNonQuery()
+    {
+        long total = 0;
+        foreach (var r in RunAll()) if (r.Kind == QueryResultKind.Mutation) total += (long)r.Affected;
+        return total > int.MaxValue ? int.MaxValue : (int)total;
+    }
+
+    /// <summary>Run every command; the first value of the first row-producing one.</summary>
+    public override object? ExecuteScalar()
+    {
+        foreach (var r in RunAll())
+            if (r.Kind == QueryResultKind.Rows)
+                return r.Rows is { Count: > 0 } rows && rows[0].Length > 0 ? rows[0][0] : null;
+        return null;
+    }
+
+    /// <summary>
+    /// Run every command; a reader whose result sets are the row-producing
+    /// commands' results in order (<see cref="DbDataReader.NextResult"/> walks
+    /// them). <see cref="DbDataReader.RecordsAffected"/> is the total changed.
+    /// </summary>
+    public new SkaidbDataReader ExecuteReader(CommandBehavior behavior = CommandBehavior.Default)
+    {
+        var sets = new List<QueryResult>();
+        long total = 0;
+        foreach (var r in RunAll())
+        {
+            if (r.Kind == QueryResultKind.Rows)
+            {
+                sets.Add(new QueryResult(QueryResultKind.Rows, r.Columns, r.Rows, 0));
+                sets.AddRange(r.MoreSets);
+            }
+            else if (r.Kind == QueryResultKind.Mutation) total += (long)r.Affected;
+        }
+        var close = (behavior & CommandBehavior.CloseConnection) != 0 ? _connection : null;
+        int affected = sets.Count > 0 && total == 0 ? -1 : (int)Math.Min(total, int.MaxValue);
+        if (sets.Count == 0)
+            return new SkaidbDataReader(Array.Empty<string>(), new List<object?[]>(), null, affected, close);
+        var first = sets[0];
+        sets.RemoveAt(0);
+        return new SkaidbDataReader(first.Columns!, first.Rows!, sets, affected, close);
+    }
+
+    protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => ExecuteReader(behavior);
+
+    protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<DbDataReader>(ExecuteReader(behavior));
+    }
+
+    public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ExecuteNonQuery());
+    }
+
+    public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ExecuteScalar());
+    }
+
+    /// <summary>
+    /// Execute the commands in order, merging runs of the same parameterised
+    /// statement into one OP_EXECUTE_BATCH. Each command's RecordsAffected is
+    /// set; a command merged into a run reports -1 (the server returns only
+    /// the run's total).
+    /// </summary>
+    private List<QueryResult> RunAll()
+    {
+        var conn = _connection ?? throw new InvalidOperationException("the batch has no Connection");
+        if (!conn.IsOpen) throw new SkaidbException("connection is not open");
+        var results = new List<QueryResult>();
+        var cmds = BatchCommands.Items;
+        int i = 0;
+        while (i < cmds.Count)
+        {
+            var (sql, values) = cmds[i].Bound();
+            int j = i + 1;
+            var rows = new List<IReadOnlyList<object?>> { values };
+            if (values.Count > 0)
+            {
+                while (j < cmds.Count)
+                {
+                    var (sql2, values2) = cmds[j].Bound();
+                    if (sql2 != sql || values2.Count != values.Count) break;
+                    rows.Add(values2);
+                    j++;
+                }
+            }
+            if (j - i > 1)
+            {
+                try
+                {
+                    long n = conn.RunBatch(sql, rows, conn.Consistency);
+                    for (int k = i; k < j; k++) cmds[k].SetRecordsAffected(-1);
+                    results.Add(new QueryResult(QueryResultKind.Mutation, null, null, (ulong)n));
+                    i = j;
+                    continue;
+                }
+                catch (UnpreparableException)
+                {
+                    // Not a preparable statement kind: run the run one by one.
+                }
+            }
+            conn.EnsureLive();
+            var r = conn.RunStatement(sql, values, conn.Consistency);
+            cmds[i].SetRecordsAffected(r.Kind == QueryResultKind.Mutation
+                ? (int)Math.Min(r.Affected, int.MaxValue) : -1);
+            results.Add(r);
+            i++;
+        }
+        return results;
+    }
+}
+
+/// <summary>One statement of a <see cref="SkaidbBatch"/>.</summary>
+public sealed class SkaidbBatchCommand : DbBatchCommand
+{
+    private string _commandText = "";
+    private CommandType _commandType = CommandType.Text;
+    private int _recordsAffected = -1;
+
+    public SkaidbBatchCommand() { }
+
+    public SkaidbBatchCommand(string commandText) { _commandText = commandText; }
+
+    [AllowNull]
+    public override string CommandText
+    {
+        get => _commandText;
+        set => _commandText = value ?? "";
+    }
+
+    /// <summary>Text or StoredProcedure, as on <see cref="SkaidbCommand.CommandType"/>.</summary>
+    public override CommandType CommandType
+    {
+        get => _commandType;
+        set
+        {
+            if (value != CommandType.Text && value != CommandType.StoredProcedure)
+                throw new NotSupportedException($"CommandType.{value} is not supported");
+            _commandType = value;
+        }
+    }
+
+    /// <summary>Rows this command changed; -1 for a SELECT, DDL, or a command merged into an OP_EXECUTE_BATCH run.</summary>
+    public override int RecordsAffected => _recordsAffected;
+
+    internal void SetRecordsAffected(int n) => _recordsAffected = n;
+
+    public new SkaidbParameterCollection Parameters { get; } = new();
+
+    protected override DbParameterCollection DbParameterCollection => Parameters;
+
+    public override bool CanCreateParameter => true;
+
+    public override DbParameter CreateParameter() => new SkaidbParameter();
+
+    internal (string Sql, IReadOnlyList<object?> Values)Bound()
+    {
+        if (_commandType == CommandType.StoredProcedure)
+        {
+            var qs = new string[Parameters.Count];
+            Array.Fill(qs, "?");
+            return ($"CALL {_commandText}({string.Join(", ", qs)})", Parameters.Values());
+        }
+        return Placeholders.Rewrite(_commandText, Parameters);
+    }
+}
+
+/// <summary>The commands of a <see cref="SkaidbBatch"/>.</summary>
+public sealed class SkaidbBatchCommandCollection : DbBatchCommandCollection
+{
+    internal readonly List<SkaidbBatchCommand> Items = new();
+
+    public override int Count => Items.Count;
+
+    public override bool IsReadOnly => false;
+
+    public override void Add(DbBatchCommand item) => Items.Add(Cast(item));
+
+    /// <summary>Add a statement and return it, for adding its parameters.</summary>
+    public SkaidbBatchCommand Add(string commandText)
+    {
+        var c = new SkaidbBatchCommand(commandText);
+        Items.Add(c);
+        return c;
+    }
+
+    public override void Clear() => Items.Clear();
+
+    public override bool Contains(DbBatchCommand item) => item is SkaidbBatchCommand c && Items.Contains(c);
+
+    public override void CopyTo(DbBatchCommand[] array, int arrayIndex)
+    {
+        for (int i = 0; i < Items.Count; i++) array[arrayIndex + i] = Items[i];
+    }
+
+    public override IEnumerator<DbBatchCommand> GetEnumerator() => Items.GetEnumerator();
+
+    public override int IndexOf(DbBatchCommand item) => item is SkaidbBatchCommand c ? Items.IndexOf(c) : -1;
+
+    public override void Insert(int index, DbBatchCommand item) => Items.Insert(index, Cast(item));
+
+    public override bool Remove(DbBatchCommand item) => item is SkaidbBatchCommand c && Items.Remove(c);
+
+    public override void RemoveAt(int index) => Items.RemoveAt(index);
+
+    protected override DbBatchCommand GetBatchCommand(int index) => Items[index];
+
+    protected override void SetBatchCommand(int index, DbBatchCommand batchCommand) => Items[index] = Cast(batchCommand);
+
+    public new SkaidbBatchCommand this[int index]
+    {
+        get => Items[index];
+        set => Items[index] = value;
+    }
+
+    private static SkaidbBatchCommand Cast(DbBatchCommand item) =>
+        item as SkaidbBatchCommand ?? throw new ArgumentException("a SkaidbBatch holds SkaidbBatchCommand items");
+}
+
+// ---- ADO.NET: provider factory + connection string builder --------------------
+
+/// <summary>
+/// The ADO.NET provider factory. Register it once at startup to resolve the
+/// provider by name:
+/// <code>
+/// DbProviderFactories.RegisterFactory(SkaidbFactory.ProviderInvariantName, SkaidbFactory.Instance);
+/// var factory = DbProviderFactories.GetFactory("Skaidb");
+/// </code>
+/// </summary>
+public sealed class SkaidbFactory : DbProviderFactory
+{
+    /// <summary>The provider invariant name: <c>Skaidb</c>.</summary>
+    public const string ProviderInvariantName = "Skaidb";
+
+    /// <summary>The one instance (DbProviderFactories looks this field up by name).</summary>
+    public static readonly SkaidbFactory Instance = new();
+
+    private SkaidbFactory() { }
+
+    /// <summary>Register <see cref="Instance"/> under <see cref="ProviderInvariantName"/>.</summary>
+    public static void Register() => DbProviderFactories.RegisterFactory(ProviderInvariantName, Instance);
+
+    public override DbConnection CreateConnection() => new SkaidbConnection();
+
+    public override DbCommand CreateCommand() => new SkaidbCommand();
+
+    public override DbParameter CreateParameter() => new SkaidbParameter();
+
+    public override DbConnectionStringBuilder CreateConnectionStringBuilder() => new SkaidbConnectionStringBuilder();
+
+    public override bool CanCreateBatch => true;
+
+    public override DbBatch CreateBatch() => new SkaidbBatch();
+
+    public override DbBatchCommand CreateBatchCommand() => new SkaidbBatchCommand();
+}
+
+/// <summary>
+/// Builds and parses skaidb connection strings. Keys are case-insensitive and
+/// normalised to the canonical names below; unknown keys are an error.
+/// </summary>
+/// <remarks>
+/// <list type="table">
+/// <item><term>Host</term><description>(Server, Data Source) one host or a comma list: <c>a,b:7001,[::1]:7002</c>. Every entry is a seed; one without a port uses Port.</description></item>
+/// <item><term>Port</term><description>default port, 7000</description></item>
+/// <item><term>Username</term><description>(User, User Id, UserId, Uid) default <c>anonymous</c></description></item>
+/// <item><term>Password</term><description>(Pwd)</description></item>
+/// <item><term>Database</term><description>(Db) session database, selected with USE on every dial</description></item>
+/// <item><term>Consistency</term><description>One, Quorum (default) or All</description></item>
+/// <item><term>Timeout</term><description>(Connect Timeout, ConnectTimeout) seconds, default 10</description></item>
+/// <item><term>Seeds</term><description>explicit endpoint list; overrides the Host list</description></item>
+/// <item><term>Tls</term><description>true/false; implied by any other Tls* key</description></item>
+/// <item><term>TlsCa</term><description>(Tls CA) PEM CA bundle for the server certificate</description></item>
+/// <item><term>TlsInsecure</term><description>(Tls Insecure) encrypt without verifying. Development only</description></item>
+/// <item><term>TlsServerName</term><description>(Tls Server Name) SNI / verified name, default <c>skaidb</c></description></item>
+/// <item><term>TlsClientCert</term><description>(Tls Client Cert) PEM client certificate to present</description></item>
+/// <item><term>TlsClientKey</term><description>(Tls Client Key) its PEM private key</description></item>
+/// <item><term>AuthMechanism</term><description>(Auth Mechanism) <c>Scram</c> (default) or <c>Certificate</c></description></item>
+/// </list>
+/// </remarks>
+public sealed class SkaidbConnectionStringBuilder : DbConnectionStringBuilder
+{
+    private static readonly Dictionary<string, string> Canonical = BuildCanonical();
+
+    private static Dictionary<string, string> BuildCanonical()
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        void Map(string canon, params string[] aliases)
+        {
+            d[canon] = canon;
+            foreach (var a in aliases) d[a] = canon;
+        }
+        Map("Host", "Server", "DataSource", "Data Source");
+        Map("Port");
+        Map("Username", "User", "UserId", "User Id", "Uid");
+        Map("Password", "Pwd");
+        Map("Database", "Db");
+        Map("Consistency");
+        Map("Timeout", "ConnectTimeout", "Connect Timeout");
+        Map("Seeds");
+        Map("Tls");
+        Map("TlsCa", "Tls CA");
+        Map("TlsInsecure", "Tls Insecure");
+        Map("TlsServerName", "Tls Server Name");
+        Map("TlsClientCert", "Tls Client Cert", "TlsClientCertificate");
+        Map("TlsClientKey", "Tls Client Key");
+        Map("AuthMechanism", "Auth Mechanism");
+        return d;
+    }
+
+    public SkaidbConnectionStringBuilder() { }
+
+    public SkaidbConnectionStringBuilder(string? connectionString)
+    {
+        ConnectionString = connectionString ?? "";
+    }
+
+    private static string Canon(string keyword)
+    {
+        if (keyword is null) throw new ArgumentNullException(nameof(keyword));
+        if (Canonical.TryGetValue(keyword.Trim(), out var c)) return c;
+        throw new ArgumentException($"unknown connection string key: '{keyword}'", nameof(keyword));
+    }
+
+    /// <summary>A value by any key or alias; setting validates it (an invalid value is an ArgumentException).</summary>
+    [AllowNull]
+    public override object this[string keyword]
+    {
+        get => base[Canon(keyword)];
+        set
+        {
+            string k = Canon(keyword);
+            if (value is null) { base.Remove(k); return; }
+            string s = Convert.ToString(value, CultureInfo.InvariantCulture)?.Trim() ?? "";
+            Validate(k, s);
+            base[k] = s;
+        }
+    }
+
+    private static void Validate(string key, string value)
+    {
+        switch (key)
+        {
+            case "Port":
+                if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int p) || p < 1 || p > 65535)
+                    throw new ArgumentException($"invalid Port '{value}'");
+                break;
+            case "Consistency":
+                try { SkaidbConnection.ParseConsistency(value); }
+                catch (SkaidbException e) { throw new ArgumentException(e.Message); }
+                break;
+            case "Timeout":
+                if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double t) || t <= 0 || double.IsInfinity(t))
+                    throw new ArgumentException($"invalid Timeout '{value}' (seconds)");
+                break;
+            case "AuthMechanism":
+                ParseMechanism(value);
+                break;
+        }
+    }
+
+    private static SkaidbAuthMechanism ParseMechanism(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "" or "scram" or "scram-sha-256" or "password" => SkaidbAuthMechanism.Scram,
+        "certificate" or "external" or "x509" => SkaidbAuthMechanism.Certificate,
+        _ => throw new ArgumentException($"unknown AuthMechanism '{value}' (use Scram or Certificate)"),
+    };
+
+    public override bool ContainsKey(string keyword) =>
+        Canonical.TryGetValue(keyword.Trim(), out var c) && base.ContainsKey(c);
+
+    public override bool Remove(string keyword) =>
+        Canonical.TryGetValue(keyword.Trim(), out var c) && base.Remove(c);
+
+    public override bool ShouldSerialize(string keyword) =>
+        Canonical.TryGetValue(keyword.Trim(), out var c) && base.ShouldSerialize(c);
+
+    public override bool TryGetValue(string keyword, [NotNullWhen(true)] out object? value)
+    {
+        if (Canonical.TryGetValue(keyword.Trim(), out var c)) return base.TryGetValue(c, out value);
+        value = null;
+        return false;
+    }
+
+    private string Get(string key, string fallback) =>
+        base.TryGetValue(key, out var v) && v is not null ? Convert.ToString(v, CultureInfo.InvariantCulture) ?? fallback : fallback;
+
+    private static bool Truthy(string v) =>
+        v.Equals("true", StringComparison.OrdinalIgnoreCase) || v == "1"
+        || v.Equals("yes", StringComparison.OrdinalIgnoreCase) || v.Equals("on", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>One host, or a comma-separated list of <c>host[:port]</c> seeds.</summary>
+    public string Host { get => Get("Host", "localhost"); set => this["Host"] = value; }
+
+    public int Port
+    {
+        get => int.Parse(Get("Port", "7000"), CultureInfo.InvariantCulture);
+        set => this["Port"] = value;
+    }
+
+    public string Username { get => Get("Username", "anonymous"); set => this["Username"] = value; }
+
+    public string Password { get => Get("Password", ""); set => this["Password"] = value; }
+
+    public string Database { get => Get("Database", ""); set => this["Database"] = value; }
+
+    public SkaidbConsistency Consistency
+    {
+        get => SkaidbConnection.ParseConsistency(Get("Consistency", "Quorum"));
+        set => this["Consistency"] = value.ToString();
+    }
+
+    /// <summary>Connect/read timeout; null when unset (the connection then uses 10 s).</summary>
+    public TimeSpan? Timeout
+    {
+        get => base.TryGetValue("Timeout", out var v) && v is not null
+            ? TimeSpan.FromSeconds(double.Parse(Convert.ToString(v, CultureInfo.InvariantCulture)!, CultureInfo.InvariantCulture))
+            : null;
+        set => this["Timeout"] = value?.TotalSeconds;
+    }
+
+    public string Seeds { get => Get("Seeds", ""); set => this["Seeds"] = value; }
+
+    public bool Tls { get => Truthy(Get("Tls", "false")); set => this["Tls"] = value; }
+
+    public string TlsCa { get => Get("TlsCa", ""); set => this["TlsCa"] = value; }
+
+    public bool TlsInsecure { get => Truthy(Get("TlsInsecure", "false")); set => this["TlsInsecure"] = value; }
+
+    public string TlsServerName { get => Get("TlsServerName", "skaidb"); set => this["TlsServerName"] = value; }
+
+    public string TlsClientCert { get => Get("TlsClientCert", ""); set => this["TlsClientCert"] = value; }
+
+    public string TlsClientKey { get => Get("TlsClientKey", ""); set => this["TlsClientKey"] = value; }
+
+    public SkaidbAuthMechanism AuthMechanism
+    {
+        get => ParseMechanism(Get("AuthMechanism", "Scram"));
+        set => this["AuthMechanism"] = value.ToString();
+    }
+}
+
 
 // ---- client-side parameter binding (§5) ------------------------------------
 
