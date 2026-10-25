@@ -162,6 +162,8 @@ public sealed class FakeServer : IDisposable
     public Handler Handle;
     public int Iterations = 1000;
     public bool CorruptServerSignature;
+    /// <summary>Close every new connection before the handshake, as a node at its connection ceiling does.</summary>
+    public volatile bool Refuse;
 
     /// <summary>Every parsed post-handshake request, in order.</summary>
     public readonly List<Request> Requests = new();
@@ -215,6 +217,11 @@ public sealed class FakeServer : IDisposable
             Socket s;
             try { s = _listener.AcceptSocket(); }
             catch { return; }
+            if (Refuse)
+            {
+                try { s.Close(); } catch { /* ignore */ }
+                continue;
+            }
             Interlocked.Increment(ref _connections);
             lock (_gate) _sockets.Add(s);
             var t = new Thread(() => Serve(s)) { IsBackground = true, Name = "fake-server-conn" };

@@ -15,8 +15,8 @@ file, targets `net8.0`.
   sets, one-round-trip batches, full type fidelity (`long`, `decimal`, `Guid`,
   `byte[]`, `DateTimeOffset`, arrays, documents).
 - Multi-seed failover, transparent reconnect, TLS (including client
-  certificate login), connection pooling, stream subscriptions, multiple
-  result sets.
+  certificate login), connection pooling balanced across the cluster's
+  members, stream subscriptions, multiple result sets.
 
 Full documentation: this README, the [`docs/`](docs/) folder
 ([getting started](docs/getting-started.md) · [ADO.NET](docs/adonet.md) · [API reference](docs/api.md) ·
@@ -36,7 +36,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.1.0
+V=1.2.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -129,9 +129,12 @@ keeps the settings — `Open()` dials again; `Dispose()` is final.
 
 skaidb is leaderless: every node accepts reads and writes, so a seed list is
 only "somewhere to land". `Open()` shuffles the seeds and tries them in turn
-until one connects; if none does it throws `no reachable endpoint in <list>:
-<last error>`. The same walk runs again on reconnect (below), so a client
-survives the node it was talking to going away.
+until one connects and completes the handshake (a node at its connection
+ceiling, which drops the handshake, is skipped too; a refused login stops the
+walk); if none does it throws `no reachable endpoint in <list>: <last
+error>`. The same walk runs again on reconnect (below), so a client survives
+the node it was talking to going away. A [pool](#pooling) goes further and
+balances its connections across the members.
 
 ### TLS
 
@@ -391,10 +394,42 @@ try { ... } finally { pool.Release(conn); }
 checked out: a burst opens extras and the surplus is disposed on release.
 `Acquire()` validates an idle connection before handing it out and discards
 one the server closed meanwhile; `Release()` disposes a broken connection
-instead of pooling it. Pooled connections inherit seeds, TLS and the session
-database from the connection string. Do not return a `Stream()` enumerable
-out of `WithConnection`: it is lazy, and the connection would go back to the
-pool before the first row is read. More in [docs/pooling.md](docs/pooling.md).
+instead of pooling it. Pooled connections inherit TLS and the session
+database from the connection string, whose seeds are the pool's starting
+members. Do not return a `Stream()` enumerable out of `WithConnection`: it
+is lazy, and the connection would go back to the pool before the first row
+is read.
+
+The pool balances across members by the rules every skaidb driver shares
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
+
+```csharp
+using var pool = new SkaidbConnectionPool(
+    "Seeds=h1:7000,h2:7000,h3:7000;User=app;Password=secret;Database=app",
+    new SkaidbPoolOptions
+    {
+        MaxSize = 8,
+        LoadBalancing = SkaidbLoadBalancing.LeastLatency,   // Random (default) | RoundRobin | LeastLatency
+        Discover = true,                                     // members from SHOW ENDPOINTS
+        ReadYourWrites = TimeSpan.FromSeconds(2),            // with Acquire(affinity)
+    });
+long notes = pool.WithConnection(userId, c =>            // sees userId's last write
+{
+    using var cmd = c.CreateCommand();
+    cmd.CommandText = "SELECT count(*) FROM notes WHERE owner = ?";
+    cmd.Parameters.Add(userId);
+    return (long)cmd.ExecuteScalar()!;
+});
+foreach (var m in pool.Members()) Console.WriteLine($"{m.Endpoint} {m.State} {m.Latency}");
+```
+
+`LoadBalancing` picks the member for each checkout, `Discover` learns the
+members from the cluster (resyncing ones get no new connections), a member
+with repeated transport failures or a latency far above the others' is
+ejected and re-probed in the background (the last usable one never is),
+`IdleOrder = SkaidbIdleOrder.Fifo` keeps every idle connection in use, and
+`ReadYourWrites` sends checkouts under the same affinity key to the member
+that took the key's last write. More in [docs/pooling.md](docs/pooling.md).
 
 ## Reconnect and errors
 
@@ -463,7 +498,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.1.0
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.2.0
 ```
 
 ## Compatibility
@@ -473,7 +508,9 @@ SELECT client_name, client_version FROM drivers;   -- dotnet | 1.1.0
   servers get the client-side fallback automatically), `ExecuteBatch` ≥
   0.87.0, `Stream()` a server with the streaming opcode (an older one answers
   `server does not support streaming`), multiple result sets a server with
-  `EMIT`, the `drivers` row a server ≥ 0.203.0.
+  `EMIT`, the `drivers` row a server ≥ 0.203.0, pool discovery
+  (`SkaidbPoolOptions.Discover`) a server ≥ 0.327 (an older one leaves the
+  pool on its seeds).
 - **Wire protocol**: <https://skaidb.org/docs/PROTOCOL.html>.
 
 ## Conformance

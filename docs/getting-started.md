@@ -15,7 +15,7 @@ at <https://github.com/porcupin26/skaidb-dotnet/releases> attaches
 `Skaidb.X.Y.Z.nupkg`):
 
 ```sh
-V=1.1.0
+V=1.2.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -124,7 +124,9 @@ long n = pool.WithConnection(c =>
 });
 ```
 
-See [pooling.md](pooling.md).
+`new SkaidbConnectionPool(connectionString, new SkaidbPoolOptions { LoadBalancing
+= SkaidbLoadBalancing.LeastLatency, Discover = true })` spreads the checkouts
+over every member of the cluster. See [pooling.md](pooling.md).
 
 ## Big results
 

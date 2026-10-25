@@ -1,11 +1,15 @@
-// A bounded pool of connections shared by several threads.
+// A pool of connections shared by several threads, balanced across the
+// cluster's members.
 //
-//   dotnet run --project examples/Pool -- [host] [port] [user] [password] [database]
+//   dotnet run --project examples/Pool -- [hosts] [port] [user] [password] [database]
 //
-// maxsize bounds the connections kept IDLE, not the number checked out: a
-// burst opens extras and the surplus is disposed on release. Pooled
-// connections inherit seed failover, TLS and the session database from the
-// connection string.
+// hosts is one host or a comma list (h1,h2:7001,...). MaxSize bounds the
+// connections kept IDLE, not the number checked out: a burst opens extras and
+// the surplus is disposed on release. Pooled connections inherit TLS and the
+// session database from the connection string. With LeastLatency and
+// Discover the pool spreads its checkouts over every member it learns from
+// SHOW ENDPOINTS, skipping members that are resyncing and ejecting ones that
+// fail or turn slow.
 
 using System;
 using System.Globalization;
@@ -20,7 +24,13 @@ string password = args.Length > 3 ? args[3] : "";
 string database = args.Length > 4 ? args[4] : "";
 
 using var pool = new SkaidbConnectionPool(
-    $"Host={host};Port={port};User={user};Password={password};Database={database}", maxsize: 4);
+    $"Host={host};Port={port};User={user};Password={password};Database={database}",
+    new SkaidbPoolOptions
+    {
+        MaxSize = 4,
+        LoadBalancing = SkaidbLoadBalancing.LeastLatency,
+        Discover = true,
+    });
 
 pool.WithConnection(c =>
 {
@@ -65,3 +75,7 @@ finally
 {
     pool.Release(conn);
 }
+
+// What the pool sees per member.
+foreach (var m in pool.Members())
+    Console.WriteLine($"{m.Endpoint} {m.State} latency={m.Latency?.TotalMilliseconds:F1}ms in_use={m.InUse} idle={m.Idle}");

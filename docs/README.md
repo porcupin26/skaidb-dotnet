@@ -6,7 +6,7 @@
 - [Types](types.md) — the value mapping in both directions.
 - [TLS](tls.md) — the three modes, the server name, failure modes.
 - [Streaming](streaming.md) — `Stream()`, the abandon rule, `Subscribe()`.
-- [Pooling](pooling.md) — `SkaidbConnectionPool` and how it treats broken connections.
+- [Pooling](pooling.md) — `SkaidbConnectionPool`: balancing across members, health ejection, discovery, read-your-writes, and how it treats broken connections.
 
 Elsewhere: the package [README](../README.md), runnable [examples](../examples/),
 the [changelog](../CHANGELOG.md), the

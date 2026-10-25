@@ -8,8 +8,10 @@ Everything lives in the `Skaidb` namespace: `SkaidbConnection`,
 `SkaidbConnectionStringBuilder`, `SkaidbCommand`, `SkaidbParameter`,
 `SkaidbParameterCollection`, `SkaidbDataReader`, `SkaidbBatch`,
 `SkaidbBatchCommand`, `SkaidbBatchCommandCollection`, `SkaidbFactory`,
-`SkaidbConnectionPool`, `SkaidbConsistency`, `SkaidbAuthMechanism`,
-`SkaidbException`, `UnpreparableException`. The ADO.NET types derive from
+`SkaidbConnectionPool`, `SkaidbPoolOptions`, `SkaidbPoolMember`,
+`SkaidbLoadBalancing`, `SkaidbIdleOrder`, `SkaidbMemberState`,
+`SkaidbConsistency`, `SkaidbAuthMechanism`, `SkaidbException`,
+`UnpreparableException`. The ADO.NET types derive from
 `System.Data.Common`; [adonet.md](adonet.md) covers how they behave as a
 provider.
 
@@ -73,8 +75,11 @@ The constructor only stores configuration; nothing is dialled until `Open()`.
 
 ### `Open()`
 
-Shuffles the seeds and tries each (TCP connect, then TLS if configured)
-until one connects; authenticates (SCRAM-SHA-256, or with
+Shuffles the seeds and tries each (TCP connect, TLS if configured, the
+handshake) until one connects and authenticates — a node that accepts the
+connection but drops the handshake (at its connection ceiling, or going
+down) is skipped like an unreachable one, while a refused login stops the
+walk. It authenticates (SCRAM-SHA-256, or with
 `AuthMechanism=Certificate` the EXTERNAL mechanism: the TLS client
 certificate is the credential, the username sent is `Username` when one was
 given and empty otherwise, and the outcome's placeholder signature is not
@@ -217,13 +222,54 @@ Accessing a cell before the first `Read()` or after the last throws
 
 ```csharp
 new SkaidbConnectionPool(string connectionString, int maxsize = 10);
+new SkaidbConnectionPool(string connectionString, SkaidbPoolOptions options);
 SkaidbConnection Acquire();
+SkaidbConnection Acquire(object? affinity);
 void Release(SkaidbConnection c);
 T WithConnection<T>(Func<SkaidbConnection, T> work);
+T WithConnection<T>(object? affinity, Func<SkaidbConnection, T> work);
+IReadOnlyList<SkaidbPoolMember> Members();
 void Dispose();
 ```
 
-See [pooling.md](pooling.md).
+Thread-safe. The connection string's `Host`/`Seeds` are the starting members
+and every connection is built from it; an invalid connection string or
+option throws `SkaidbException` from the constructor. `maxsize` caps the
+**idle** connections kept; it does not bound concurrent checkouts, and
+`Acquire()` never blocks. `affinity` scopes `ReadYourWrites` (any object with
+value equality; null = the pool-wide key). `Release()` disposes a connection
+that is broken, belongs to an ejected/not-ready/departed member, was not
+handed out by this pool, or would exceed `maxsize`. `Dispose()` closes the
+idle connections and stops the background timer that re-probes ejected
+members and refreshes discovery.
+
+```csharp
+public sealed class SkaidbPoolOptions          // every property is init-only
+{
+    int MaxSize = 10;
+    SkaidbLoadBalancing LoadBalancing = Random;  // Random | RoundRobin | LeastLatency
+    SkaidbIdleOrder IdleOrder = Lifo;            // Lifo | Fifo
+    bool Discover = false;                       // members from SHOW ENDPOINTS
+    TimeSpan RefreshInterval = 60 s;             // between discovery refreshes (5 s while a member is not ready)
+    TimeSpan ReadYourWrites = Zero;              // affinity window after a write; Zero = off
+    int EjectErrors = 3;                         // consecutive transport failures
+    double EjectLatencyFactor = 3.0;             // x the other members' median; 0 = off
+    TimeSpan EjectLatencyFloor = 50 ms;          // above the median, at least
+    TimeSpan EjectBackoff = 5 s;                 // first ejection, doubling per repeat
+    TimeSpan EjectBackoffMax = 60 s;
+}
+
+public sealed record SkaidbPoolMember(
+    string Endpoint,            // what the pool dials, host:port
+    string? Canonical,          // the member's own SHOW ENDPOINTS name, once discovered
+    SkaidbMemberState State,    // Ready | Ejected | Resyncing | Unreachable | Unlisted
+    TimeSpan? Latency,          // round-trip average; null until measured
+    int InUse,                  // checked out now
+    int Idle,                   // idle in the pool
+    bool Seed);                 // from the connection string, not discovered
+```
+
+See [pooling.md](pooling.md) for what each policy and option does.
 
 ## `SkaidbConsistency`
 

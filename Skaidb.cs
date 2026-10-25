@@ -150,6 +150,28 @@ public sealed class SkaidbConnection : DbConnection
 
     private static int _nonceCounter;
 
+    /// <summary>
+    /// The pool that owns this connection (see <see cref="SkaidbConnectionPool"/>):
+    /// told each round trip's latency, each transport failure and each write,
+    /// and asked for the dial order when the connection re-dials. Null
+    /// outside a pool.
+    /// </summary>
+    internal SkaidbConnectionPool? Pool;
+    /// <summary>The member <see cref="Pool"/> counts this connection against.</summary>
+    internal string? PoolEndpoint;
+    /// <summary>The read-your-writes key of the current checkout (null = pool-wide).</summary>
+    internal object? PoolAffinity;
+    /// <summary>Checked out of <see cref="Pool"/>, not idle in it.</summary>
+    internal bool PoolOut;
+
+    /// <summary>
+    /// The endpoint the live socket is dialed to, as <see cref="EndpointKey"/>
+    /// writes it; a pooled re-dial tries it last.
+    /// </summary>
+    private string? _connected;
+    internal string? ConnectedEndpoint => _connected;
+    internal bool IsBroken => _broken;
+
     /// <summary>Name the driver reports in its Hello frame (the drivers table's client_name).</summary>
     public const string DriverName = "dotnet";
 
@@ -398,7 +420,24 @@ public sealed class SkaidbConnection : DbConnection
         OnStateChange(new StateChangeEventArgs(ConnectionState.Closed, ConnectionState.Open));
     }
 
-    private void OpenCore()
+    /// <summary><see cref="Open"/> walking <paramref name="order"/> instead of the shuffled seeds (a pool's pick).</summary>
+    internal void OpenAt(IReadOnlyList<string> order)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
+        if (_open) return;
+        OpenCore(order);
+        OnStateChange(new StateChangeEventArgs(ConnectionState.Closed, ConnectionState.Open));
+    }
+
+    /// <summary>
+    /// <paramref name="host"/>:<paramref name="port"/> as one string, IPv6 in
+    /// brackets: how a pool names a member and a connection the endpoint it
+    /// reached.
+    /// </summary>
+    internal static string EndpointKey(string host, int port) =>
+        (host.Contains(':') ? $"[{host}]" : host) + ":" + port.ToString(CultureInfo.InvariantCulture);
+
+    private void OpenCore(IReadOnlyList<string>? order = null)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (_open) return;
@@ -407,57 +446,65 @@ public sealed class SkaidbConnection : DbConnection
             throw new SkaidbException(
                 "certificate authentication needs TLS with a client certificate (TlsClientCert, TlsClientKey)");
 
+        // The walk: what the caller asked for, else a pooled connection's
+        // pool order (usable members first, the one it just lost last), else
+        // the seeds shuffled.
+        order ??= Pool?.DialOrder(_connected) ?? Shuffled(Seeds);
         try
         {
-            // Try each seed until one connects; a dead node must not swallow
-            // the attempt.
-            var order = new List<string>(Seeds);
-            var rng = new Random();
-            for (int i = order.Count - 1; i > 0; i--)
-            {
-                int j = rng.Next(i + 1);
-                (order[i], order[j]) = (order[j], order[i]);
-            }
-            TcpClient? tcp = null;
+            // Try each endpoint until one connects AND completes the
+            // handshake: a dead node must not swallow the attempt, and
+            // neither may a node at its connection ceiling (it closes the
+            // socket before the challenge) or one going down mid-handshake.
+            // A refused login stops the walk: the credentials are the same
+            // on every node.
             Exception? last = null;
+            bool connected = false;
             foreach (var ep in order)
             {
                 var (h, p) = SplitEndpoint(ep, Port);
-                var candidate = new TcpClient { NoDelay = true };
-                candidate.SendTimeout = (int)Timeout.TotalMilliseconds;
-                candidate.ReceiveTimeout = (int)Timeout.TotalMilliseconds;
                 try
                 {
-                    var t = candidate.ConnectAsync(h, p);
+                    var tcp = new TcpClient { NoDelay = true };
+                    tcp.SendTimeout = (int)Timeout.TotalMilliseconds;
+                    tcp.ReceiveTimeout = (int)Timeout.TotalMilliseconds;
+                    _tcp = tcp;
+                    var t = tcp.ConnectAsync(h, p);
                     if (!t.Wait(Timeout)) throw new SkaidbException($"connect to {ep} timed out");
-                    tcp = candidate;
-                    break;
+                    var stream = tcp.GetStream();
+                    stream.ReadTimeout = (int)Timeout.TotalMilliseconds;
+                    stream.WriteTimeout = (int)Timeout.TotalMilliseconds;
+                    _stream = Tls ? TlsWrap(stream) : stream;
+                    if (AuthMechanism == SkaidbAuthMechanism.Certificate)
+                        HandshakeCertificate(_userExplicit ? User : "");
+                    else
+                        Handshake(User, _password);
                 }
                 catch (Exception e)
                 {
-                    last = e is AggregateException agg && agg.InnerExceptions.Count == 1
+                    Exception root = e is AggregateException agg && agg.InnerExceptions.Count == 1
                         ? agg.InnerExceptions[0] : e;
-                    candidate.Dispose();
+                    CleanupSocket();
+                    if (!SkaidbConnectionPool.MemberFault(root))
+                    {
+                        if (e is SkaidbException) throw;
+                        throw new SkaidbException($"connect failed: {root.Message}", root);
+                    }
+                    Pool?.Failed(EndpointKey(h, p));
+                    last = root;
+                    continue;
                 }
+                _connected = EndpointKey(h, p);
+                connected = true;
+                break;
             }
-            if (tcp is null)
+            if (!connected)
             {
                 string where = $"no reachable endpoint in {string.Join(", ", order)}";
                 throw last is null
                     ? new SkaidbException(where)
                     : new SkaidbException($"{where}: {last.Message}", last);
             }
-            tcp.NoDelay = true;
-            var stream = tcp.GetStream();
-            stream.ReadTimeout = (int)Timeout.TotalMilliseconds;
-            stream.WriteTimeout = (int)Timeout.TotalMilliseconds;
-
-            _tcp = tcp;
-            _stream = Tls ? TlsWrap(stream) : stream;
-            if (AuthMechanism == SkaidbAuthMechanism.Certificate)
-                HandshakeCertificate(_userExplicit ? User : "");
-            else
-                Handshake(User, _password);
             _open = true;
             SendHello();
             // USE is per-connection session state, so it runs on every open.
@@ -553,6 +600,17 @@ public sealed class SkaidbConnection : DbConnection
 #pragma warning restore SYSLIB0057
         }
         return cert;
+    }
+
+    private static List<string> Shuffled(IReadOnlyList<string> seeds)
+    {
+        var order = new List<string>(seeds);
+        for (int i = order.Count - 1; i > 0; i--)
+        {
+            int j = Random.Shared.Next(i + 1);
+            (order[i], order[j]) = (order[j], order[i]);
+        }
+        return order;
     }
 
     private void CleanupSocket()
@@ -694,6 +752,9 @@ public sealed class SkaidbConnection : DbConnection
         _broken = false;
         _prepared.Clear();
         CleanupSocket();
+        // Closed while checked out instead of released: the pool stops
+        // counting it against its member.
+        Pool?.ClosedOut(this);
         if (wasOpen) OnStateChange(new StateChangeEventArgs(ConnectionState.Open, ConnectionState.Closed));
     }
 
@@ -1055,7 +1116,7 @@ public sealed class SkaidbConnection : DbConnection
     /// <see cref="IsUsable"/> false, so a pool discards it instead of handing
     /// out a socket with rows still queued on it.</para>
     /// <para>Do not return the enumerable out of
-    /// <see cref="SkaidbConnectionPool.WithConnection"/>: it is lazy, and the
+    /// <see cref="SkaidbConnectionPool.WithConnection{T}(Func{SkaidbConnection, T})"/>: it is lazy, and the
     /// connection would go back to the pool before the first row is read.
     /// Enumerate inside the callback.</para>
     /// </remarks>
@@ -1095,11 +1156,21 @@ public sealed class SkaidbConnection : DbConnection
         try
         {
             BinReader first;
-            lock (_lock)
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
             {
-                WriteFrame(w.ToArray());
-                first = new BinReader(ReadFrame());
+                lock (_lock)
+                {
+                    WriteFrame(w.ToArray());
+                    first = new BinReader(ReadFrame());
+                }
             }
+            catch (SkaidbException) when (_broken)
+            {
+                ObserveFailure();
+                throw;
+            }
+            ObserveRoundTrip(started);
             byte tag = first.U8();
             if (tag == 3)
             {
@@ -1107,6 +1178,7 @@ public sealed class SkaidbConnection : DbConnection
                 throw new SkaidbException(msg.Contains("unknown opcode")
                     ? $"server does not support streaming: {msg}" : msg);
             }
+            NoteStatement(sql);
             if (tag == 1) { StreamAffected = (long)first.U64(); yield break; }   // Mutation
             if (tag == 2) yield break;                                           // Ddl
             if (tag != 5)
@@ -1126,7 +1198,15 @@ public sealed class SkaidbConnection : DbConnection
             while (live)
             {
                 BinReader r;
-                lock (_lock) { r = new BinReader(ReadFrame()); }
+                try
+                {
+                    lock (_lock) { r = new BinReader(ReadFrame()); }
+                }
+                catch (SkaidbException) when (_broken)
+                {
+                    ObserveFailure();
+                    throw;
+                }
                 byte t = r.U8();
                 if (t == 6)
                 {
@@ -1225,12 +1305,22 @@ public sealed class SkaidbConnection : DbConnection
         // Unlocked first so a threading mistake is reported now rather
         // than after the streaming thread's current frame read.
         ThrowIfStreamingUnlocked();
-        lock (_lock)
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
         {
-            ThrowIfStreamingLocked();
-            WriteFrame(w.ToArray());
-            r = new BinReader(ReadFrame());
+            lock (_lock)
+            {
+                ThrowIfStreamingLocked();
+                WriteFrame(w.ToArray());
+                r = new BinReader(ReadFrame());
+            }
         }
+        catch (SkaidbException) when (_broken)
+        {
+            ObserveFailure();
+            throw;
+        }
+        ObserveRoundTrip(started);
         byte tag = r.U8();
         if (tag == 4)
         {
@@ -1264,6 +1354,13 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     internal QueryResult RunStatement(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency)
     {
+        var result = RunStatementCore(sql, values, consistency);
+        NoteStatement(sql);
+        return result;
+    }
+
+    private QueryResult RunStatementCore(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency)
+    {
         if (values.Count > 0)
         {
             try
@@ -1291,7 +1388,29 @@ public sealed class SkaidbConnection : DbConnection
                 throw new SkaidbException($"batch row expects {n} parameters, got {r.Count}");
         }
         var result = ExecuteBatch(id, rows, consistency);
+        NoteStatement(sql);
         return result.Kind == QueryResultKind.Mutation ? (long)result.Affected : 0;
+    }
+
+    // ---- what a pool is told -------------------------------------------------
+
+    /// <summary>A request round trip (send to the first response frame) succeeded.</summary>
+    private void ObserveRoundTrip(long started) =>
+        Pool?.RoundTrip(this, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds);
+
+    /// <summary>A transport failure broke the connection mid-request.</summary>
+    private void ObserveFailure()
+    {
+        if (_connected is not null) Pool?.Failed(_connected);
+    }
+
+    /// <summary>
+    /// A statement succeeded: a pool with read-your-writes on remembers
+    /// which member took a write.
+    /// </summary>
+    private void NoteStatement(string sql)
+    {
+        if (Pool is not null && SkaidbConnectionPool.IsWrite(sql)) Pool.Wrote(this);
     }
 
     /// <summary>
@@ -1485,12 +1604,23 @@ public sealed class SkaidbConnection : DbConnection
         // Unlocked first so a threading mistake is reported now rather
         // than after the streaming thread's current frame read.
         ThrowIfStreamingUnlocked();
-        lock (_lock)
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
         {
-            ThrowIfStreamingLocked();
-            WriteFrame(request);
-            r = new BinReader(ReadFrame());
+            lock (_lock)
+            {
+                ThrowIfStreamingLocked();
+                WriteFrame(request);
+                r = new BinReader(ReadFrame());
+            }
         }
+        catch (SkaidbException) when (_broken)
+        {
+            // The transport died mid-request: a member failure for a pool.
+            ObserveFailure();
+            throw;
+        }
+        ObserveRoundTrip(started);
 
         byte tag = r.U8();
         switch (tag)
@@ -3274,16 +3404,150 @@ internal sealed class BinWriter
 
     public byte[] ToArray() => _buf.ToArray();
 }
+
+// ---- connection pool --------------------------------------------------------
+
+/// <summary>How <see cref="SkaidbConnectionPool"/> picks the member a checkout goes to.</summary>
+public enum SkaidbLoadBalancing
+{
+    /// <summary>
+    /// Any idle connection; a new connection dials the usable members in
+    /// random order and stays on the member it reached. The default.
+    /// </summary>
+    Random = 0,
+    /// <summary>The next usable member in endpoint order.</summary>
+    RoundRobin = 1,
+    /// <summary>
+    /// Of two usable members picked at random, the one with the lower
+    /// round-trip average × (checked-out connections + 1). A member not
+    /// measured in the last 2 s scores 0, so it is tried.
+    /// </summary>
+    LeastLatency = 2,
+}
+
+/// <summary>Which idle connection <see cref="SkaidbConnectionPool.Acquire()"/> hands out first.</summary>
+public enum SkaidbIdleOrder
+{
+    /// <summary>The most recently returned, so a quiet pool keeps few sockets warm. The default.</summary>
+    Lifo = 0,
+    /// <summary>The longest idle, so every idle connection keeps being used and a server-side idle timeout never finds one.</summary>
+    Fifo = 1,
+}
+
+/// <summary>A member's state as <see cref="SkaidbConnectionPool.Members"/> reports it.</summary>
+public enum SkaidbMemberState
+{
+    /// <summary>Gets new connections.</summary>
+    Ready = 0,
+    /// <summary>Taken out of rotation by health ejection until a probe re-admits it.</summary>
+    Ejected = 1,
+    /// <summary>Listed by <c>SHOW ENDPOINTS</c> as backfilling: no new connections.</summary>
+    Resyncing = 2,
+    /// <summary>Listed by <c>SHOW ENDPOINTS</c> with its circuit breaker open: no new connections.</summary>
+    Unreachable = 3,
+    /// <summary>A configured seed that discovery no longer lists (it left the ring): no new connections.</summary>
+    Unlisted = 4,
+}
+
 /// <summary>
-/// A thread-safe pool of skaidb connections.
+/// Settings of a <see cref="SkaidbConnectionPool"/>: its idle bound and how it
+/// balances across the cluster's members (PROTOCOL.md 6.1, shared by every
+/// skaidb driver).
+/// </summary>
+public sealed class SkaidbPoolOptions
+{
+    /// <summary>The cap on IDLE connections kept (not on checkouts). Default 10; at least 1.</summary>
+    public int MaxSize { get; init; } = 10;
+
+    /// <summary>Which member a checkout goes to. Default <see cref="SkaidbLoadBalancing.Random"/>.</summary>
+    public SkaidbLoadBalancing LoadBalancing { get; init; } = SkaidbLoadBalancing.Random;
+
+    /// <summary>Which idle connection is handed out first. Default <see cref="SkaidbIdleOrder.Lifo"/>.</summary>
+    public SkaidbIdleOrder IdleOrder { get; init; } = SkaidbIdleOrder.Lifo;
+
+    /// <summary>
+    /// Learn the members from <c>SHOW ENDPOINTS</c> (server 0.327 or later)
+    /// when a member is first reached and every <see cref="RefreshInterval"/>
+    /// after: joiners are added, leavers dropped, members listed as resyncing
+    /// or unreachable get no new connections. Default off.
+    /// </summary>
+    public bool Discover { get; init; }
+
+    /// <summary>
+    /// Time between discovery refreshes. Default 60 s; 5 s instead while a
+    /// listed member is resyncing or unreachable.
+    /// </summary>
+    public TimeSpan RefreshInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How long after a write checkouts under the same affinity key go to
+    /// the member that took it. <see cref="TimeSpan.Zero"/> (the default)
+    /// turns it off.
+    /// </summary>
+    public TimeSpan ReadYourWrites { get; init; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// Consecutive transport failures (a failed dial, an I/O error or
+    /// timeout mid-request, a capacity refusal) that eject a member. Default 3.
+    /// </summary>
+    public int EjectErrors { get; init; } = 3;
+
+    /// <summary>
+    /// A member whose round-trip average is above this many times the other
+    /// members' median, and <see cref="EjectLatencyFloor"/> above it, is
+    /// ejected. Default 3; 0 disables latency ejection.
+    /// </summary>
+    public double EjectLatencyFactor { get; init; } = 3.0;
+
+    /// <summary>How far above the median a member's average must also be to eject it. Default 50 ms.</summary>
+    public TimeSpan EjectLatencyFloor { get; init; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>How long the first ejection lasts; each repeat doubles it. Default 5 s.</summary>
+    public TimeSpan EjectBackoff { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The longest an ejection lasts; a member healthy this long after a
+    /// re-admission starts over at <see cref="EjectBackoff"/>. Default 60 s.
+    /// </summary>
+    public TimeSpan EjectBackoffMax { get; init; } = TimeSpan.FromSeconds(60);
+}
+
+/// <summary>One member as <see cref="SkaidbConnectionPool.Members"/> reports it.</summary>
+/// <param name="Endpoint">The endpoint the pool dials (<c>host:port</c>).</param>
+/// <param name="Canonical">The member's own name from <c>SHOW ENDPOINTS</c>, once discovered.</param>
+/// <param name="State">Whether it gets new connections, and why not.</param>
+/// <param name="Latency">The round-trip average; null until measured.</param>
+/// <param name="InUse">Connections to it checked out now.</param>
+/// <param name="Idle">Connections to it idle in the pool.</param>
+/// <param name="Seed">Configured (from the connection string) rather than discovered.</param>
+public sealed record SkaidbPoolMember(
+    string Endpoint,
+    string? Canonical,
+    SkaidbMemberState State,
+    TimeSpan? Latency,
+    int InUse,
+    int Idle,
+    bool Seed);
+
+/// <summary>
+/// A thread-safe pool of skaidb connections, balanced across the cluster's
+/// members.
 /// </summary>
 /// <remarks>
 /// <para><c>maxsize</c> bounds the connections kept IDLE, not the number
 /// checked out: a burst creates extras and the surplus is disposed on return.
 /// Connections are built from the same connection string, so pooled ones
-/// inherit seed failover, TLS and the session database.</para>
+/// inherit TLS and the session database; the connection string's seeds are
+/// the pool's starting members.</para>
+/// <para><see cref="SkaidbPoolOptions"/> picks how checkouts spread over the
+/// members (random, round-robin or least-latency), whether the pool learns
+/// the members from <c>SHOW ENDPOINTS</c>, when it ejects a failing or slow
+/// member (a background timer probes it back in), and read-your-writes
+/// affinity. The rules are the same in every skaidb driver (PROTOCOL.md
+/// 6.1); see docs/pooling.md.</para>
 /// <code>
-/// using var pool = new SkaidbConnectionPool("Host=h1;Port=7000;Database=app", 8);
+/// using var pool = new SkaidbConnectionPool("Host=h1,h2,h3;Port=7000;Database=app",
+///     new SkaidbPoolOptions { MaxSize = 8, LoadBalancing = SkaidbLoadBalancing.LeastLatency, Discover = true });
 /// long n = pool.WithConnection(c => {
 ///     using var cmd = c.CreateCommand();
 ///     cmd.CommandText = "SELECT count(*) AS n FROM t";
@@ -3295,51 +3559,224 @@ internal sealed class BinWriter
 /// </remarks>
 public sealed class SkaidbConnectionPool : IDisposable
 {
-    private readonly string _connectionString;
-    private readonly int _maxsize;
-    private readonly Stack<SkaidbConnection> _idle = new();
-    private readonly object _gate = new();
-    private bool _closed;
+    // Latency EWMA: each round trip moves a member's average 5% toward it, and
+    // no sample counts for more than 10x the larger of the current average
+    // and the ejection floor — one slow query does not eject a healthy
+    // member, a member that stays slow is ejected within a few dozen
+    // statements.
+    private const double EwmaWeight = 0.05;
+    private const double EwmaClamp = 10.0;
+    /// <summary>Round trips a member (and at least one other) needs before its average can eject it.</summary>
+    private const int EwmaMinSamples = 10;
+    /// <summary>
+    /// Seconds after which a member's average is stale for least-latency:
+    /// it scores 0 again, so a lightly loaded pool keeps re-measuring every
+    /// member instead of settling forever on whichever answered fastest once.
+    /// </summary>
+    private const double StaleSample = 2.0;
+    /// <summary>
+    /// Discovery refresh (seconds) while a listed member is not ready: a
+    /// member is often resyncing or unreachable only for seconds (a peer's
+    /// circuit breaker right after it restarts), and waiting a whole refresh
+    /// interval to let it back in leaves the load on the others.
+    /// </summary>
+    private const double RefreshNotReady = 5.0;
+    /// <summary>How often the background timer checks for members due a re-probe.</summary>
+    private static readonly TimeSpan MaintainTick = TimeSpan.FromMilliseconds(250);
+    /// <summary>Affinity entries kept before expired ones are swept out.</summary>
+    private const int AffinityCap = 4096;
+    /// <summary>The affinity key of checkouts that name none.</summary>
+    private static readonly object SharedAffinity = new();
 
-    public SkaidbConnectionPool(string connectionString, int maxsize = 10)
+    // Leading keywords of statements that never write: everything else counts
+    // as a write for read-your-writes affinity (a read taken for a write only
+    // keeps the caller on its member a little longer).
+    private static readonly HashSet<string> ReadKeywords = new(StringComparer.OrdinalIgnoreCase)
     {
-        if (maxsize < 1) throw new SkaidbException("maxsize must be >= 1");
-        _connectionString = connectionString;
-        _maxsize = maxsize;
-    }
+        "select", "show", "explain", "describe", "desc", "values", "with", "use",
+    };
 
-    /// <summary>Check out a usable connection, reusing an idle one when possible.</summary>
-    public SkaidbConnection Acquire()
+    /// <summary>One member as the pool sees it. Every field is guarded by <see cref="_gate"/>.</summary>
+    internal sealed class Member
     {
-        while (true)
+        public readonly string Endpoint;          // what the pool dials (EndpointKey form)
+        public readonly string Host;
+        public readonly int Port;
+        public readonly bool Seed;                // configured: discovery never drops it
+        public string? Canonical;                 // its own SHOW ENDPOINTS name
+        public SkaidbMemberState Listed = SkaidbMemberState.Ready;   // Ready | Resyncing | Unreachable | Unlisted
+        public double? Ewma;                      // seconds
+        public int Samples;
+        public double LastSample;                 // Now() of the last round trip
+        public int Errors;                        // consecutive transport failures
+        public double? EjectedUntil;              // null = admitted
+        public int Ejections;
+        public double ReadmittedAt = double.NegativeInfinity;
+        public int InUse;
+
+        public Member(string host, int port, bool seed)
         {
-            SkaidbConnection? c = null;
-            lock (_gate)
-            {
-                if (_closed) throw new SkaidbException("pool is closed");
-                if (_idle.Count > 0) c = _idle.Pop();
-            }
-            if (c is null)
-            {
-                var fresh = new SkaidbConnection(_connectionString);
-                fresh.Open();
-                return fresh;
-            }
-            // A connection the server closed while it sat idle still looks
-            // fine locally, so check before handing it out.
-            if (c.IsUsable) return c;
-            c.Dispose();
+            Host = host;
+            Port = port;
+            Endpoint = SkaidbConnection.EndpointKey(host, port);
+            Seed = seed;
         }
     }
 
-    /// <summary>Return a connection, disposing it if broken or the pool is full.</summary>
+    private readonly string _connectionString;
+    private readonly int _maxsize;
+    private readonly SkaidbLoadBalancing _policy;
+    private readonly bool _fifo;
+    private readonly bool _discover;
+    private readonly double _refreshInterval;
+    private readonly double _ryw;
+    private readonly int _ejectErrors;
+    private readonly double _ejectFactor;
+    private readonly double _ejectFloor;
+    private readonly double _backoff;
+    private readonly double _backoffMax;
+    private readonly int _defaultPort;
+    private readonly Dictionary<string, Member> _members = new();
+    private readonly List<SkaidbConnection> _idle = new();
+    private readonly Dictionary<object, (string Endpoint, double Until)> _affinity = new();
+    private readonly object _gate = new();
+    private int _rr = -1;
+    private bool _discoveryOff;
+    private double _nextRefresh;
+    private Timer? _maintainer;
+    private bool _closed;
+
+    /// <summary>A pool keeping at most <paramref name="maxsize"/> idle connections, every other option at its default.</summary>
+    public SkaidbConnectionPool(string connectionString, int maxsize = 10)
+        : this(connectionString, new SkaidbPoolOptions { MaxSize = maxsize })
+    {
+    }
+
+    /// <summary>
+    /// A pool over the members named by <paramref name="connectionString"/>
+    /// (its <c>Host</c>/<c>Seeds</c>), every connection built from it.
+    /// Throws <see cref="SkaidbException"/> for an invalid option or
+    /// connection string.
+    /// </summary>
+    public SkaidbConnectionPool(string connectionString, SkaidbPoolOptions options)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        if (options.MaxSize < 1) throw new SkaidbException("maxsize must be >= 1");
+        if (!Enum.IsDefined(options.LoadBalancing))
+            throw new SkaidbException($"unknown LoadBalancing {options.LoadBalancing} (use Random, RoundRobin or LeastLatency)");
+        if (!Enum.IsDefined(options.IdleOrder))
+            throw new SkaidbException($"unknown IdleOrder {options.IdleOrder} (use Lifo or Fifo)");
+        if (options.EjectErrors < 1) throw new SkaidbException("EjectErrors must be >= 1");
+        if (!(options.EjectLatencyFactor >= 0)) throw new SkaidbException("EjectLatencyFactor must be >= 0");
+        if (options.RefreshInterval <= TimeSpan.Zero) throw new SkaidbException("RefreshInterval must be positive");
+        if (options.ReadYourWrites < TimeSpan.Zero || options.EjectLatencyFloor < TimeSpan.Zero
+            || options.EjectBackoff < TimeSpan.Zero || options.EjectBackoffMax < TimeSpan.Zero)
+            throw new SkaidbException("pool durations must not be negative");
+        _connectionString = connectionString;
+        _maxsize = options.MaxSize;
+        _policy = options.LoadBalancing;
+        _fifo = options.IdleOrder == SkaidbIdleOrder.Fifo;
+        _discover = options.Discover;
+        _refreshInterval = options.RefreshInterval.TotalSeconds;
+        _ryw = options.ReadYourWrites.TotalSeconds;
+        _ejectErrors = options.EjectErrors;
+        _ejectFactor = options.EjectLatencyFactor;
+        _ejectFloor = options.EjectLatencyFloor.TotalSeconds;
+        _backoff = options.EjectBackoff.TotalSeconds;
+        _backoffMax = options.EjectBackoffMax.TotalSeconds;
+        // The seeds and the default port, read once (a bad connection string
+        // fails here rather than at the first checkout).
+        using var template = new SkaidbConnection(connectionString);
+        _defaultPort = template.Port;
+        foreach (var seed in template.Seeds)
+        {
+            var (h, p) = SkaidbConnection.SplitEndpoint(seed, _defaultPort);
+            var m = new Member(h, p, seed: true);
+            _members.TryAdd(m.Endpoint, m);
+        }
+    }
+
+    private static double Now() =>
+        System.Diagnostics.Stopwatch.GetTimestamp() / (double)System.Diagnostics.Stopwatch.Frequency;
+
+    // ---- checkout / checkin ------------------------------------------------
+
+    /// <summary>
+    /// Check out a usable connection: an idle one to the member the policy
+    /// picks, or a new one dialed to it (falling back to the other members).
+    /// </summary>
+    public SkaidbConnection Acquire() => Acquire(null);
+
+    /// <summary>
+    /// <see cref="Acquire()"/> under a read-your-writes affinity key (a user
+    /// or session id; null = the pool-wide key): within
+    /// <see cref="SkaidbPoolOptions.ReadYourWrites"/> of a write made under
+    /// the same key, the checkout goes to the member that took it.
+    /// </summary>
+    public SkaidbConnection Acquire(object? affinity)
+    {
+        while (true)
+        {
+            SkaidbConnection? c;
+            List<SkaidbConnection>? stale;
+            List<string>? order = null;
+            lock (_gate)
+            {
+                if (_closed) throw new SkaidbException("pool is closed");
+                var target = Pick(affinity);
+                c = TakeIdle(target, out stale);
+                if (c is null) order = Order(target, null);
+            }
+            if (stale is not null)
+                foreach (var s in stale) s.Dispose();
+            if (c is null)
+            {
+                c = new SkaidbConnection(_connectionString) { Pool = this };
+                try
+                {
+                    c.OpenAt(order!);
+                }
+                catch
+                {
+                    c.Dispose();
+                    throw;
+                }
+                c.PoolEndpoint = c.ConnectedEndpoint;
+                DiscoverThrough(c);
+                if (!c.IsUsable) { c.Dispose(); continue; }
+            }
+            // A connection the server closed while it sat idle still looks
+            // fine locally, so check before handing it out.
+            else if (!c.IsUsable) { c.Dispose(); continue; }
+            lock (_gate)
+            {
+                if (c.PoolEndpoint is not null && _members.TryGetValue(c.PoolEndpoint, out var m)) m.InUse++;
+                c.PoolAffinity = affinity;
+                c.PoolOut = true;
+            }
+            return c;
+        }
+    }
+
+    /// <summary>
+    /// Return a connection. It is disposed instead of kept when it is
+    /// broken, its member is ejected, not ready or gone, it is not this
+    /// pool's, or the idle set is full.
+    /// </summary>
     public void Release(SkaidbConnection c)
     {
         lock (_gate)
         {
-            if (!_closed && c.IsUsable && _idle.Count < _maxsize)
+            Member? m = null;
+            if (c.Pool == this && c.PoolEndpoint is not null) _members.TryGetValue(c.PoolEndpoint, out m);
+            if (c.PoolOut && c.Pool == this)
             {
-                _idle.Push(c);
+                c.PoolOut = false;
+                if (m is not null && m.InUse > 0) m.InUse--;
+            }
+            if (!_closed && m is not null && Usable(m) && c.IsUsable && _idle.Count < _maxsize)
+            {
+                _idle.Add(c);
                 return;
             }
         }
@@ -3347,9 +3784,12 @@ public sealed class SkaidbConnectionPool : IDisposable
     }
 
     /// <summary>Run <paramref name="work"/> with a checked-out connection.</summary>
-    public T WithConnection<T>(Func<SkaidbConnection, T> work)
+    public T WithConnection<T>(Func<SkaidbConnection, T> work) => WithConnection(null, work);
+
+    /// <summary>Run <paramref name="work"/> with a connection checked out under <paramref name="affinity"/> (see <see cref="Acquire(object?)"/>).</summary>
+    public T WithConnection<T>(object? affinity, Func<SkaidbConnection, T> work)
     {
-        var c = Acquire();
+        var c = Acquire(affinity);
         try
         {
             return work(c);
@@ -3360,16 +3800,611 @@ public sealed class SkaidbConnectionPool : IDisposable
         }
     }
 
-    /// <summary>Close the pool and every idle connection.</summary>
+    /// <summary>
+    /// The members as the pool sees them, for monitoring: the endpoint it
+    /// dials, the discovered name, the state, the latency average and the
+    /// connections checked out and idle. Sorted by endpoint.
+    /// </summary>
+    public IReadOnlyList<SkaidbPoolMember> Members()
+    {
+        lock (_gate)
+        {
+            var idle = new Dictionary<string, int>();
+            foreach (var c in _idle)
+                if (c.PoolEndpoint is not null) idle[c.PoolEndpoint] = idle.GetValueOrDefault(c.PoolEndpoint) + 1;
+            var sorted = new List<Member>(_members.Values);
+            sorted.Sort(ByEndpoint);
+            var list = new List<SkaidbPoolMember>(sorted.Count);
+            foreach (var m in sorted)
+            {
+                list.Add(new SkaidbPoolMember(
+                    m.Endpoint,
+                    m.Canonical,
+                    m.EjectedUntil is not null ? SkaidbMemberState.Ejected : m.Listed,
+                    m.Ewma is double e ? TimeSpan.FromSeconds(e) : null,
+                    m.InUse,
+                    idle.GetValueOrDefault(m.Endpoint),
+                    m.Seed));
+            }
+            return list;
+        }
+    }
+
+    /// <summary>
+    /// Close the pool and every idle connection, and stop its background
+    /// timer. Checked-out connections are disposed when released.
+    /// </summary>
     public void Dispose()
     {
         List<SkaidbConnection> drained;
+        Timer? timer;
         lock (_gate)
         {
             _closed = true;
             drained = new List<SkaidbConnection>(_idle);
             _idle.Clear();
+            timer = _maintainer;
+            _maintainer = null;
         }
+        timer?.Dispose();
         foreach (var c in drained) c.Dispose();
+    }
+
+    // ---- choosing a member (callers hold _gate) ---------------------------
+
+    private static bool Usable(Member m) => m.EjectedUntil is null && m.Listed == SkaidbMemberState.Ready;
+
+    private static int ByEndpoint(Member a, Member b)
+    {
+        int c = string.CompareOrdinal(a.Host, b.Host);
+        return c != 0 ? c : a.Port.CompareTo(b.Port);
+    }
+
+    /// <summary>
+    /// The member this checkout should go to, or null for "any" (the random
+    /// policy, or no usable member at all).
+    /// </summary>
+    private Member? Pick(object? affinity)
+    {
+        if (_ryw > 0)
+        {
+            object key = affinity ?? SharedAffinity;
+            if (_affinity.TryGetValue(key, out var hit))
+            {
+                _members.TryGetValue(hit.Endpoint, out var am);
+                if (Now() >= hit.Until || am is null) _affinity.Remove(key);
+                else if (Usable(am)) return am;
+            }
+        }
+        var usable = new List<Member>();
+        foreach (var m in _members.Values)
+            if (Usable(m)) usable.Add(m);
+        if (usable.Count == 0 || _policy == SkaidbLoadBalancing.Random) return null;
+        if (_policy == SkaidbLoadBalancing.RoundRobin)
+        {
+            usable.Sort(ByEndpoint);
+            _rr = (_rr + 1) % usable.Count;
+            return usable[_rr];
+        }
+        if (usable.Count == 1) return usable[0];
+        int i = System.Random.Shared.Next(usable.Count);
+        int j = System.Random.Shared.Next(usable.Count - 1);
+        if (j >= i) j++;
+        double now = Now();
+        return Score(usable[i], now) <= Score(usable[j], now) ? usable[i] : usable[j];
+    }
+
+    /// <summary>A member never measured, or not lately, scores 0: it is tried and measured.</summary>
+    private static double Score(Member m, double now) =>
+        m.Ewma is not double e || now - m.LastSample > StaleSample ? 0.0 : e * (m.InUse + 1);
+
+    /// <summary>
+    /// Remove and return an idle connection (to <paramref name="target"/>, or
+    /// to any usable member), plus in <paramref name="stale"/> the idle
+    /// connections found to belong to members that are no longer usable (to
+    /// dispose outside the lock).
+    /// </summary>
+    private SkaidbConnection? TakeIdle(Member? target, out List<SkaidbConnection>? stale)
+    {
+        stale = null;
+        List<int>? drop = null;
+        int found = -1;
+        int n = _idle.Count;
+        for (int k = 0; k < n; k++)
+        {
+            int i = _fifo ? k : n - 1 - k;
+            var c = _idle[i];
+            Member? m = null;
+            if (c.PoolEndpoint is not null) _members.TryGetValue(c.PoolEndpoint, out m);
+            if (m is null || !Usable(m))
+            {
+                (stale ??= new List<SkaidbConnection>()).Add(c);
+                (drop ??= new List<int>()).Add(i);
+                continue;
+            }
+            if (target is null || m == target)
+            {
+                found = i;
+                break;
+            }
+        }
+        SkaidbConnection? picked = found >= 0 ? _idle[found] : null;
+        if (found >= 0) (drop ??= new List<int>()).Add(found);
+        if (drop is not null)
+        {
+            drop.Sort();
+            for (int d = drop.Count - 1; d >= 0; d--) _idle.RemoveAt(drop[d]);
+        }
+        return picked;
+    }
+
+    /// <summary>
+    /// Endpoints to dial, best first: <paramref name="first"/>, the other
+    /// usable members in random order, then the rest (resyncing/unreachable
+    /// before ejected, soonest re-admission first), <paramref name="exclude"/>
+    /// last — a dial never has nowhere to go while any member is configured.
+    /// </summary>
+    private List<string> Order(Member? first, string? exclude)
+    {
+        var usable = new List<Member>();
+        var rest = new List<Member>();
+        foreach (var m in _members.Values)
+        {
+            if (m == first) continue;
+            (Usable(m) ? usable : rest).Add(m);
+        }
+        for (int i = usable.Count - 1; i > 0; i--)
+        {
+            int j = System.Random.Shared.Next(i + 1);
+            (usable[i], usable[j]) = (usable[j], usable[i]);
+        }
+        rest.Sort((a, b) =>
+        {
+            int c = a.EjectedUntil.HasValue.CompareTo(b.EjectedUntil.HasValue);
+            return c != 0 ? c : (a.EjectedUntil ?? 0).CompareTo(b.EjectedUntil ?? 0);
+        });
+        var eps = new List<string>(_members.Count);
+        if (first is not null) eps.Add(first.Endpoint);
+        foreach (var m in usable) eps.Add(m.Endpoint);
+        foreach (var m in rest) eps.Add(m.Endpoint);
+        if (exclude is not null && eps.Count > 1 && eps.Remove(exclude)) eps.Add(exclude);
+        return eps;
+    }
+
+    // ---- what connections report (any thread) ------------------------------
+
+    /// <summary>A pooled connection re-dialing: the pool's order, the member it lost last.</summary>
+    internal List<string> DialOrder(string? exclude)
+    {
+        lock (_gate) return Order(null, exclude);
+    }
+
+    internal void RoundTrip(SkaidbConnection conn, double elapsed)
+    {
+        lock (_gate)
+        {
+            string? ep = conn.ConnectedEndpoint;
+            if (ep is null) return;
+            if (ep != conn.PoolEndpoint)
+            {
+                // The connection re-dialed to another member mid-checkout.
+                if (conn.PoolOut)
+                {
+                    if (conn.PoolEndpoint is not null && _members.TryGetValue(conn.PoolEndpoint, out var old) && old.InUse > 0)
+                        old.InUse--;
+                    if (_members.TryGetValue(ep, out var now)) now.InUse++;
+                }
+                conn.PoolEndpoint = ep;
+            }
+            if (!_members.TryGetValue(ep, out var m)) return;
+            m.Errors = 0;
+            if (m.Ewma is not double avg)
+            {
+                m.Ewma = elapsed;
+            }
+            else
+            {
+                double cap = EwmaClamp * Math.Max(avg, _ejectFloor);
+                m.Ewma = avg + EwmaWeight * (Math.Min(elapsed, cap) - avg);
+            }
+            m.Samples++;
+            m.LastSample = Now();
+            // Only a member still in rotation: round trips finishing on
+            // connections checked out before an ejection must not eject it
+            // again (and stretch its backoff).
+            if (Usable(m) && m.Samples >= EwmaMinSamples && _ejectFactor > 0)
+            {
+                var others = new List<double>();
+                foreach (var o in _members.Values)
+                    if (o != m && Usable(o) && o.Ewma is double oe && o.Samples >= EwmaMinSamples) others.Add(oe);
+                if (others.Count > 0)
+                {
+                    others.Sort();
+                    double median = others[(others.Count - 1) / 2];
+                    double mine = m.Ewma.Value;
+                    if (mine > _ejectFactor * median && mine - median > _ejectFloor)
+                        Eject(m, string.Format(CultureInfo.InvariantCulture,
+                            "latency {0:F1} ms vs median {1:F1} ms", mine * 1000, median * 1000));
+                }
+            }
+        }
+    }
+
+    internal void Failed(string endpoint)
+    {
+        lock (_gate)
+        {
+            if (!_members.TryGetValue(endpoint, out var m)) return;
+            m.Errors++;
+            if (m.Errors >= _ejectErrors && m.EjectedUntil is null)
+                Eject(m, $"{m.Errors} consecutive connection failures");
+        }
+    }
+
+    /// <summary>A checked-out connection was closed instead of released.</summary>
+    internal void ClosedOut(SkaidbConnection conn)
+    {
+        lock (_gate)
+        {
+            if (!conn.PoolOut) return;
+            conn.PoolOut = false;
+            if (conn.PoolEndpoint is not null && _members.TryGetValue(conn.PoolEndpoint, out var m) && m.InUse > 0)
+                m.InUse--;
+        }
+    }
+
+    internal void Wrote(SkaidbConnection conn)
+    {
+        if (_ryw <= 0 || !conn.PoolOut || conn.ConnectedEndpoint is not string ep) return;
+        double now = Now();
+        lock (_gate)
+        {
+            if (_affinity.Count >= AffinityCap)
+            {
+                var expired = new List<object>();
+                foreach (var kv in _affinity)
+                    if (kv.Value.Until <= now) expired.Add(kv.Key);
+                foreach (var k in expired) _affinity.Remove(k);
+            }
+            _affinity[conn.PoolAffinity ?? SharedAffinity] = (ep, now + _ryw);
+        }
+    }
+
+    // ---- statement and failure classification -------------------------------
+
+    /// <summary>
+    /// Whether <paramref name="sql"/> counts as a write for read-your-writes:
+    /// its first keyword, after whitespace, comments and opening
+    /// parentheses, is not one of SELECT, SHOW, EXPLAIN, DESCRIBE, DESC,
+    /// VALUES, WITH or USE.
+    /// </summary>
+    internal static bool IsWrite(string sql)
+    {
+        int i = 0, n = sql.Length;
+        while (i < n)
+        {
+            if (char.IsWhiteSpace(sql[i]) || sql[i] == '(')
+            {
+                i++;
+            }
+            else if (sql.AsSpan(i).StartsWith("--", StringComparison.Ordinal))
+            {
+                int j = sql.IndexOf('\n', i);
+                i = j < 0 ? n : j + 1;
+            }
+            else if (sql.AsSpan(i).StartsWith("/*", StringComparison.Ordinal))
+            {
+                int j = sql.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                i = j < 0 ? n : j + 2;
+            }
+            else
+            {
+                break;
+            }
+        }
+        int k = i;
+        while (k < n && (char.IsLetter(sql[k]) || sql[k] == '_')) k++;
+        return !ReadKeywords.Contains(sql.Substring(i, k - i));
+    }
+
+    /// <summary>
+    /// Whether a failed dial says something about the member's health. A
+    /// refused login is the caller's problem, not the member's — except a
+    /// capacity refusal, which is the member being full.
+    /// </summary>
+    internal static bool MemberFault(Exception e)
+    {
+        if (e is IOException or SocketException) return true;
+        string msg = e.Message;
+        if (msg.StartsWith("authentication denied", StringComparison.Ordinal))
+            return msg.Contains("too many connections:", StringComparison.Ordinal);
+        return !msg.StartsWith("server signature mismatch", StringComparison.Ordinal);
+    }
+
+    // ---- ejection and re-admission (callers hold _gate) ---------------------
+
+    /// <summary>
+    /// Take <paramref name="m"/> out of rotation — unless it is the last
+    /// usable member: a slow or flaky member beats none.
+    /// </summary>
+    private void Eject(Member m, string why)
+    {
+        bool another = false;
+        foreach (var o in _members.Values)
+        {
+            if (o != m && Usable(o)) { another = true; break; }
+        }
+        if (!another) return;
+        double now = Now();
+        if (now - m.ReadmittedAt > _backoffMax) m.Ejections = 0;   // healthy for a while: start the backoff over
+        m.Ejections++;
+        m.EjectedUntil = now + BackoffFor(m);
+        System.Diagnostics.Trace.TraceWarning($"skaidb pool: ejecting {m.Endpoint} ({why})");
+        EnsureMaintainer();
+    }
+
+    internal double BackoffFor(Member m) =>
+        Math.Min(_backoff * Math.Pow(2, Math.Max(m.Ejections - 1, 0)), _backoffMax);
+
+    /// <summary>
+    /// Start the background timer: it re-probes ejected members and
+    /// refreshes discovery. A thread-pool timer, so it never keeps the
+    /// process alive; <see cref="Dispose"/> stops it. One-shot and re-armed
+    /// after each run, so a slow probe never overlaps the next.
+    /// </summary>
+    private void EnsureMaintainer()
+    {
+        if (_maintainer is null && !_closed)
+            _maintainer = new Timer(_ => Maintain(), null, MaintainTick, System.Threading.Timeout.InfiniteTimeSpan);
+    }
+
+    private void Maintain()
+    {
+        try
+        {
+            double now = Now();
+            var due = new List<Member>();
+            bool refresh;
+            lock (_gate)
+            {
+                if (_closed) return;
+                foreach (var m in _members.Values)
+                    if (m.EjectedUntil is double until && now >= until) due.Add(m);
+                refresh = _discover && !_discoveryOff && now >= _nextRefresh;
+            }
+            foreach (var m in due) Probe(m);
+            if (refresh) Refresh();
+        }
+        catch (Exception)
+        {
+            // An exception escaping a timer callback ends the process; the
+            // next tick tries again.
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (!_closed) _maintainer?.Change(MaintainTick, System.Threading.Timeout.InfiniteTimeSpan);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dial <paramref name="m"/> alone and run one statement: success
+    /// re-admits it with a fresh latency average (the probe connection joins
+    /// the idle set), failure ejects it again for twice as long.
+    /// </summary>
+    private void Probe(Member m)
+    {
+        SkaidbConnection? conn = null;
+        bool ok;
+        try
+        {
+            conn = new SkaidbConnection(_connectionString);
+            conn.OpenAt(new[] { m.Endpoint });
+            conn.RunStatement("SHOW DATABASES", Array.Empty<object?>(), conn.Consistency);
+            ok = true;
+        }
+        catch (Exception)
+        {
+            ok = false;
+        }
+        lock (_gate)
+        {
+            if (_closed) ok = false;
+            if (ok)
+            {
+                m.EjectedUntil = null;
+                m.Errors = 0;
+                m.Ewma = null;
+                m.Samples = 0;
+                m.ReadmittedAt = Now();
+                System.Diagnostics.Trace.TraceWarning($"skaidb pool: re-admitted {m.Endpoint}");
+                if (conn is not null && _idle.Count < _maxsize)
+                {
+                    conn.Pool = this;
+                    conn.PoolEndpoint = m.Endpoint;
+                    _idle.Add(conn);
+                    conn = null;
+                }
+            }
+            else
+            {
+                m.Ejections++;
+                m.EjectedUntil = Now() + BackoffFor(m);
+            }
+        }
+        conn?.Dispose();
+    }
+
+    // ---- discovery ------------------------------------------------------------
+
+    /// <summary>
+    /// Run discovery on a freshly dialed connection when the member it
+    /// reached has not named itself yet (once per member, so seeds given as
+    /// host names are matched to the endpoints the server reports).
+    /// </summary>
+    private void DiscoverThrough(SkaidbConnection conn)
+    {
+        if (!_discover) return;
+        lock (_gate)
+        {
+            if (_discoveryOff) return;
+            if (conn.PoolEndpoint is null || !_members.TryGetValue(conn.PoolEndpoint, out var m) || m.Canonical is not null)
+                return;
+            EnsureMaintainer();
+        }
+        ListThrough(conn);
+    }
+
+    private void Refresh()
+    {
+        SkaidbConnection conn;
+        try
+        {
+            conn = Acquire();
+        }
+        catch (SkaidbException)
+        {
+            lock (_gate) _nextRefresh = Now() + _refreshInterval;
+            return;
+        }
+        try
+        {
+            ListThrough(conn);
+        }
+        finally
+        {
+            Release(conn);
+        }
+    }
+
+    /// <summary>Run <c>SHOW ENDPOINTS</c> on <paramref name="conn"/> and fold the answer in.</summary>
+    internal void ListThrough(SkaidbConnection conn)
+    {
+        QueryResult result;
+        try
+        {
+            conn.EnsureLive();
+            result = conn.RunStatement("SHOW ENDPOINTS", Array.Empty<object?>(), conn.Consistency);
+        }
+        catch (SkaidbException) when (conn.IsOpen && !conn.IsBroken)
+        {
+            // An Error reply: a server that predates the statement. Keep the seeds.
+            lock (_gate) _discoveryOff = true;
+            return;
+        }
+        catch (SkaidbException)
+        {
+            return;   // the transport failed; the next refresh tries again
+        }
+        lock (_gate)
+        {
+            if (result.Rows is not { Count: > 0 })
+            {
+                // A standalone server: there are no members to learn. Keep the seeds.
+                _discoveryOff = true;
+                return;
+            }
+            ApplyListing(conn.ConnectedEndpoint, result.Rows);
+            double interval = _refreshInterval;
+            foreach (var m in _members.Values)
+            {
+                if (m.Listed is SkaidbMemberState.Resyncing or SkaidbMemberState.Unreachable)
+                {
+                    interval = Math.Min(interval, RefreshNotReady);
+                    break;
+                }
+            }
+            _nextRefresh = Now() + interval;
+        }
+    }
+
+    /// <summary>Fold a non-empty <c>SHOW ENDPOINTS</c> answer (caller holds <see cref="_gate"/>).</summary>
+    private void ApplyListing(string? dialed, List<object?[]> rows)
+    {
+        var listed = new List<(string Endpoint, string State)>();
+        var listedNames = new HashSet<string>();
+        foreach (var row in rows)
+        {
+            if (row.Length < 3 || row[0] is not string endpoint) continue;
+            if (listedNames.Add(endpoint)) listed.Add((endpoint, row[1] as string ?? ""));
+            if (row[2] is true && dialed is not null && _members.TryGetValue(dialed, out var me))
+                me.Canonical = endpoint;
+        }
+        // A member reported under the name of one already known (a seed
+        // given as a host name) is that member, not a new one.
+        var byName = new Dictionary<string, Member>();
+        foreach (var m in _members.Values)
+            if (m.Canonical is not null && (!byName.ContainsKey(m.Canonical) || m.Seed)) byName[m.Canonical] = m;
+        foreach (var key in new List<string>(_members.Keys))
+        {
+            var m = _members[key];
+            if (m.Canonical is not null && byName[m.Canonical] != m) _members.Remove(key);   // a duplicate of a seed
+        }
+        var seen = new HashSet<Member>();
+        foreach (var (endpoint, rawState) in listed)
+        {
+            if (!byName.TryGetValue(endpoint, out var m))
+            {
+                string host;
+                int port;
+                try
+                {
+                    (host, port) = SkaidbConnection.SplitEndpoint(endpoint, _defaultPort);
+                }
+                catch (SkaidbException)
+                {
+                    continue;   // not an endpoint this driver can dial
+                }
+                string key = SkaidbConnection.EndpointKey(host, port);
+                if (!_members.TryGetValue(key, out m))
+                {
+                    m = new Member(host, port, seed: false);
+                    _members[key] = m;
+                }
+                m.Canonical = endpoint;
+            }
+            var state = rawState switch
+            {
+                "resyncing" => SkaidbMemberState.Resyncing,
+                "unreachable" => SkaidbMemberState.Unreachable,
+                _ => SkaidbMemberState.Ready,
+            };
+            if (state == SkaidbMemberState.Ready && m.Listed != SkaidbMemberState.Ready)
+            {
+                // Back in rotation: measured afresh, like a re-admission.
+                m.Ewma = null;
+                m.Samples = 0;
+                m.Errors = 0;
+            }
+            m.Listed = state;
+            seen.Add(m);
+        }
+        foreach (var key in new List<string>(_members.Keys))
+        {
+            var m = _members[key];
+            if (seen.Contains(m) || (m.Seed && m.Canonical is null)) continue;   // listed, or a seed not identified yet
+            if (m.Seed) m.Listed = SkaidbMemberState.Unlisted;                   // configured, but no longer a member
+            else _members.Remove(key);
+        }
+    }
+
+    // ---- for the tests ----------------------------------------------------------
+
+    internal Member? MemberAt(string endpoint)
+    {
+        lock (_gate) return _members.TryGetValue(endpoint, out var m) ? m : null;
+    }
+
+    internal bool DiscoveryOff
+    {
+        get { lock (_gate) return _discoveryOff; }
+    }
+
+    /// <summary>Seconds until the next discovery refresh.</summary>
+    internal double NextRefreshIn
+    {
+        get { lock (_gate) return _nextRefresh - Now(); }
     }
 }

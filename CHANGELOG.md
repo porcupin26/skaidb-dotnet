@@ -4,6 +4,40 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.2.0] - 2026-10-25
+
+### Added
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1): `new SkaidbConnectionPool(connectionString,
+  new SkaidbPoolOptions { ... })` with
+  `LoadBalancing = SkaidbLoadBalancing.RoundRobin` / `LeastLatency` (power of
+  two choices on the round-trip average × checked-out connections; a member
+  not measured in the last 2 s is tried again; `Random` stays the default),
+  `IdleOrder = SkaidbIdleOrder.Fifo`, health ejection (`EjectErrors`
+  consecutive transport failures, or a latency average far above the other
+  members': `EjectLatencyFactor`, `EjectLatencyFloor`) with a background
+  probe that re-admits the member (`EjectBackoff` doubling to
+  `EjectBackoffMax`), `Discover = true` (members from `SHOW ENDPOINTS`,
+  server ≥ 0.327: joiners added, leavers dropped, resyncing/unreachable
+  members skipped and re-checked every 5 s), and `ReadYourWrites =
+  <TimeSpan>` with `Acquire(affinity)` / `WithConnection(affinity, work)` —
+  reads follow the member that took the key's last write.
+  `pool.Members()` reports each member's endpoint, discovered name, state,
+  latency and connections (`SkaidbPoolMember`). The
+  `(connectionString, maxsize)` constructor keeps working.
+
+### Changed
+- `Open()`, and the re-dial after a transport error, move on to the next
+  seed when a node accepts the TCP connection but drops the handshake (a
+  node at its connection ceiling, or one going down) instead of failing; a
+  refused login still fails at once.
+- A pooled connection re-dials in the pool's order (usable members first,
+  the one it lost last).
+- `SkaidbConnectionPool` reads its connection string when constructed, so an
+  invalid one throws from the constructor rather than from the first
+  `Acquire()`. `Release()` disposes a connection the pool did not hand out
+  instead of keeping it.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added
@@ -160,5 +194,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.2.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.2.0
+[1.1.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.1.0
 [1.0.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.0.0
