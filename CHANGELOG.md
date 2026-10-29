@@ -4,6 +4,25 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.3.0] - 2026-10-29
+
+### Added
+- **Parameterised streaming**: `conn.Stream(sql, parameters, consistency?)`
+  binds the statement's `?` placeholders in order, typed — the values
+  `cmd.Parameters` takes — over `OP_QUERY_STREAM_PARAMS` (server ≥ 0.330),
+  so a range-bounded export no longer needs its literals written into the
+  SQL: `conn.Stream("SELECT … WHERE ts >= ? AND ts < ?", [start, end])`.
+  `parameters` is an `IReadOnlyList<object?>` like an `ExecuteBatch` row (an
+  array, a list, a collection expression). An older server's refusal is
+  thrown as `server does not support parameterised streaming (skaidb >=
+  0.330): …` and leaves the connection usable. Without parameters (none,
+  null or an empty list) the request is the original `OP_QUERY_STREAM`,
+  byte for byte, so it works against every server. `Stream(sql)` and
+  `Stream(sql, consistency)` are unchanged, binary included: every call form
+  of them, `Stream(sql, null)` too, binds as before, and a consistency is
+  never taken for a parameter. The conformance suite's `stream_params` case
+  runs through it.
+
 ## [1.2.0] - 2026-10-25
 
 ### Added
@@ -194,6 +213,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.3.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.3.0
 [1.2.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.2.0
 [1.1.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.1.0
 [1.0.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.0.1

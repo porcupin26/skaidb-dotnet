@@ -36,7 +36,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.2.0
+V=1.3.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -307,7 +307,7 @@ conn.Open();
 
 Details in [docs/adonet.md](docs/adonet.md).
 
-## Streaming large results — `conn.Stream(sql, consistency?)`
+## Streaming large results — `conn.Stream(sql, parameters?, consistency?)`
 
 `ExecuteReader()` buffers the whole result; a large scan is also bounded by
 the server's scan budgets. `Stream()` asks the server to deliver the rows in
@@ -319,15 +319,31 @@ foreach (object?[] row in conn.Stream("SELECT id, v FROM readings"))
 Console.WriteLine(string.Join(",", conn.StreamColumns));   // set once the header arrives
 ```
 
-It takes **no parameters** (the streaming opcode carries SQL text only). A
-non-row statement streamed this way yields nothing (`conn.StreamAffected`
+The server executes a plain `SELECT` page by page, and no scan budget
+applies to a streamed page (server ≥ 0.330; `EXPLAIN` says whether a
+statement pages, and the rules are under "Streamed queries" in the
+[query syntax reference](https://skaidb.org/docs/query_syntax.html)).
+
+A list of values binds the statement's `?` placeholders in order, typed —
+the values `cmd.Parameters` takes ([types](docs/types.md)) — and a
+consistency stays the last argument:
+
+```csharp
+foreach (var row in conn.Stream("SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?", [start, end]))
+    Export(row);
+foreach (var row in conn.Stream("SELECT id FROM events WHERE kind = ?", new object?[] { "click" }, SkaidbConsistency.One))
+    Count(row);
+```
+
+Parameters need a server ≥ 0.330: an older one answers `server does not
+support parameterised streaming (skaidb >= 0.330): …` and the connection
+stays usable. A stream without parameters works against every server.
+
+A non-row statement streamed this way yields nothing (`conn.StreamAffected`
 then holds a mutation's count). An error before any row
 is an ordinary statement error; an error partway through (a node dying
 mid-scan, a scan budget tripping) is thrown after the rows already yielded,
 which are valid.
-
-On a cluster, name the columns: a bare `SELECT *` is only executed page by
-page at consistency `One`; a named column list streams at any level.
 
 ### The abandon rule
 
@@ -498,7 +514,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.2.0
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.3.0
 ```
 
 ## Compatibility
@@ -507,7 +523,9 @@ SELECT client_name, client_version FROM drivers;   -- dotnet | 1.2.0
 - **Server**: any skaidb. Prepared statements need server ≥ 0.17.0 (older
   servers get the client-side fallback automatically), `ExecuteBatch` ≥
   0.87.0, `Stream()` a server with the streaming opcode (an older one answers
-  `server does not support streaming`), multiple result sets a server with
+  `server does not support streaming`) and `Stream()` with parameters a
+  server ≥ 0.330 (an older one answers `server does not support
+  parameterised streaming`), multiple result sets a server with
   `EMIT`, the `drivers` row a server ≥ 0.203.0, pool discovery
   (`SkaidbPoolOptions.Discover`) a server ≥ 0.327 (an older one leaves the
   pool on its seeds).
@@ -526,8 +544,9 @@ the driver's decoder and encoder, the SCRAM computations, the auth outcomes
 every case through the public API against a scripted fake server that
 verifies the client proof independently and replays the reference bytes.
 
-Nothing is skipped by call method: `query`, `query_stream`,
-`execute_prepared`, `execute_batch` and `sequence` all run. One value is
+Nothing is skipped by call method: `query`, `query_stream` (with
+`call.params`, through the parameterised `Stream()`), `execute_prepared`,
+`execute_batch` and `sequence` all run. One value is
 checked only one way: `decimal_wide` (31 digits) decodes to its documented
 form, a decimal string, but has no bindable .NET value, so its encode is
 skipped.

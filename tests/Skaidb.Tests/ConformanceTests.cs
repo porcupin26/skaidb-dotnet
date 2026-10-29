@@ -484,10 +484,19 @@ public class ConformanceTests
             case "query_stream":
                 return Outcome(() =>
                 {
+                    string sql = call["sql"]!.GetValue<string>();
+                    // With call.params, the parameterised form (OP_QUERY_STREAM_PARAMS).
+                    var stream = call["params"] is JsonArray ps
+                        ? conn.Stream(sql, ps.Select(p =>
+                        {
+                            Assert.True(TryNative(p!, out var v));
+                            return v;
+                        }).ToList())
+                        : conn.Stream(sql);
                     var rows = new List<object?[]>();
                     try
                     {
-                        foreach (var row in conn.Stream(call["sql"]!.GetValue<string>())) rows.Add(row);
+                        foreach (var row in stream) rows.Add(row);
                     }
                     catch (SkaidbException e) when (conn.StreamColumns.Count > 0)
                     {

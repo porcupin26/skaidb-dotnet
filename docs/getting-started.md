@@ -15,7 +15,7 @@ at <https://github.com/porcupin26/skaidb-dotnet/releases> attaches
 `Skaidb.X.Y.Z.nupkg`):
 
 ```sh
-V=1.2.0
+V=1.3.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg

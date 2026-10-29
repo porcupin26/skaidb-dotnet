@@ -1,4 +1,5 @@
-// Stream a large result set row by row with bounded memory, and stop early.
+// Stream a large result set row by row with bounded memory, stream a range
+// with bound parameters, and stop early.
 //
 //   dotnet run --project examples/Stream -- [host] [port] [user] [password] [database]
 //
@@ -34,8 +35,7 @@ using (var cmd = conn.CreateCommand())
     cmd.ExecuteBatch(rows);
 }
 
-// Full scan, one chunk in memory at a time. Name the columns: on a cluster a
-// bare `SELECT *` only streams page by page at consistency ONE.
+// Full scan, one chunk in memory at a time.
 long n = 0;
 double sum = 0;
 foreach (var row in conn.Stream("SELECT id, v FROM readings"))
@@ -44,6 +44,13 @@ foreach (var row in conn.Stream("SELECT id, v FROM readings"))
     sum += (double)row[1]!;
 }
 Console.WriteLine($"columns [{string.Join(", ", conn.StreamColumns)}] rows {n} mean {sum / n}");
+
+// A range with its bounds bound as parameters (server >= 0.330): the values
+// travel typed, nothing is spliced into the SQL.
+long inRange = 0;
+foreach (var row in conn.Stream("SELECT id, v FROM readings WHERE id > ? AND id <= ?", [1000L, 2000L]))
+    inRange++;
+Console.WriteLine($"rows with 1000 < id <= 2000: {inRange}");
 
 // Stop early: `break` leaves the foreach, which disposes the enumerator.
 foreach (var row in conn.Stream("SELECT id, v FROM readings", SkaidbConsistency.One))

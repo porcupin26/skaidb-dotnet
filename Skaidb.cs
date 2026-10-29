@@ -124,10 +124,11 @@ public sealed class SkaidbConnection : DbConnection
     private bool _broken;
 
     /// <summary>
-    /// A <see cref="Stream"/> owns the socket until RowsEnd/Error. Written
-    /// under <see cref="_lock"/>, together with the check that guards a
-    /// request. Volatile because <see cref="IsUsable"/> reads it from whatever
-    /// thread a pool happens to return the connection on.
+    /// A <see cref="Stream(string, SkaidbConsistency?)"/> (with or without
+    /// parameters) owns the socket until RowsEnd/Error. Written under
+    /// <see cref="_lock"/>, together with the check that guards a request.
+    /// Volatile because <see cref="IsUsable"/> reads it from whatever thread a
+    /// pool happens to return the connection on.
     /// </summary>
     private volatile bool _streaming;
 
@@ -366,7 +367,10 @@ public sealed class SkaidbConnection : DbConnection
     /// <c>SELECT version()</c> returns it.
     /// </summary>
     public override string ServerVersion => "";
-    /// <summary>Open, Closed, or Open|Fetching while a <see cref="Stream"/> holds the connection.</summary>
+    /// <summary>
+    /// Open, Closed, or Open|Fetching while a
+    /// <see cref="Stream(string, SkaidbConsistency?)"/> holds the connection.
+    /// </summary>
     public override ConnectionState State =>
         !_open ? ConnectionState.Closed
         : _streaming ? ConnectionState.Open | ConnectionState.Fetching
@@ -712,10 +716,10 @@ public sealed class SkaidbConnection : DbConnection
 
     /// <summary>
     /// False once disposed, once a transport error broke the socket, or while a
-    /// <see cref="Stream"/> is still in flight. The last case is what keeps a
-    /// pool honest: a connection whose stream was abandoned without being
-    /// disposed still owes unread frames, and handing it out would desync
-    /// whoever got it next.
+    /// <see cref="Stream(string, SkaidbConsistency?)"/> is still in flight. The
+    /// last case is what keeps a pool honest: a connection whose stream was
+    /// abandoned without being disposed still owes unread frames, and handing
+    /// it out would desync whoever got it next.
     /// </summary>
     public bool IsUsable => !_disposed && _open && !_broken && !_streaming && !SocketDead();
 
@@ -811,8 +815,8 @@ public sealed class SkaidbConnection : DbConnection
     }
 
     /// <summary>
-    /// Refuse a request while a <see cref="Stream"/> holds the connection,
-    /// WITHOUT waiting for the lock.
+    /// Refuse a request while a <see cref="Stream(string, SkaidbConsistency?)"/>
+    /// holds the connection, WITHOUT waiting for the lock.
     ///
     /// The locked check below is the authority, but reaching it means
     /// blocking on the Monitor until the streaming thread is between
@@ -832,9 +836,9 @@ public sealed class SkaidbConnection : DbConnection
     }
 
     /// <summary>
-    /// Refuse a request while a <see cref="Stream"/> holds the connection.
-    /// Call with <see cref="_lock"/> held, so the check and the WriteFrame it
-    /// guards cannot be split by the streaming thread.
+    /// Refuse a request while a <see cref="Stream(string, SkaidbConsistency?)"/>
+    /// holds the connection. Call with <see cref="_lock"/> held, so the check
+    /// and the WriteFrame it guards cannot be split by the streaming thread.
     /// </summary>
     private void ThrowIfStreamingLocked()
     {
@@ -1098,7 +1102,8 @@ public sealed class SkaidbConnection : DbConnection
     /// <code>
     /// foreach (var row in conn.Stream("SELECT ...")) { ... }
     /// </code>
-    /// Takes no parameters — the opcode carries SQL text.
+    /// <see cref="Stream(string, IReadOnlyList{object}, SkaidbConsistency?)"/>
+    /// also binds <c>?</c> placeholders.
     /// </summary>
     /// <remarks>
     /// <para>The connection is busy for the whole stream: every other
@@ -1120,7 +1125,39 @@ public sealed class SkaidbConnection : DbConnection
     /// connection would go back to the pool before the first row is read.
     /// Enumerate inside the callback.</para>
     /// </remarks>
-    public IEnumerable<object?[]> Stream(string sql, SkaidbConsistency? consistency = null)
+    public IEnumerable<object?[]> Stream(string sql, SkaidbConsistency? consistency = null) =>
+        StreamCore(sql, null, consistency);
+
+    /// <summary>
+    /// <see cref="Stream(string, SkaidbConsistency?)"/> with bound parameters:
+    /// <paramref name="parameters"/> bind the statement's <c>?</c>
+    /// placeholders in order, typed — the values a command's
+    /// <see cref="SkaidbCommand.Parameters"/> take, arrays and documents
+    /// included.
+    /// <code>
+    /// foreach (var row in conn.Stream("SELECT id, ts FROM events WHERE ts &gt;= ? AND ts &lt; ?", [start, end])) { ... }
+    /// </code>
+    /// </summary>
+    /// <remarks>
+    /// <para>The values travel in <c>OP_QUERY_STREAM_PARAMS</c> (the SQL, then
+    /// the parameter vector <c>OP_EXECUTE</c> carries), which needs a server
+    /// ≥ 0.330: an older one refuses it with one ordinary error frame, thrown as
+    /// <c>server does not support parameterised streaming (skaidb &gt;= 0.330): …</c>,
+    /// and the connection stays usable. There is no client-side text
+    /// fallback. With no values (null or an empty list) the request is the
+    /// <c>OP_QUERY_STREAM</c> of the overload without parameters, which every
+    /// server takes.</para>
+    /// <para>The consistency stays the trailing argument; everything else —
+    /// the reply, the busy connection, the abandon rule — is
+    /// <see cref="Stream(string, SkaidbConsistency?)"/>'s. The list is read when
+    /// the enumeration starts, like the rest of the statement.</para>
+    /// </remarks>
+    public IEnumerable<object?[]> Stream(string sql, IReadOnlyList<object?>? parameters,
+                                         SkaidbConsistency? consistency = null) =>
+        StreamCore(sql, parameters, consistency);
+
+    private IEnumerable<object?[]> StreamCore(string sql, IReadOnlyList<object?>? parameters,
+                                              SkaidbConsistency? consistency)
     {
         EnsureLive();
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
@@ -1131,12 +1168,10 @@ public sealed class SkaidbConnection : DbConnection
         StreamColumns = Array.Empty<string>();
         StreamAffected = null;
 
-        byte[] sqlBytes = Encoding.UTF8.GetBytes(sql);
-        var w = new BinWriter();
-        w.U8(5);                                    // OP_QUERY_STREAM
-        w.U8((byte)(consistency ?? Consistency));
-        w.U32((uint)sqlBytes.Length);
-        w.Raw(sqlBytes);
+        // Built before the connection is claimed: a value that cannot be
+        // bound throws here, with nothing sent and the connection still free.
+        bool bound = parameters is { Count: > 0 };
+        byte[] request = StreamRequest(sql, parameters, consistency ?? Consistency);
 
         // A busy flag, not a held lock, is what serialises the exchange.
         // Holding _lock for the stream's duration is not available to an
@@ -1161,7 +1196,7 @@ public sealed class SkaidbConnection : DbConnection
             {
                 lock (_lock)
                 {
-                    WriteFrame(w.ToArray());
+                    WriteFrame(request);
                     first = new BinReader(ReadFrame());
                 }
             }
@@ -1174,9 +1209,13 @@ public sealed class SkaidbConnection : DbConnection
             byte tag = first.U8();
             if (tag == 3)
             {
+                // One ordinary frame, before any header: nothing is left to
+                // drain, so the connection stays usable.
                 string msg = first.Text();
-                throw new SkaidbException(msg.Contains("unknown opcode")
-                    ? $"server does not support streaming: {msg}" : msg);
+                if (!msg.Contains("unknown opcode")) throw new SkaidbException(msg);
+                throw new SkaidbException(bound
+                    ? $"server does not support parameterised streaming (skaidb >= 0.330): {msg}"
+                    : $"server does not support streaming: {msg}");
             }
             NoteStatement(sql);
             if (tag == 1) { StreamAffected = (long)first.U64(); yield break; }   // Mutation
@@ -1268,16 +1307,57 @@ public sealed class SkaidbConnection : DbConnection
     }
 
     /// <summary>
-    /// Column names of the most recent <see cref="Stream"/> call; empty when
-    /// that statement produced no rows (a mutation or DDL) or failed before
-    /// its header.
+    /// The request a stream sends. Without parameters it is
+    /// <c>OP_QUERY_STREAM</c> (5) — <c>u8 5 | u8 consistency | u32 sql_len | sql</c>,
+    /// what every server knows; with them <c>OP_QUERY_STREAM_PARAMS</c> (9),
+    /// the same fields followed by the parameter vector <c>OP_EXECUTE</c>
+    /// carries (PROTOCOL.md 3.4).
+    /// </summary>
+    internal static byte[] StreamRequest(string sql, IReadOnlyList<object?>? parameters,
+                                         SkaidbConsistency consistency)
+    {
+        bool bound = parameters is { Count: > 0 };
+        byte[] sqlBytes = Encoding.UTF8.GetBytes(sql);
+        var w = new BinWriter();
+        w.U8(bound ? (byte)9 : (byte)5);            // OP_QUERY_STREAM_PARAMS : OP_QUERY_STREAM
+        w.U8((byte)consistency);
+        w.U32((uint)sqlBytes.Length);
+        w.Raw(sqlBytes);
+        if (bound) WriteParameters(w, parameters!);
+        return w.ToArray();
+    }
+
+    /// <summary>
+    /// The parameter vector of <c>OP_EXECUTE</c>, of each
+    /// <c>OP_EXECUTE_BATCH</c> row and of <c>OP_QUERY_STREAM_PARAMS</c>:
+    /// <c>u16 count</c>, then each value's §4 encoding behind a <c>u32</c> length.
+    /// </summary>
+    private static void WriteParameters(BinWriter w, IReadOnlyList<object?> parameters)
+    {
+        if (parameters.Count > ushort.MaxValue)
+            throw new SkaidbException(
+                $"a statement takes at most {ushort.MaxValue} parameters, got {parameters.Count}");
+        w.U16((ushort)parameters.Count);
+        for (int i = 0; i < parameters.Count; i++)
+        {
+            byte[] v = EncodeValue(parameters[i]);
+            w.U32((uint)v.Length);
+            w.Raw(v);
+        }
+    }
+
+    /// <summary>
+    /// Column names of the most recent <see cref="Stream(string, SkaidbConsistency?)"/>
+    /// call; empty when that statement produced no rows (a mutation or DDL)
+    /// or failed before its header.
     /// </summary>
     public IReadOnlyList<string> StreamColumns { get; private set; } = Array.Empty<string>();
 
     /// <summary>
-    /// Affected-row count of the most recent <see cref="Stream"/> call when
-    /// the statement was a mutation (the server answers a streamed
-    /// INSERT/UPDATE/DELETE with a count, not rows); null otherwise.
+    /// Affected-row count of the most recent
+    /// <see cref="Stream(string, SkaidbConsistency?)"/> call when the statement was
+    /// a mutation (the server answers a streamed INSERT/UPDATE/DELETE with a
+    /// count, not rows); null otherwise.
     /// </summary>
     public long? StreamAffected { get; private set; }
 
@@ -1424,13 +1504,7 @@ public sealed class SkaidbConnection : DbConnection
         w.U8(3);                          // OP_EXECUTE
         w.U8((byte)consistency);
         w.U32(id);
-        w.U16((ushort)parameters.Count);
-        foreach (var p in parameters)
-        {
-            byte[] v = EncodeValue(p);
-            w.U32((uint)v.Length);
-            w.Raw(v);
-        }
+        WriteParameters(w, parameters);
         return Roundtrip(w.ToArray());
     }
 
@@ -1447,16 +1521,7 @@ public sealed class SkaidbConnection : DbConnection
         w.U8((byte)consistency);
         w.U32(id);
         w.U32((uint)rows.Count);
-        foreach (var parameters in rows)
-        {
-            w.U16((ushort)parameters.Count);
-            foreach (var p in parameters)
-            {
-                byte[] v = EncodeValue(p);
-                w.U32((uint)v.Length);
-                w.Raw(v);
-            }
-        }
+        foreach (var parameters in rows) WriteParameters(w, parameters);
         return Roundtrip(w.ToArray());
     }
 

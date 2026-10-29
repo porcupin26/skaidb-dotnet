@@ -381,15 +381,24 @@ public sealed class FakeServer : IDisposable
                 req.Name = r.Text();
                 req.Version = r.Text();
                 break;
+            case 9:
+            {
+                req.Consistency = r.U8();
+                req.Sql = r.Text();
+                int n = r.U16();
+                for (int i = 0; i < n; i++) req.Params.Add(SkaidbConnection.DecodeValue(new BinReader(r.Blob())));
+                break;
+            }
         }
         return req;
     }
 }
 
 /// <summary>
-/// A scripted handler: <c>script[sql]</c> answers OP_QUERY / OP_QUERY_STREAM
-/// text, <c>prepared[sql]</c> makes OP_PREPARE succeed with that arity,
-/// executes go through <c>onExecute</c>, batches through <c>onBatch</c>.
+/// A scripted handler: <c>script[sql]</c> answers OP_QUERY / OP_QUERY_STREAM /
+/// OP_QUERY_STREAM_PARAMS text, <c>prepared[sql]</c> makes OP_PREPARE succeed
+/// with that arity, executes go through <c>onExecute</c>, batches through
+/// <c>onBatch</c>.
 /// </summary>
 public sealed class Scripted
 {
@@ -424,6 +433,7 @@ public sealed class Scripted
         {
             case 1:
             case 5:
+            case 9:
                 if (!Script.TryGetValue(req.Sql, out var a)) return new[] { F.Error("fake server: unknown statement " + req.Sql) };
                 return a(req, conn);
             case 2:

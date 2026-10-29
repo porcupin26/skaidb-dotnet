@@ -113,8 +113,21 @@ Throws `NotSupportedException`: the wire protocol has no transactions.
 ### `Stream(string sql, SkaidbConsistency? consistency = null)` → `IEnumerable<object?[]>`
 
 Runs `sql` with the streaming opcode and yields each row as a cell array in
-column order, one server chunk in memory at a time. No parameters. See
+column order, one server chunk in memory at a time. See
 [streaming.md](streaming.md) for the contract and the abandon rule.
+
+### `Stream(string sql, IReadOnlyList<object?>? parameters, SkaidbConsistency? consistency = null)` → `IEnumerable<object?[]>`
+
+The same, with `parameters` bound to the statement's `?` placeholders in
+order, typed (the values `SkaidbCommand.Parameters` takes), over
+`OP_QUERY_STREAM_PARAMS`, which needs a server ≥ 0.330; an older one
+answers `server does not support parameterised streaming (skaidb >=
+0.330): …` and the connection stays usable. `null` or an empty list sends
+the parameterless request. Pass a collection expression
+(`conn.Stream(sql, [a, b])`), an `object?[]` or a list; a consistency stays
+the trailing argument and is never taken for a parameter
+(`Stream(sql, null)` is the overload above). See
+[streaming.md](streaming.md#parameters).
 
 ### `Subscribe(string stream, string? after = null, int pollMs = 500)` → `IEnumerable<StreamEvent>`
 

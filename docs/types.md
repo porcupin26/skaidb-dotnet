@@ -4,7 +4,7 @@
 
 Results decode from skaidb's typed wire values; parameters encode back to
 them when a statement is prepared (which is the normal path whenever a
-command has parameters).
+command has parameters) and when `Stream()` is given parameters.
 
 | skaidb type | Result value (`GetValue`) | Accepted as a parameter |
 |---|---|---|

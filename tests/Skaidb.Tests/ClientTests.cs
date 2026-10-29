@@ -5,8 +5,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using Xunit;
 
@@ -350,6 +352,156 @@ public class ClientTests
         Assert.Equal(42L, Scalar(c, "SELECT 42"));
         Assert.Equal(2, srv.Connections);
         Assert.Equal(2, srv.Hellos.Count);                                // Hello again after the reconnect
+    }
+
+    private static byte[] Le32(int v) => new[] { (byte)v, (byte)(v >> 8), (byte)(v >> 16), (byte)(v >> 24) };
+
+    [Fact]
+    public void Stream_with_parameters_sends_OP_QUERY_STREAM_PARAMS_carrying_the_OP_EXECUTE_parameter_vector()
+    {
+        const string sql = "SELECT id FROM t WHERE ts >= ? AND tag = ?";
+        var s = new Scripted()
+            .Answer(sql, F.Header("id"), F.Chunk(new object?[] { 7L }, new object?[] { 8L }), F.End())
+            .Answer("DELETE FROM t WHERE id = ?", F.Mutation(1))
+            .Prepare(sql, 2);
+        s.OnExecute = (_, _) => new[] { F.Rows(new[] { "id" }, new object?[] { 7L }) };
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);                                       // Consistency=Quorum (1)
+
+        Assert.Equal(new[] { 7L, 8L }, c.Stream(sql, new object?[] { 5L, "a" }).Select(r => (long)r[0]!).ToList());
+        Assert.Equal(new[] { "id" }, c.StreamColumns);
+        Assert.True(c.IsUsable);
+
+        // u8 9 | u8 consistency | u32 sql_len | sql | u16 nparams | nparams x (u32 len | value), little-endian.
+        byte[] sqlBytes = Encoding.UTF8.GetBytes(sql);
+        byte[] want = new byte[] { 9, 1 }
+            .Concat(Le32(sqlBytes.Length)).Concat(sqlBytes)
+            .Concat(new byte[] { 2, 0 })                                         // two parameters
+            .Concat(Le32(9)).Concat(new byte[] { 2, 5, 0, 0, 0, 0, 0, 0, 0 })    // Int 5
+            .Concat(Le32(6)).Concat(new byte[] { 5, 1, 0, 0, 0, (byte)'a' })     // String "a"
+            .ToArray();
+        var streamed = srv.Requests.Single(q => q.Op == 9);
+        Assert.Equal(want, streamed.Raw);
+        Assert.Equal(new object?[] { 5L, "a" }, streamed.Params);
+
+        // Exactly the parameter vector OP_EXECUTE carries for the same values.
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = sql;
+            cmd.Parameters.Add(5L);
+            cmd.Parameters.Add("a");
+            Assert.Equal(7L, cmd.ExecuteScalar());
+        }
+        byte[] execute = srv.Requests.Single(q => q.Op == 3).Raw;          // u8 3 | u8 consistency | u32 id | vector
+        Assert.Equal(execute.AsSpan(6).ToArray(), streamed.Raw.AsSpan(6 + sqlBytes.Length).ToArray());
+
+        // The reply is OP_QUERY_STREAM's: a mutation answers with its count.
+        Assert.Empty(c.Stream("DELETE FROM t WHERE id = ?", new object?[] { 3L }).ToList());
+        Assert.Empty(c.StreamColumns);
+        Assert.Equal(1L, c.StreamAffected);
+    }
+
+    [Fact]
+    public void Stream_without_parameters_sends_the_original_OP_QUERY_STREAM_byte_for_byte()
+    {
+        var s = new Scripted().Answer("SELECT 1", F.Header("v"), F.Chunk(new object?[] { 1L }), F.End());
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        Assert.Single(c.Stream("SELECT 1"));
+        Assert.Single(c.Stream("SELECT 1", Array.Empty<object?>()));
+        Assert.Single(c.Stream("SELECT 1", new List<object?>()));
+        Assert.Single(c.Stream("SELECT 1", []));
+        Assert.Single(c.Stream("SELECT 1", (IReadOnlyList<object?>?)null));
+        // u8 5 | u8 consistency | u32 sql_len | sql: what every server knows.
+        byte[] want = new byte[] { 5, 1 }.Concat(Le32(8)).Concat(Encoding.UTF8.GetBytes("SELECT 1")).ToArray();
+        var sent = srv.Requests.Where(q => q.Op != 8).ToList();            // all but the Hello
+        Assert.Equal(5, sent.Count);
+        Assert.All(sent, q => Assert.Equal(want, q.Raw));
+    }
+
+    [Fact]
+    public void A_consistency_argument_keeps_meaning_the_consistency_and_the_1_2_signature_stays()
+    {
+        var s = new Scripted();
+        IEnumerable<byte[]> Level(Request req, FakeConnection conn) =>
+            new[] { F.Header("c"), F.Chunk(new object?[] { (long)req.Consistency }), F.End() };
+        s.Script["SELECT lvl"] = Level;
+        s.Script["SELECT lvl WHERE x = ?"] = Level;
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);                                       // Consistency=Quorum (1)
+        static long Got(IEnumerable<object?[]> rows) => (long)rows.Single()[0]!;
+
+        // Every call form of Stream(sql, consistency?) binds as it did: OP_QUERY_STREAM, the level in its byte.
+        SkaidbConsistency? unset = null;
+        Assert.Equal(0L, Got(c.Stream("SELECT lvl", SkaidbConsistency.One)));
+        Assert.Equal(2L, Got(c.Stream("SELECT lvl", consistency: SkaidbConsistency.All)));
+        Assert.Equal(1L, Got(c.Stream("SELECT lvl", unset)));
+        Assert.Equal(1L, Got(c.Stream("SELECT lvl", consistency: null)));
+        Assert.Equal(1L, Got(c.Stream("SELECT lvl", null)));
+        Assert.Equal(1L, Got(c.Stream("SELECT lvl", default)));
+        Assert.Equal(1L, Got(c.Stream("SELECT lvl")));
+        Assert.All(srv.Requests.Where(q => q.Op != 8), q => Assert.Equal(5, q.Op));
+
+        // With parameters it is still the trailing argument, never a parameter.
+        Assert.Equal(0L, Got(c.Stream("SELECT lvl WHERE x = ?", new object?[] { 1L }, SkaidbConsistency.One)));
+        Assert.Equal(2L, Got(c.Stream("SELECT lvl WHERE x = ?", [1L], consistency: SkaidbConsistency.All)));
+        Assert.Equal(1L, Got(c.Stream("SELECT lvl WHERE x = ?", [1L])));
+        var bound = srv.Requests.Where(q => q.Op == 9).ToList();
+        Assert.Equal(3, bound.Count);
+        Assert.All(bound, q => Assert.Equal(new object?[] { 1L }, q.Params));
+
+        // Binary and method-group compatibility: 1.2's Stream(string, SkaidbConsistency?) is unchanged.
+        var original = typeof(SkaidbConnection).GetMethod(nameof(SkaidbConnection.Stream),
+            new[] { typeof(string), typeof(SkaidbConsistency?) });
+        Assert.NotNull(original);
+        Assert.Equal(typeof(IEnumerable<object[]>), original!.ReturnType);
+        Func<string, SkaidbConsistency?, IEnumerable<object?[]>> group = c.Stream;
+        Assert.Equal(original.MethodHandle, group.Method.MethodHandle);
+        // And on what the compiler bound: a second argument that is a consistency, a literal null or
+        // default included, picks that overload, not the parameter list.
+        static RuntimeMethodHandle Bound(Expression<Func<SkaidbConnection, IEnumerable<object?[]>>> call) =>
+            ((MethodCallExpression)call.Body).Method.MethodHandle;
+        Assert.Equal(original.MethodHandle, Bound(x => x.Stream("q", SkaidbConsistency.One)));
+        Assert.Equal(original.MethodHandle, Bound(x => x.Stream("q", null)));
+        Assert.Equal(original.MethodHandle, Bound(x => x.Stream("q", default)));
+        Assert.NotEqual(original.MethodHandle, Bound(x => x.Stream("q", new object?[] { 1L }, null)));
+    }
+
+    [Fact]
+    public void An_old_server_refusing_parameterised_streaming_names_it_and_leaves_the_connection_usable()
+    {
+        // A server before 0.330 answers opcode 9 with one ordinary Error frame.
+        const string unknown = "protocol error: malformed message: unknown opcode";
+        var s = new Scripted()
+            .Answer("SELECT id FROM t", F.Header("id"), F.Chunk(new object?[] { 1L }), F.End())
+            .Answer("SELECT ancient", F.Error(unknown))                     // as a server without any streaming opcode
+            .Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }));
+        using var srv = new FakeServer((req, conn) => req.Op == 9 ? new[] { F.Error(unknown) } : s.Handle(req, conn));
+        using var c = Connect(srv);
+        var e = Assert.Throws<SkaidbException>(() => c.Stream("SELECT id FROM t WHERE id > ?", new object?[] { 0L }).ToList());
+        Assert.Equal($"server does not support parameterised streaming (skaidb >= 0.330): {unknown}", e.Message);
+        Assert.True(c.IsUsable);                                           // one frame: nothing left to drain
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(new[] { 1L }, c.Stream("SELECT id FROM t").Select(r => (long)r[0]!).ToList());   // parameterless still streams
+        Assert.Equal($"server does not support streaming: {unknown}",
+            Assert.Throws<SkaidbException>(() => c.Stream("SELECT ancient").ToList()).Message);
+        Assert.True(c.IsUsable);
+        Assert.Equal(1, srv.Connections);
+    }
+
+    [Fact]
+    public void A_stream_parameter_that_cannot_be_bound_fails_before_anything_is_sent()
+    {
+        var s = new Scripted().Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }));
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        Assert.Equal("cannot bind NaN/Infinity",
+            Assert.Throws<SkaidbException>(() => c.Stream("SELECT v FROM t WHERE v > ?", new object?[] { double.NaN }).ToList()).Message);
+        Assert.Equal("a statement takes at most 65535 parameters, got 65536",
+            Assert.Throws<SkaidbException>(() => c.Stream("SELECT 1", new object?[65536]).ToList()).Message);
+        Assert.True(c.IsUsable);                                           // never claimed
+        Assert.DoesNotContain(srv.Requests, q => q.Op == 5 || q.Op == 9);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
     }
 
     [Fact]

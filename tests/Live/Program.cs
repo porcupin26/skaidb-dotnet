@@ -10,6 +10,7 @@
 // Covers: connect + SCRAM, CREATE TABLE, a prepared INSERT with every typed
 // parameter, SELECT with a bound WHERE and ORDER BY reading every type back,
 // UPDATE row counts, a one-round-trip batch, a streamed result of 2500 rows,
+// a streamed range with bound parameters (server >= 0.330),
 // a server error surfacing as SkaidbException, and the drivers-table row the
 // Hello frame creates (client_name dotnet, client_version = package version).
 
@@ -165,6 +166,20 @@ try
         cmd.CommandText = $"SELECT count(*) FROM {BIG}";
         Check(cmd.ExecuteScalar() is long c2 && c2 == ROWS, "connection usable after an abandoned stream");
     }
+    // A range streamed with bound parameters (OP_QUERY_STREAM_PARAMS, server >= 0.330).
+    try
+    {
+        var ranged = new List<long>();
+        foreach (var row in conn.Stream($"SELECT id FROM {BIG} WHERE id > ? AND id <= ?", [(long)(ROWS - 10), (long)ROWS]))
+            ranged.Add((long)row[0]!);
+        Check(ranged.Count == 10 && ranged.Min() == ROWS - 9 && ranged.Max() == ROWS,
+              $"parameterised stream: {ranged.Count} rows in ({ROWS - 10}, {ROWS}]");
+    }
+    catch (SkaidbException e)
+    {
+        Check(false, $"parameterised stream (needs server >= 0.330): {e.Message}");
+    }
+    Check(conn.IsUsable, "connection usable after the parameterised stream");
     // A non-streaming SELECT of the whole table, for comparison.
     using (var cmd = conn.CreateCommand())
     {

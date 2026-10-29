@@ -1,12 +1,16 @@
 # Streaming
 
-## `conn.Stream(sql, consistency?)`
+## `conn.Stream(sql, parameters?, consistency?)`
 
 `ExecuteReader()` receives the whole result in one frame and holds it in
 memory; the server also bounds such a scan with its scan budgets. `Stream()`
 sends the statement with the streaming opcode: the server answers with a
 header (the column names), then the rows in chunks, then an end marker, and
-the driver yields one row at a time holding one chunk:
+the driver yields one row at a time holding one chunk. The server executes a
+plain `SELECT` page by page, and no scan budget applies to a streamed page
+(server ≥ 0.330; `EXPLAIN` says whether a statement pages, and the rules are
+under "Streamed queries" in the
+[query syntax reference](https://skaidb.org/docs/query_syntax.html)):
 
 ```csharp
 long n = 0;
@@ -26,8 +30,8 @@ Console.WriteLine($"{n} rows, columns {string.Join(",", conn.StreamColumns)}");
   stays empty for a statement that returns no rows or fails before its
   header.
 - The optional consistency overrides the connection's for this statement.
-- It takes **no parameters**: the streaming opcode carries SQL text only.
-  Quote values yourself or select a wider range and filter client-side.
+- A list of values binds the statement's `?` placeholders; see
+  [Parameters](#parameters).
 - A non-row statement (`INSERT`, DDL) streamed this way yields nothing; for
   a mutation `conn.StreamAffected` then holds the affected-row count (it is
   `null` for rows and DDL).
@@ -35,10 +39,44 @@ Console.WriteLine($"{n} rows, columns {string.Join(",", conn.StreamColumns)}");
   the first `MoveNext()`. An error *after* the header (a node dying mid-scan,
   a scan budget tripping) is thrown from the `MoveNext()` that meets it; the
   rows already yielded are valid and the connection stays usable.
-- On a cluster, name the columns: a bare `SELECT *` is only executed page by
-  page at consistency `One`; a named column list streams at any level.
 - A server without the streaming opcode answers `server does not support
   streaming: …`.
+
+## Parameters
+
+`conn.Stream(sql, parameters, consistency?)` binds the statement's `?`
+placeholders in order, typed, with the values a command's `Parameters` take
+([types.md](types.md)) — arrays and documents included:
+
+```csharp
+foreach (var row in conn.Stream("SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?", [start, end]))
+{
+    Export(row);
+}
+
+var clicks = conn.Stream("SELECT id FROM events WHERE kind = ? AND tags = ?",
+                         new object?[] { "click", new[] { "a", "b" } }, SkaidbConsistency.One);
+```
+
+- `parameters` is an `IReadOnlyList<object?>`, like an `ExecuteBatch` row:
+  a collection expression, an `object?[]`, a `List<object?>`. Placeholders
+  are `?` only; `@name` and `$N` belong to `SkaidbCommand`.
+- A consistency stays the last argument, by position or by name, and is
+  never taken for a parameter: `Stream(sql, null)` means the connection's
+  default consistency.
+- The values travel in `OP_QUERY_STREAM_PARAMS` (the SQL, then the
+  parameter vector `OP_EXECUTE` carries), which needs a server ≥ 0.330. An
+  older server answers `server does not support parameterised streaming
+  (skaidb >= 0.330): …`, thrown from the first `MoveNext()`; the connection
+  stays usable. There is no client-side text fallback.
+- No values (`null` or an empty list) send the parameterless request, which
+  every server takes.
+- The server checks the values against the placeholders: a count that does
+  not match, or a statement kind that cannot be prepared, is an ordinary
+  statement error. A value the driver cannot bind (`cannot bind
+  NaN/Infinity`, …) throws before anything is sent.
+- The list is read when the enumeration starts, like the rest of the
+  statement.
 
 ## The abandon rule
 
