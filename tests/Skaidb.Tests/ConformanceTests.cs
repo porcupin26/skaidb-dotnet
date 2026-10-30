@@ -192,6 +192,25 @@ public class ConformanceTests
         ["rows"] = new JsonArray(rows.Select(r => (JsonNode)new JsonArray(r.Select(Tagged).ToArray())).ToArray()),
     };
 
+    /// <summary>A reader's current result set, read to its end.</summary>
+    private static JsonObject RowsJson(SkaidbDataReader r)
+    {
+        var cols = Enumerable.Range(0, r.FieldCount).Select(r.GetName).ToList();
+        var rows = new List<object?[]>();
+        while (r.Read())
+        {
+            var row = new object[r.FieldCount];
+            r.GetValues(row);
+            rows.Add(row);
+        }
+        return RowsJson(cols, rows);
+    }
+
+    /// <summary>One result set is <c>rows</c>; several are <c>result_sets</c>, in order.</summary>
+    private static JsonObject RowsOrSets(List<JsonObject> sets) => sets.Count > 1
+        ? new JsonObject { ["result_sets"] = new JsonArray(sets.ToArray()) }
+        : new JsonObject { ["rows"] = sets[0] };
+
     /// <summary>
     /// Structural equality of two JSON trees; a float is compared by its
     /// float_bits only (JSON number spelling differs between encoders).
@@ -420,21 +439,8 @@ public class ConformanceTests
                 ? new JsonObject { ["ddl"] = true }
                 : new JsonObject { ["affected"] = r.RecordsAffected.ToString(CultureInfo.InvariantCulture) };
         var sets = new List<JsonObject>();
-        do
-        {
-            var cols = Enumerable.Range(0, r.FieldCount).Select(r.GetName).ToList();
-            var rows = new List<object?[]>();
-            while (r.Read())
-            {
-                var row = new object[r.FieldCount];
-                r.GetValues(row);
-                rows.Add(row);
-            }
-            sets.Add(RowsJson(cols, rows));
-        } while (r.NextResult());
-        return sets.Count > 1
-            ? new JsonObject { ["result_sets"] = new JsonArray(sets.ToArray()) }
-            : new JsonObject { ["rows"] = sets[0] };
+        do sets.Add(RowsJson(r)); while (r.NextResult());
+        return RowsOrSets(sets);
     }
 
     private JsonObject RunCall(SkaidbConnection conn, JsonObject call)
@@ -509,7 +515,12 @@ public class ConformanceTests
                         return conn.StreamAffected is long n
                             ? new JsonObject { ["affected"] = n.ToString(CultureInfo.InvariantCulture) }
                             : new JsonObject { ["ddl"] = true };
-                    return new JsonObject { ["rows"] = RowsJson(conn.StreamColumns, rows) };
+                    // The enumeration yielded the first set; a reply carrying several
+                    // (a CALL that EMITs) has the rest on StreamResultSets.
+                    var sets = new List<JsonObject> { RowsJson(conn.StreamColumns, rows) };
+                    if (conn.StreamResultSets is { } more)
+                        while (more.NextResult()) sets.Add(RowsJson(more));
+                    return RowsOrSets(sets);
                 });
             default:
                 // Never reached today: every call method has a public API here.
