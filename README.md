@@ -36,7 +36,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.3.0
+V=1.4.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -340,7 +340,10 @@ support parameterised streaming (skaidb >= 0.330): …` and the connection
 stays usable. A stream without parameters works against every server.
 
 A non-row statement streamed this way yields nothing (`conn.StreamAffected`
-then holds a mutation's count). An error before any row
+then holds a mutation's count). A `CALL` whose body `EMIT`s result sets is
+answered with all of them in one frame even when streamed: the enumeration
+yields the first set's rows, and `conn.StreamResultSets` is the reader
+`ExecuteReader()` would return, `NextResult()` walking every set. An error before any row
 is an ordinary statement error; an error partway through (a node dying
 mid-scan, a scan budget tripping) is thrown after the rows already yielded,
 which are valid.
@@ -514,7 +517,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.3.0
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.4.0
 ```
 
 ## Compatibility

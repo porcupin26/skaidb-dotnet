@@ -35,6 +35,19 @@ Console.WriteLine($"{n} rows, columns {string.Join(",", conn.StreamColumns)}");
 - A non-row statement (`INSERT`, DDL) streamed this way yields nothing; for
   a mutation `conn.StreamAffected` then holds the affected-row count (it is
   `null` for rows and DDL).
+- A `CALL` whose procedure body `EMIT`s result sets is answered with all of
+  them in one frame, as `ExecuteReader()` receives it: the enumeration
+  yields the first set's rows (`conn.StreamColumns` its columns), and
+  `conn.StreamResultSets` is the reader `ExecuteReader()` would return —
+  on the first set, `NextResult()` walking the rest; `null` for every other
+  statement. Nothing is left in flight, so the connection is free before
+  the first row arrives:
+
+  ```csharp
+  foreach (var row in conn.Stream("CALL report()")) { /* the first set */ }
+  var r = conn.StreamResultSets!;
+  do { while (r.Read()) { /* ... */ } } while (r.NextResult());
+  ```
 - An error *before* the header is an ordinary statement error thrown from
   the first `MoveNext()`. An error *after* the header (a node dying mid-scan,
   a scan budget tripping) is thrown from the `MoveNext()` that meets it; the

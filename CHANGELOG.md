@@ -4,6 +4,22 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.4.0] - 2026-10-29
+
+### Fixed
+- A streamed `CALL` whose procedure body `EMIT`s result sets returns them.
+  The server answers such a call with every set in one `ResultSets` frame
+  (tag 8) even to a stream request, and `conn.Stream()`, with or without
+  parameters, threw `unexpected response tag 8 to stream request` and
+  marked the connection broken. The frame is now decoded by the code
+  `ExecuteReader()` uses: the enumeration yields the first set's rows
+  (`StreamColumns` holds its columns), and the new
+  `conn.StreamResultSets` is the reader `ExecuteReader()` would return for
+  the statement, on the first set with `NextResult()` walking the rest
+  (null for every other statement). The exchange is complete in that one
+  frame, so the connection is handed back before the first row is yielded
+  and stays usable.
+
 ## [1.3.0] - 2026-10-29
 
 ### Added
@@ -213,6 +229,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.4.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.0
 [1.3.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.3.0
 [1.2.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.2.0
 [1.1.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.1.0

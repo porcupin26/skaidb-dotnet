@@ -299,16 +299,76 @@ public class ClientTests
         Assert.Equal(new[] { 1L }, partial);
         Assert.True(c.IsUsable);
         Assert.Equal(9L, Scalar(c, "SELECT id FROM t"));
-        // A ResultSets reply on the stream opcode is out of contract: the socket is dropped, the next statement re-dials.
-        Assert.Contains("unexpected response tag 8", Assert.Throws<SkaidbException>(() => c.Stream("CALL emits()").ToList()).Message);
-        Assert.False(c.IsUsable);
+        // A ResultSets reply on the stream opcode is one whole frame: its sets come
+        // back (see the CALL test below) and the same socket goes on serving.
+        Assert.Equal(new[] { 1L }, c.Stream("CALL emits()").Select(r => (long)r[0]!).ToList());
+        Assert.True(c.IsUsable);
         Assert.Equal(9L, Scalar(c, "SELECT id FROM t"));
-        Assert.Equal(2, srv.Connections);
+        Assert.Equal(1, srv.Connections);
         // Per-stream consistency: the stream request carries it.
         Assert.Equal(2L, c.Stream("SELECT lvl", SkaidbConsistency.All).Single()[0]);
         Assert.Equal(2, srv.Requests.Last(q => q.Op == 5).Consistency);
         Assert.Equal(1L, c.Stream("SELECT lvl").Single()[0]);
         Assert.Equal(1, srv.Requests.Last(q => q.Op == 5).Consistency);
+    }
+
+    [Fact]
+    public void A_streamed_CALL_that_EMITs_returns_its_result_sets_through_NextResult()
+    {
+        // One ResultSets frame, as ExecuteReader() receives it: [a: x, y] then [b: z].
+        byte[] sets = F.ResultSets((new[] { "a" }, new object?[][] { new object?[] { "x" }, new object?[] { "y" } }),
+                                   (new[] { "b" }, new object?[][] { new object?[] { "z" } }));
+        var s = new Scripted()
+            .Answer("CALL report(?)", sets)     // with parameters: OP_QUERY_STREAM_PARAMS
+            .Answer("CALL report()", sets)      // without: OP_QUERY_STREAM
+            .Answer("SELECT 1", F.Rows(new[] { "x" }, new object?[] { 1L }))
+            .Answer("SELECT id FROM big", F.Header("id"), F.Chunk(new object?[] { 1L }), F.End());
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        var streams = new Func<IEnumerable<object?[]>>[]
+        {
+            () => c.Stream("CALL report(?)", new object?[] { 5L }),
+            () => c.Stream("CALL report()"),
+        };
+        foreach (var stream in streams)
+        {
+            // The enumeration yields the first set, as a reader's Read() loop does ...
+            Assert.Equal(new[] { "x", "y" }, stream().Select(r => (string)r[0]!).ToList());
+            Assert.Equal(new[] { "a" }, c.StreamColumns);
+            Assert.Null(c.StreamAffected);
+            Assert.True(c.IsUsable);
+            // ... and every set, in order, is on the reader ExecuteReader() would return.
+            var r = c.StreamResultSets!;
+            var walked = new List<string>();
+            do
+            {
+                var cells = new StringBuilder(r.GetName(0)).Append(':');
+                while (r.Read()) cells.Append(r.GetString(0));
+                walked.Add(cells.ToString());
+            } while (r.NextResult());
+            Assert.Equal("a:xy|b:z", string.Join("|", walked));
+        }
+        Assert.Equal(new byte[] { 9, 5 }, srv.Requests.Where(q => q.Op != 8).Select(q => q.Op).ToArray());
+        Assert.Equal(new object?[] { 5L }, srv.Requests.First(q => q.Op == 9).Params);
+        // The connection is free while the rows are read, and the CALL's enumerator
+        // finishing does not release a stream started meanwhile.
+        using (var inner = c.Stream("SELECT id FROM big").GetEnumerator())
+        {
+            foreach (var row in c.Stream("CALL report()"))
+            {
+                if ((string)row[0]! != "x") continue;
+                Assert.Equal(1L, Scalar(c, "SELECT 1"));
+                Assert.True(inner.MoveNext());
+            }
+            Assert.False(c.IsUsable, "the inner stream still owns the connection");
+            Assert.False(inner.MoveNext());
+        }
+        // Nothing was left on the socket: the same connection reads its own reply.
+        Assert.True(c.IsUsable);
+        Assert.Equal(1L, Scalar(c, "SELECT 1"));
+        Assert.Empty(c.Stream("SELECT id FROM big").Skip(1));
+        Assert.Null(c.StreamResultSets);
+        Assert.Equal(1, srv.Connections);
     }
 
     [Fact]

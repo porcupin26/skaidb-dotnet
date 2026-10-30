@@ -1124,6 +1124,11 @@ public sealed class SkaidbConnection : DbConnection
     /// <see cref="SkaidbConnectionPool.WithConnection{T}(Func{SkaidbConnection, T})"/>: it is lazy, and the
     /// connection would go back to the pool before the first row is read.
     /// Enumerate inside the callback.</para>
+    /// <para>A <c>CALL</c> whose procedure body <c>EMIT</c>s result sets is
+    /// answered with all of them in one frame, streamed or not: the
+    /// enumeration yields the first set's rows, <see cref="StreamResultSets"/>
+    /// walks every set with <c>NextResult()</c>, and the connection is free
+    /// before the first row arrives.</para>
     /// </remarks>
     public IEnumerable<object?[]> Stream(string sql, SkaidbConsistency? consistency = null) =>
         StreamCore(sql, null, consistency);
@@ -1167,6 +1172,7 @@ public sealed class SkaidbConnection : DbConnection
         // non-row reply sets no columns.
         StreamColumns = Array.Empty<string>();
         StreamAffected = null;
+        StreamResultSets = null;
 
         // Built before the connection is claimed: a value that cannot be
         // bound throws here, with nothing sent and the connection still free.
@@ -1188,6 +1194,7 @@ public sealed class SkaidbConnection : DbConnection
         }
 
         bool live = false;   // true while the server still owes frames
+        bool released = false;   // the exchange ended in its first frame, before any row was yielded
         try
         {
             BinReader first;
@@ -1220,6 +1227,22 @@ public sealed class SkaidbConnection : DbConnection
             NoteStatement(sql);
             if (tag == 1) { StreamAffected = (long)first.U64(); yield break; }   // Mutation
             if (tag == 2) yield break;                                           // Ddl
+            if (tag == 8)
+            {
+                // ResultSets: a CALL whose body EMITted is answered with every
+                // set in ONE frame, streamed or not — the frame ExecuteReader()
+                // receives, decoded by the same code. Nothing follows it, so
+                // the connection is handed back before the first row is
+                // yielded, and the finally below must not release it again:
+                // by then it may belong to a stream the caller started.
+                var sets = ReadResultSets(first);
+                StreamColumns = sets.Columns!;
+                StreamResultSets = SkaidbDataReader.FromResult(sets, null);
+                lock (_lock) { _streaming = false; }
+                released = true;
+                foreach (var row in sets.Rows!) yield return row;
+                yield break;
+            }
             if (tag != 5)
             {
                 // The server is not answering the stream contract, so there is
@@ -1302,7 +1325,7 @@ public sealed class SkaidbConnection : DbConnection
             }
             // Released last: until this drops, IsUsable is false and every
             // other statement on the connection is refused.
-            lock (_lock) { _streaming = false; }
+            if (!released) lock (_lock) { _streaming = false; }
         }
     }
 
@@ -1360,6 +1383,20 @@ public sealed class SkaidbConnection : DbConnection
     /// count, not rows); null otherwise.
     /// </summary>
     public long? StreamAffected { get; private set; }
+
+    /// <summary>
+    /// Every result set of the most recent
+    /// <see cref="Stream(string, SkaidbConsistency?)"/> call when the server
+    /// answered it with several in one frame — a <c>CALL</c> whose procedure
+    /// body <c>EMIT</c>s result sets is answered that way even to a stream
+    /// request — as the reader <see cref="SkaidbCommand.ExecuteReader()"/>
+    /// returns for the same statement: on the first set, with
+    /// <see cref="SkaidbDataReader.NextResult"/> walking the rest. The
+    /// enumeration itself yields the first set's rows, and
+    /// <see cref="StreamColumns"/> holds its columns. Null for every other
+    /// statement.
+    /// </summary>
+    public SkaidbDataReader? StreamResultSets { get; private set; }
 
     /// <summary>
     /// Prepare <paramref name="sql"/> on the SERVER, returning
@@ -1691,57 +1728,9 @@ public sealed class SkaidbConnection : DbConnection
         switch (tag)
         {
             case 0: // Rows
-            {
-                uint ncols = r.U32();
-                var columns = new string[ncols];
-                for (int i = 0; i < ncols; i++) columns[i] = r.Text();
-                uint nrows = r.U32();
-                var rows = new List<object?[]>((int)nrows);
-                for (int ri = 0; ri < nrows; ri++)
-                {
-                    uint ncells = r.U32();
-                    var row = new object?[ncells];
-                    for (int ci = 0; ci < ncells; ci++)
-                    {
-                        // each cell is a length-prefixed self-describing Value
-                        byte[] cellBytes = r.Blob();
-                        var cr = new BinReader(cellBytes);
-                        row[ci] = DecodeValue(cr);
-                    }
-                    rows.Add(row);
-                }
-                return new QueryResult(QueryResultKind.Rows, columns, rows, 0);
-            }
+                return ReadRows(r);
             case 8: // ResultSets: a CALL whose body EMITted
-            {
-                uint nsets = r.U32();
-                var sets = new List<QueryResult>((int)nsets);
-                for (int s = 0; s < nsets; s++)
-                {
-                    uint ncols = r.U32();
-                    var columns = new string[ncols];
-                    for (int i = 0; i < ncols; i++) columns[i] = r.Text();
-                    uint nrows = r.U32();
-                    var rows = new List<object?[]>((int)nrows);
-                    for (int ri = 0; ri < nrows; ri++)
-                    {
-                        uint ncells = r.U32();
-                        var row = new object?[ncells];
-                        for (int ci = 0; ci < ncells; ci++)
-                            row[ci] = DecodeValue(new BinReader(r.Blob()));
-                        rows.Add(row);
-                    }
-                    sets.Add(new QueryResult(QueryResultKind.Rows, columns, rows, 0));
-                }
-                if (sets.Count == 0)
-                    return new QueryResult(QueryResultKind.Rows, new string[0], new List<object?[]>(), 0);
-                // The first set is current; the reader's NextResult() walks the rest.
-                var first = sets[0];
-                return new QueryResult(QueryResultKind.Rows, first.Columns, first.Rows, 0)
-                {
-                    MoreSets = sets.GetRange(1, sets.Count - 1)
-                };
-            }
+                return ReadResultSets(r);
             case 1: // Mutation
                 return new QueryResult(QueryResultKind.Mutation, null, null, r.U64());
             case 2: // Ddl
@@ -1751,6 +1740,53 @@ public sealed class SkaidbConnection : DbConnection
             default:
                 throw new SkaidbException($"unknown response tag {tag}");
         }
+    }
+
+    /// <summary>
+    /// A Rows body (PROTOCOL.md §3.2), also one set of ResultSets;
+    /// <paramref name="r"/> sits just past the tag.
+    /// </summary>
+    private static QueryResult ReadRows(BinReader r)
+    {
+        uint ncols = r.U32();
+        var columns = new string[ncols];
+        for (int i = 0; i < ncols; i++) columns[i] = r.Text();
+        uint nrows = r.U32();
+        var rows = new List<object?[]>((int)nrows);
+        for (int ri = 0; ri < nrows; ri++)
+        {
+            uint ncells = r.U32();
+            var row = new object?[ncells];
+            for (int ci = 0; ci < ncells; ci++)
+            {
+                // each cell is a length-prefixed self-describing Value
+                row[ci] = DecodeValue(new BinReader(r.Blob()));
+            }
+            rows.Add(row);
+        }
+        return new QueryResult(QueryResultKind.Rows, columns, rows, 0);
+    }
+
+    /// <summary>
+    /// A ResultSets body (a CALL whose body EMITted), <paramref name="r"/>
+    /// just past the tag: the first set, the rest in
+    /// <see cref="QueryResult.MoreSets"/> for the reader's NextResult(). The
+    /// buffered path and a stream request both receive this frame, and both
+    /// decode it here.
+    /// </summary>
+    private static QueryResult ReadResultSets(BinReader r)
+    {
+        uint nsets = r.U32();
+        var sets = new List<QueryResult>((int)nsets);
+        for (int s = 0; s < nsets; s++) sets.Add(ReadRows(r));
+        if (sets.Count == 0)
+            return new QueryResult(QueryResultKind.Rows, new string[0], new List<object?[]>(), 0);
+        // The first set is current; the reader's NextResult() walks the rest.
+        var first = sets[0];
+        return new QueryResult(QueryResultKind.Rows, first.Columns, first.Rows, 0)
+        {
+            MoreSets = sets.GetRange(1, sets.Count - 1)
+        };
     }
 
     // ---- value codec (§4) --------------------------------------------------

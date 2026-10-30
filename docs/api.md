@@ -65,6 +65,7 @@ The constructor only stores configuration; nothing is dialled until `Open()`.
 | `IsUsable` | `bool` | `IsOpen`, and: no transport error pending, no `Stream()` in flight, and the socket not closed by the peer. What a pool checks. |
 | `StreamColumns` | `IReadOnlyList<string>` | Column names of the most recent `Stream()` call, set once its header arrives; empty when it returned no rows. |
 | `StreamAffected` | `long?` | Affected-row count of the most recent `Stream()` call when it was a mutation; `null` otherwise. |
+| `StreamResultSets` | `SkaidbDataReader?` | Every result set of the most recent `Stream()` call when the server answered it with several in one frame (a `CALL` whose body `EMIT`s), as the reader `ExecuteReader()` returns: on the first set, `NextResult()` walking the rest; `null` otherwise. |
 | `AuthMechanism` | `SkaidbAuthMechanism` | `Scram` or `Certificate`. |
 | `ConnectionString` | `string` | The normalised connection string (canonical key names). Settable while closed. |
 | `State` | `ConnectionState` | `Closed`, `Open`, or `Open \| Fetching` while a `Stream()` is in flight. |
