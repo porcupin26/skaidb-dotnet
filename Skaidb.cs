@@ -3660,13 +3660,18 @@ public sealed record SkaidbPoolMember(
 /// </remarks>
 public sealed class SkaidbConnectionPool : IDisposable
 {
-    // Latency EWMA: each round trip moves a member's average 5% toward it, and
-    // no sample counts for more than 10x the larger of the current average
-    // and the ejection floor — one slow query does not eject a healthy
-    // member, a member that stays slow is ejected within a few dozen
-    // statements.
+    // Latency EWMA: the fastest of a member's first round trips seeds it (a
+    // round trip is only ever lengthened — by the member, the network or this
+    // process stalling — so a slow first statement cannot set it); then each
+    // round trip moves it 5% toward it, and no sample counts for more than
+    // 10x the larger of the current average and the ejection floor — one slow
+    // query does not eject a healthy member, a member that stays slow is
+    // ejected within a few dozen statements.
+    private const int EwmaSeedSamples = 3;
     private const double EwmaWeight = 0.05;
     private const double EwmaClamp = 10.0;
+    /// <summary>Round trips a latency ejection's warning reports the slowest of.</summary>
+    private const int RecentSamples = 10;
     /// <summary>Round trips a member (and at least one other) needs before its average can eject it.</summary>
     private const int EwmaMinSamples = 10;
     /// <summary>
@@ -3707,6 +3712,8 @@ public sealed class SkaidbConnectionPool : IDisposable
         public string? Canonical;                 // its own SHOW ENDPOINTS name
         public SkaidbMemberState Listed = SkaidbMemberState.Ready;   // Ready | Resyncing | Unreachable | Unlisted
         public double? Ewma;                      // seconds
+        public readonly List<double> Firsts = new();    // round trips before the average is seeded
+        public readonly Queue<double> Recent = new();   // the last RecentSamples round trips
         public int Samples;
         public double LastSample;                 // Now() of the last round trip
         public int Errors;                        // consecutive transport failures
@@ -3721,6 +3728,15 @@ public sealed class SkaidbConnectionPool : IDisposable
             Port = port;
             Endpoint = SkaidbConnection.EndpointKey(host, port);
             Seed = seed;
+        }
+
+        /// <summary>Measure the member afresh (a re-admission, back to ready).</summary>
+        public void ResetLatency()
+        {
+            Ewma = null;
+            Firsts.Clear();
+            Recent.Clear();
+            Samples = 0;
         }
     }
 
@@ -4099,9 +4115,18 @@ public sealed class SkaidbConnectionPool : IDisposable
             }
             if (!_members.TryGetValue(ep, out var m)) return;
             m.Errors = 0;
+            if (m.Recent.Count >= RecentSamples) m.Recent.Dequeue();
+            m.Recent.Enqueue(elapsed);
             if (m.Ewma is not double avg)
             {
-                m.Ewma = elapsed;
+                m.Firsts.Add(elapsed);
+                if (m.Firsts.Count >= EwmaSeedSamples)
+                {
+                    double fastest = double.PositiveInfinity;
+                    foreach (double s in m.Firsts) fastest = Math.Min(fastest, s);
+                    m.Ewma = fastest;
+                    m.Firsts.Clear();
+                }
             }
             else
             {
@@ -4113,7 +4138,7 @@ public sealed class SkaidbConnectionPool : IDisposable
             // Only a member still in rotation: round trips finishing on
             // connections checked out before an ejection must not eject it
             // again (and stretch its backoff).
-            if (Usable(m) && m.Samples >= EwmaMinSamples && _ejectFactor > 0)
+            if (Usable(m) && m.Ewma is double mine && m.Samples >= EwmaMinSamples && _ejectFactor > 0)
             {
                 var others = new List<double>();
                 foreach (var o in _members.Values)
@@ -4122,10 +4147,14 @@ public sealed class SkaidbConnectionPool : IDisposable
                 {
                     others.Sort();
                     double median = others[(others.Count - 1) / 2];
-                    double mine = m.Ewma.Value;
                     if (mine > _ejectFactor * median && mine - median > _ejectFloor)
+                    {
+                        double slowest = 0;
+                        foreach (double s in m.Recent) slowest = Math.Max(slowest, s);
                         Eject(m, string.Format(CultureInfo.InvariantCulture,
-                            "latency {0:F1} ms vs median {1:F1} ms", mine * 1000, median * 1000));
+                            "latency {0:F1} ms vs median {1:F1} ms; slowest of the last {2} round trips {3:F1} ms",
+                            mine * 1000, median * 1000, m.Recent.Count, slowest * 1000));
+                    }
                 }
             }
         }
@@ -4317,8 +4346,7 @@ public sealed class SkaidbConnectionPool : IDisposable
             {
                 m.EjectedUntil = null;
                 m.Errors = 0;
-                m.Ewma = null;
-                m.Samples = 0;
+                m.ResetLatency();
                 m.ReadmittedAt = Now();
                 System.Diagnostics.Trace.TraceWarning($"skaidb pool: re-admitted {m.Endpoint}");
                 if (conn is not null && _idle.Count < _maxsize)
@@ -4475,8 +4503,7 @@ public sealed class SkaidbConnectionPool : IDisposable
             if (state == SkaidbMemberState.Ready && m.Listed != SkaidbMemberState.Ready)
             {
                 // Back in rotation: measured afresh, like a re-admission.
-                m.Ewma = null;
-                m.Samples = 0;
+                m.ResetLatency();
                 m.Errors = 0;
             }
             m.Listed = state;

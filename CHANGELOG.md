@@ -4,6 +4,23 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.4.1] - 2026-10-31
+
+### Fixed
+- One slow round trip at the start can no longer get a healthy member
+  ejected for latency. A member's first round trip set its average
+  outright, so a statement that stalled in the client — a CPU-bound
+  application holding the thread while it starts — put seconds into it;
+  ten round trips later the member was compared with the others, and the
+  average had barely decayed: ejected (`latency 4153.7 ms vs median
+  0.2 ms`) while it answered in milliseconds. The fastest of a member's
+  first three round trips now seeds its average (a round trip is only ever
+  lengthened), and later ones move it as before. Until then the member
+  counts as not measured: `Members()` reports its `Latency` as null.
+- A latency ejection's `System.Diagnostics.Trace` warning names the slowest
+  of the member's last 10 round trips alongside its average and the
+  median, which tells a slow member from one slow statement.
+
 ## [1.4.0] - 2026-10-29
 
 ### Fixed
@@ -229,6 +246,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.4.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.1
 [1.4.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.0
 [1.3.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.3.0
 [1.2.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.2.0

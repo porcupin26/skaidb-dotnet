@@ -36,7 +36,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.4.0
+V=1.4.1
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -517,7 +517,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.4.0
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.4.1
 ```
 
 ## Compatibility

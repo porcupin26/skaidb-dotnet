@@ -81,7 +81,7 @@ using var pool = new SkaidbConnectionPool(
 | `Discover` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `RefreshInterval` after. New members are added, members that left are dropped (seeds are kept, marked `Unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready` again — re-checked every 5 s while any is — and then start with a fresh latency average. An older or standalone server leaves the seeds as they are and discovery stops. |
 | `RefreshInterval` | 60 s | Time between discovery refreshes. |
 | `EjectErrors` | `3` | Consecutive transport failures (dial, I/O, timeout, capacity refusal) that eject a member. Statement errors and refused logins do not count. |
-| `EjectLatencyFactor`, `EjectLatencyFloor` | `3.0`, 50 ms | A member whose round-trip average is above factor × the other members' median **and** more than the floor above it is ejected (after 10 samples on it and on another member). A factor of `0` disables this. |
+| `EjectLatencyFactor`, `EjectLatencyFloor` | `3.0`, 50 ms | A member whose round-trip average is above factor × the other members' median **and** more than the floor above it is ejected (after 10 samples on it and on another member). The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the warning names the average, the median and the slowest of the member's last 10 round trips. A factor of `0` disables this. |
 | `EjectBackoff`, `EjectBackoffMax` | 5 s, 60 s | How long an ejection lasts, doubling per repeat; a member healthy for `EjectBackoffMax` after a re-admission starts over at the base. Afterwards a background timer probes the member (dials it alone and runs one statement) and re-admits it; the probe connection joins the idle set. The last usable member is never ejected. |
 | `ReadYourWrites` | `TimeSpan.Zero` | How long after a write checkouts with the same affinity key go to the member that took the write. Zero turns it off. |
 
@@ -89,10 +89,11 @@ An invalid option (an undefined enum value, `MaxSize` or `EjectErrors`
 below 1, a negative duration) throws `SkaidbException` from the constructor.
 
 **Latency** is an exponentially weighted average of each member's round
-trips (request sent to first response frame): a sample moves it 5 %, and no
-sample counts for more than 10 × the larger of the average and the ejection
-floor, so one slow statement barely moves it while a member that stays slow
-is ejected within a few dozen statements.
+trips (request sent to first response frame): the fastest of the member's
+first three round trips seeds it, then a sample moves it 5 %, and no sample
+counts for more than 10 × the larger of the average and the ejection floor,
+so one slow statement barely moves it while a member that stays slow is
+ejected within a few dozen statements.
 
 **Read-your-writes.** The member that coordinated a write reads it back at
 any consistency, `One` included; another member may not have applied it yet.

@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -304,6 +305,123 @@ public sealed class LoadBalancingTests : IDisposable
         Assert.Equal(SkaidbMemberState.Ready, Row(p, _b).State);
     }
 
+    /// <summary>
+    /// A connection to each member, by name, checked out and kept to feed the
+    /// pool's latency measurements round trips of a chosen length (a
+    /// round-robin pool dials each member in turn; opening one measures
+    /// nothing).
+    /// </summary>
+    private Dictionary<string, SkaidbConnection> Held(SkaidbConnectionPool p)
+    {
+        var conns = All.Select(_ => p.Acquire()).ToList();
+        return All.ToDictionary(m => m.Name, m => conns.Single(c => c.ConnectedEndpoint == m.Endpoint));
+    }
+
+    /// <summary>
+    /// The warnings the pool traces (ejections, re-admissions) while this is
+    /// installed. Trace listeners are process-wide: a test keeps only the
+    /// lines that name its own members.
+    /// </summary>
+    private sealed class Warnings : TraceListener
+    {
+        private readonly List<string> _lines = new();
+
+        public Warnings() => Trace.Listeners.Add(this);
+
+        public List<string> Lines
+        {
+            get { lock (_lines) return new List<string>(_lines); }
+        }
+
+        public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? message)
+        {
+            lock (_lines) _lines.Add(message ?? "");
+        }
+
+        public override void Write(string? message) { }
+
+        public override void WriteLine(string? message) { }
+
+        protected override void Dispose(bool disposing)
+        {
+            Trace.Listeners.Remove(this);
+            base.Dispose(disposing);
+        }
+    }
+
+    [Fact]
+    public void A_slow_first_round_trip_does_not_eject_a_member()
+    {
+        // The first statements on b stall in the client — a CPU-bound
+        // application starting up holds the thread — and b answers fast from
+        // then on: the fastest of its first round trips seeds its average,
+        // so b stays in rotation. (Seeded by its first round trip alone, b's
+        // average still read ~3.8 s when another member reached 10 samples,
+        // and b was ejected.)
+        using var p = Pool(All, new SkaidbPoolOptions
+        {
+            LoadBalancing = SkaidbLoadBalancing.RoundRobin,
+            EjectLatencyFloor = TimeSpan.FromMilliseconds(50),
+        });
+        var held = Held(p);
+        p.RoundTrip(held["b"], 6.6);
+        p.RoundTrip(held["b"], 3.0);
+        for (int i = 0; i < 12; i++)
+            foreach (var name in new[] { "a", "b", "c" })
+                p.RoundTrip(held[name], 0.0002);
+        Assert.Equal(SkaidbMemberState.Ready, Row(p, _b).State);
+        double? ewma = p.MemberAt(_b.Endpoint)!.Ewma;
+        Assert.True(ewma < 0.05, $"{ewma}");
+        foreach (var c in held.Values) p.Release(c);
+    }
+
+    [Fact]
+    public void A_member_slow_from_its_first_round_trip_is_ejected_and_the_warning_names_its_slowest()
+    {
+        using var p = Pool(All, new SkaidbPoolOptions
+        {
+            LoadBalancing = SkaidbLoadBalancing.RoundRobin,
+            EjectLatencyFloor = TimeSpan.FromMilliseconds(50),
+            EjectBackoff = TimeSpan.FromSeconds(30),
+        });
+        var held = Held(p);
+        using var warnings = new Warnings();
+        for (int i = 0; i < 12; i++)
+        {
+            p.RoundTrip(held["a"], 0.0002);
+            p.RoundTrip(held["c"], 0.0002);
+            p.RoundTrip(held["b"], i == 5 ? 0.9 : 0.5);
+        }
+        Assert.Equal(SkaidbMemberState.Ejected, Row(p, _b).State);
+        var ejected = warnings.Lines
+            .Where(l => All.Any(m => l.StartsWith($"skaidb pool: ejecting {m.Endpoint} (", StringComparison.Ordinal)))
+            .ToList();
+        string line = Assert.Single(ejected);
+        Assert.StartsWith($"skaidb pool: ejecting {_b.Endpoint} (", line);
+        Assert.Matches(@"latency 5\d\d\.\d ms vs median 0\.2 ms", line);
+        Assert.Contains("slowest of the last 10 round trips 900.0 ms", line);
+        foreach (var c in held.Values) p.Release(c);
+    }
+
+    [Fact]
+    public void A_readmitted_member_is_seeded_afresh()
+    {
+        using var p = Pool(All, new SkaidbPoolOptions { LoadBalancing = SkaidbLoadBalancing.RoundRobin });
+        var m = p.MemberAt(_b.Endpoint)!;
+        var held = Held(p);
+        foreach (double t in new[] { 0.004, 0.003, 0.002 }) p.RoundTrip(held["b"], t);
+        Assert.Equal(0.002, m.Ewma);
+        m.ResetLatency();   // what a re-admission, and a return to ready, do
+        Assert.Null(m.Ewma);
+        Assert.Empty(m.Firsts);
+        Assert.Empty(m.Recent);
+        Assert.Equal(0, m.Samples);
+        p.RoundTrip(held["b"], 0.007);
+        Assert.Null(m.Ewma);   // not measured until its first three round trips
+        Assert.Null(Row(p, _b).Latency);
+        foreach (var c in held.Values) p.Release(c);
+    }
+
     [Fact]
     public void The_last_usable_member_is_never_ejected()
     {
@@ -392,6 +510,9 @@ public sealed class LoadBalancingTests : IDisposable
         Assert.Equal(0, row.InUse);
         Assert.Equal(1, row.Idle);
         Who(p);
+        Assert.Null(Row(p, _a).Latency);   // its first three round trips seed it
+        Who(p);
+        Who(p);
         Assert.NotNull(Row(p, _a).Latency);
     }
 
@@ -456,10 +577,12 @@ public sealed class LoadBalancingTests : IDisposable
         var m = p.MemberAt(_c.Endpoint)!;
         m.Ewma = 9.9;
         m.Samples = 50;
+        m.Recent.Enqueue(9.9);
         SetState(_c, "ready");
         Relist(p);
         Assert.Null(m.Ewma);
         Assert.Equal(0, m.Samples);
+        Assert.Empty(m.Recent);
         Assert.Contains("c", Enumerable.Range(0, 6).Select(_ => Who(p)).ToList());
     }
 
