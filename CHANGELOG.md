@@ -4,6 +4,45 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.5.0] - 2026-11-15
+
+### Added
+- **`SkaidbTransactionConflictException`**, a `SkaidbException`: a server
+  error whose message starts with `transaction conflict:` — a standalone
+  server (0.346 and later) refusing a `COMMIT` because another writer
+  changed a row the transaction writes after its `BEGIN`. Every path that
+  surfaces a server error throws it (commands, prepared statements,
+  `ExecuteBatch`, `DbBatch`, `Stream()`), with the server's message
+  unchanged; only the prefix is matched. It is a statement error: existing
+  `catch (SkaidbException)` blocks still see it, the connection stays
+  usable, and a pool neither counts it against the member nor discards the
+  connection.
+- **`conn.Transaction(body, attempts = 3, begin = "BEGIN")`** runs `body`
+  inside a transaction on the connection and returns its value (an `Action`
+  overload returns nothing). It sends `begin`, calls the body with the
+  connection, and sends `COMMIT`; when the commit is refused with a conflict
+  the whole transaction runs again from `begin`, at once, up to `attempts`
+  runs in all — so the body must be safe to run more than once. An
+  exception out of the body sends `ROLLBACK` (whatever that answers is
+  ignored) and is rethrown unchanged, without a retry; a refused `begin` is
+  thrown before the body runs; any other `COMMIT` error is thrown with no
+  retry and no `ROLLBACK`; `attempts` below 1 is an
+  `ArgumentOutOfRangeException` before anything is sent. `begin` is sent as
+  given, so it takes the cluster forms (`BEGIN ATOMIC`, `BEGIN ATOMIC
+  PARTITION (col = lit)`). The body is synchronous: one that returns a task
+  (an `async` lambda) is refused with an `ArgumentException` before anything
+  is sent. While the transaction is open the connection does not re-dial: a
+  statement that finds the socket closed throws `connection lost inside a
+  transaction: …` instead of carrying on in autocommit on a new connection.
+- **`pool.Transaction(body, attempts = 3, begin = "BEGIN")`**: the same on
+  one checked-out connection, held for every attempt and returned
+  afterwards.
+
+### Changed
+- `BeginTransaction()` still throws `NotSupportedException` (there is no
+  `DbTransaction` object), and so does setting a non-null `Transaction` on a
+  command or batch; their messages now name `SkaidbConnection.Transaction()`.
+
 ## [1.4.1] - 2026-10-31
 
 ### Fixed
@@ -246,6 +285,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.5.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.5.0
 [1.4.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.1
 [1.4.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.0
 [1.3.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.3.0

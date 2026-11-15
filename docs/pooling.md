@@ -43,6 +43,8 @@ SkaidbConnection Acquire(object? affinity);
 void Release(SkaidbConnection c);
 T WithConnection<T>(Func<SkaidbConnection, T> work);
 T WithConnection<T>(object? affinity, Func<SkaidbConnection, T> work);
+T Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN");
+void Transaction(Action<SkaidbConnection> body, int attempts = 3, string begin = "BEGIN");
 IReadOnlyList<SkaidbPoolMember> Members();
 void Dispose();
 ```
@@ -171,6 +173,13 @@ warnings. The rules are the same in every skaidb driver
   instead of releasing it is safe: it stops counting against its member.
 - `WithConnection()` is `Acquire()` + the callback + `Release()` in a
   `finally`. Do not let a lazy `Stream()` enumerable escape the callback.
+- `Transaction()` is `WithConnection()` around
+  [`SkaidbConnection.Transaction()`](api.md#skaidbconnection):
+  one connection for the whole transaction, every attempt included, so its
+  statements never spread over several sockets. A transaction written by
+  hand needs the same: `Acquire()` or `WithConnection()` once, around all of
+  it. A `SkaidbTransactionConflictException` is a statement error: it does
+  not count against the member and the connection goes back to the pool.
 - `Dispose()` closes every idle connection and stops the background timer;
   later `Acquire()` calls throw `pool is closed`. Connections checked out at
   that moment are disposed when released.
@@ -186,7 +195,8 @@ warnings. The rules are the same in every skaidb driver
   connection. Bound your own parallelism if the server needs it.
 - It does not retry statements. A statement that fails with a transport
   error throws to the caller; the connection is disposed on release and the
-  next `Acquire()` gives a healthy one.
+  next `Acquire()` gives a healthy one. (`Transaction()` runs a transaction
+  again only when its `COMMIT` is refused for a conflict.)
 - It does not health-check idle connections on a timer; the check happens on
   `Acquire()`.
 

@@ -16,7 +16,8 @@ file, targets `net8.0`.
   `byte[]`, `DateTimeOffset`, arrays, documents).
 - Multi-seed failover, transparent reconnect, TLS (including client
   certificate login), connection pooling balanced across the cluster's
-  members, stream subscriptions, multiple result sets.
+  members, stream subscriptions, multiple result sets, transactions that
+  run again when the server reports a conflict.
 
 Full documentation: this README, the [`docs/`](docs/) folder
 ([getting started](docs/getting-started.md) · [ADO.NET](docs/adonet.md) · [API reference](docs/api.md) ·
@@ -36,7 +37,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.4.1
+V=1.5.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -264,13 +265,90 @@ do
 
 ### Transactions
 
-Every statement autocommits. The wire protocol has no transactions, so
-`BeginTransaction()` throws `NotSupportedException` (and setting a non-null
-`DbCommand.Transaction` does too). Whatever transaction statements your
-server version supports are plain SQL sent through a command on one
-connection — but on a **cluster** `BEGIN` is not supported, and every
-statement is applied on its own. `ExecuteBatch` rows autocommit one by one,
-as described above.
+A transaction is SQL sent on **one connection**: `BEGIN`, the statements,
+then `COMMIT` or `ROLLBACK`; outside one, every statement autocommits.
+`conn.Transaction(body)` runs one and returns the body's value:
+
+```csharp
+long left = conn.Transaction(c =>
+{
+    using var cmd = c.CreateCommand();
+    cmd.CommandText = "UPDATE stock SET n = n - 1 WHERE item = ?";
+    cmd.Parameters.Add("widget");
+    cmd.ExecuteNonQuery();
+    cmd.CommandText = "SELECT n FROM stock WHERE item = ?";
+    return (long)cmd.ExecuteScalar()!;
+});
+conn.Transaction(c => { ... }, attempts: 5, begin: "BEGIN ATOMIC PARTITION (tenant_id = 't1')");
+pool.Transaction(c => { ... });      // one checked-out connection, start to finish
+```
+
+It sends `BEGIN` — or the `begin` text, as given: a **cluster** refuses
+plain `BEGIN` and takes `BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col =
+lit)` — calls the body with the connection, and sends `COMMIT`. An exception
+out of the body sends `ROLLBACK` and is rethrown unchanged, whatever the
+`ROLLBACK` itself answers. If the opening statement is refused, its error is
+thrown and the body never runs.
+
+A standalone server refuses a `COMMIT` when another writer changed a row
+the transaction writes after its `BEGIN`: nothing is applied and the
+transaction is over. That error — any server error whose message starts
+with `transaction conflict:`, from whichever call received it — is thrown as
+a `SkaidbTransactionConflictException`, a `SkaidbException` like every other
+statement error, and the connection stays usable. `Transaction()` answers it
+by running the whole transaction again from `BEGIN`, at once, up to
+`attempts` runs in all (default 3; below 1 is an
+`ArgumentOutOfRangeException`), and throws the conflict if the last run is
+refused too. So **the body may run more than once**: it must be safe to
+repeat, and should do nothing outside the database that a second run would
+do again. Only a refused `COMMIT` is retried: any other `COMMIT` error is
+thrown as it is, with no `ROLLBACK` after it (a failed `COMMIT` has ended
+the transaction), and so is every error out of the body, a conflict
+included. What counts as a conflict is under "BEGIN, COMMIT, ROLLBACK" in
+the [query syntax reference](https://skaidb.org/docs/query_syntax.html).
+
+The body is synchronous, like the driver's I/O: one that returns a task (an
+`async` lambda) is refused with an `ArgumentException` before anything is
+sent, because the `COMMIT` would go out when the lambda returned its task,
+not when it finished. `pool.Transaction(…)` holds one connection for every
+attempt and returns it afterwards; the body uses the connection it is
+handed, never the pool. A transport failure is the usual connection error
+and is not retried — inside `Transaction()` that includes a connection the
+server closed between two statements, where the next statement throws
+instead of re-dialing.
+
+Written by hand, two rules matter. **One connection for the whole
+transaction**: with a pool, check one out and keep it — and it must stay the
+same socket: a statement run on a connection the server has closed
+[re-dials](#reconnect-and-errors) and carries on outside any transaction.
+**Stop if `BEGIN` fails**: otherwise every statement after it autocommits on
+its own.
+
+```csharp
+static void Run(SkaidbConnection c, string sql)
+{
+    using var cmd = c.CreateCommand();
+    cmd.CommandText = sql;
+    cmd.ExecuteNonQuery();
+}
+
+Run(conn, "BEGIN");                  // throws if refused: nothing below runs
+try
+{
+    Run(conn, "UPDATE accounts SET balance = balance - 100 WHERE id = 1");
+    Run(conn, "UPDATE accounts SET balance = balance + 100 WHERE id = 2");
+}
+catch
+{
+    try { Run(conn, "ROLLBACK"); } catch (SkaidbException) { }   // the first error is the one to report
+    throw;
+}
+Run(conn, "COMMIT");                 // a SkaidbTransactionConflictException here: run it all again
+```
+
+There is no `DbTransaction` object: `BeginTransaction()` throws
+`NotSupportedException`, and so does setting a non-null
+`DbCommand.Transaction`.
 
 ## ADO.NET
 
@@ -417,7 +495,8 @@ instead of pooling it. Pooled connections inherit TLS and the session
 database from the connection string, whose seeds are the pool's starting
 members. Do not return a `Stream()` enumerable out of `WithConnection`: it
 is lazy, and the connection would go back to the pool before the first row
-is read.
+is read. `pool.Transaction(body)` runs a [transaction](#transactions) on one
+checked-out connection.
 
 The pool balances across members by the rules every skaidb driver shares
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
@@ -459,6 +538,10 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   violation) throw; the connection stays usable. Note that an unknown bare
   column name in a select list is *not* an error on the server: `SELECT nope
   FROM t` returns a column `nope` of NULLs.
+- A **transaction conflict** (a server error starting with `transaction
+  conflict:`, the answer to a refused `COMMIT`) is a statement error with
+  its own type, `SkaidbTransactionConflictException`: see
+  [Transactions](#transactions).
 - **Transport errors** throw `read failed: …` / `write failed: …` /
   `connection closed by server` from the in-flight statement and mark the
   connection *broken*, not closed. The next statement **re-dials** (through
@@ -468,7 +551,9 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   write only if it is idempotent.
 - A connection the server closed while it sat **idle** is detected before
   the next statement is sent, so that statement simply re-dials and runs —
-  nothing was in flight, so nothing is ambiguous.
+  nothing was in flight, so nothing is ambiguous. The exception is inside
+  `conn.Transaction()`, where that statement throws instead: the new
+  connection would not be in the transaction.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   (`IsUsable` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.
@@ -517,7 +602,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.4.1
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.5.0
 ```
 
 ## Compatibility
@@ -531,7 +616,8 @@ SELECT client_name, client_version FROM drivers;   -- dotnet | 1.4.1
   parameterised streaming`), multiple result sets a server with
   `EMIT`, the `drivers` row a server ≥ 0.203.0, pool discovery
   (`SkaidbPoolOptions.Discover`) a server ≥ 0.327 (an older one leaves the
-  pool on its seeds).
+  pool on its seeds), a `COMMIT` refused for a conflict
+  (`SkaidbTransactionConflictException`) a standalone server ≥ 0.346.
 - **Wire protocol**: <https://skaidb.org/docs/PROTOCOL.html>.
 
 ## Conformance

@@ -15,7 +15,7 @@ at <https://github.com/porcupin26/skaidb-dotnet/releases> attaches
 `Skaidb.X.Y.Z.nupkg`):
 
 ```sh
-V=1.4.1
+V=1.5.0
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -148,6 +148,25 @@ cmd.ExecuteBatch(new List<IReadOnlyList<object?>> { new object?[] { 1L, "Ada" },
 ```
 
 One round-trip for all rows; each row autocommits on its own.
+
+## Transactions
+
+```csharp
+conn.Transaction(c =>
+{
+    using var cmd = c.CreateCommand();
+    cmd.CommandText = "UPDATE accounts SET balance = balance - 100 WHERE id = 1";
+    cmd.ExecuteNonQuery();
+    cmd.CommandText = "UPDATE accounts SET balance = balance + 100 WHERE id = 2";
+    cmd.ExecuteNonQuery();
+});
+```
+
+`BEGIN`, the body, `COMMIT` on this one connection; an exception out of the
+body rolls back. When the server refuses the `COMMIT` because another writer
+changed a row the transaction writes (`SkaidbTransactionConflictException`),
+the body runs again, up to three times in all, so it must be safe to repeat.
+See [Transactions](../README.md#transactions) in the README.
 
 ## Next
 

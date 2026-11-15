@@ -84,6 +84,28 @@ public sealed class UnpreparableException : SkaidbException
 }
 
 /// <summary>
+/// The server refused a <c>COMMIT</c> because another writer changed a row
+/// the transaction writes after its <c>BEGIN</c>: any server error whose
+/// message starts with <c>transaction conflict:</c>, from whichever call
+/// received it. <see cref="Exception.Message"/> is the server's message.
+/// </summary>
+/// <remarks>
+/// Nothing was applied and the transaction is over; the connection is back
+/// in autocommit and stays usable, so running the whole transaction again
+/// from its opening statement is safe.
+/// <see cref="SkaidbConnection.Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
+/// does exactly that. It is a statement error, a <see cref="SkaidbException"/>
+/// like any other, never a connection failure.
+/// </remarks>
+public sealed class SkaidbTransactionConflictException : SkaidbException
+{
+    /// <summary>What the message of a conflict starts with (PROTOCOL.md 6, rule 6).</summary>
+    internal const string Prefix = "transaction conflict:";
+
+    public SkaidbTransactionConflictException(string message) : base(message) { }
+}
+
+/// <summary>
 /// A connection to a skaidb cluster: an ADO.NET <see cref="DbConnection"/>.
 /// Construct with a connection string (see <see cref="SkaidbConnectionStringBuilder"/>)
 /// or named arguments, then call <see cref="Open"/> (idempotent) to dial a seed
@@ -122,6 +144,14 @@ public sealed class SkaidbConnection : DbConnection
 
     /// <summary>Transport died; the next statement re-dials (see EnsureLive).</summary>
     private bool _broken;
+
+    /// <summary>
+    /// Above zero while <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
+    /// has a transaction open on the socket: EnsureLive then refuses to
+    /// re-dial instead of carrying the transaction's remaining statements
+    /// over to a connection that never saw its BEGIN.
+    /// </summary>
+    private int _inTransaction;
 
     /// <summary>
     /// A <see cref="Stream(string, SkaidbConsistency?)"/> (with or without
@@ -640,12 +670,156 @@ public sealed class SkaidbConnection : DbConnection
     protected override DbProviderFactory DbProviderFactory => SkaidbFactory.Instance;
 
     /// <summary>
-    /// Not supported: the wire protocol has no transactions. Every statement
-    /// autocommits (and a batch commits row by row).
+    /// Not supported: there is no <see cref="DbTransaction"/> object. A
+    /// transaction is SQL sent on this connection (<c>BEGIN</c>, the
+    /// statements, <c>COMMIT</c> or <c>ROLLBACK</c>), and
+    /// <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
+    /// runs one.
     /// </summary>
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) =>
         throw new NotSupportedException(
-            "skaidb connections have no transactions: every statement autocommits");
+            "skaidb has no DbTransaction: a transaction is the statements BEGIN ... COMMIT sent on one "
+            + "connection, which SkaidbConnection.Transaction() runs");
+
+    /// <summary>
+    /// Run <paramref name="body"/> inside a transaction on this connection
+    /// and return its value: <paramref name="begin"/>, the body, then
+    /// <c>COMMIT</c>. When the server refuses the commit with a
+    /// <see cref="SkaidbTransactionConflictException"/> the whole transaction
+    /// runs again from <paramref name="begin"/>, up to
+    /// <paramref name="attempts"/> runs in all.
+    /// <code>
+    /// long left = conn.Transaction(c =>
+    /// {
+    ///     using var cmd = c.CreateCommand();
+    ///     cmd.CommandText = "UPDATE stock SET n = n - 1 WHERE item = ?";
+    ///     cmd.Parameters.Add(item);
+    ///     cmd.ExecuteNonQuery();
+    ///     cmd.CommandText = "SELECT n FROM stock WHERE item = ?";
+    ///     return (long)cmd.ExecuteScalar()!;
+    /// });
+    /// </code>
+    /// </summary>
+    /// <remarks>
+    /// <para>The body is handed this connection and runs every statement of
+    /// the transaction on it. It may run more than once, so it must be safe
+    /// to repeat and should do nothing outside the database that a second
+    /// run would do again; the value returned is the last run's.</para>
+    /// <para>An exception out of the body sends <c>ROLLBACK</c> and is
+    /// rethrown unchanged, a conflict included: only a refused
+    /// <c>COMMIT</c> is retried. Whatever the <c>ROLLBACK</c> itself answers
+    /// is ignored. When <paramref name="begin"/> fails its error is thrown
+    /// and the body never runs: its statements would each autocommit. A
+    /// <c>COMMIT</c> that fails for any other reason is thrown as it is,
+    /// with no retry and no <c>ROLLBACK</c> (the transaction is already
+    /// over); so is a conflict on the last attempt. Nothing waits between
+    /// attempts: a refused commit means the other writer has finished, and
+    /// the next run reads the rows as they are now.</para>
+    /// <para>Plain <c>BEGIN</c> opens a transaction on a standalone server;
+    /// on a cluster pass <c>BEGIN ATOMIC</c> or <c>BEGIN ATOMIC PARTITION
+    /// (col = lit)</c> as <paramref name="begin"/>. The text is sent as
+    /// given.</para>
+    /// <para>A transport failure is the usual connection error and is not
+    /// retried. That includes a connection the server closed between two
+    /// statements of the transaction: the statement that finds out throws
+    /// instead of re-dialing as it would outside the helper, because a new
+    /// connection is in autocommit and would apply the remaining statements
+    /// one by one. The connection re-dials on the next statement after the
+    /// helper has returned.</para>
+    /// <para>The body is synchronous, like the driver's I/O: the commit is
+    /// sent when it returns, so a body that returns a task is refused before
+    /// anything is sent. A <see cref="Stream(string, SkaidbConsistency?)"/>
+    /// started in the body is enumerated in the body, not returned from
+    /// it.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="attempts"/> is below 1; nothing is sent.</exception>
+    public T Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")
+    {
+        CheckTransaction(body, typeof(T), attempts, begin);
+        for (int attempt = 1; ; attempt++)
+        {
+            // A refused opening statement is thrown as it is: the body's
+            // statements would each autocommit behind it.
+            RunText(begin);
+            // From here to the end of the transaction the socket must stay
+            // the one that took the BEGIN (see EnsureLive).
+            _inTransaction++;
+            try
+            {
+                T value;
+                try
+                {
+                    value = body(this);
+                }
+                catch
+                {
+                    // The caller gets the body's exception whatever ROLLBACK
+                    // answers: with nothing open (the body ended the
+                    // transaction itself, or the socket is gone) it may well
+                    // be an error.
+                    try { RunText("ROLLBACK"); }
+                    catch (Exception) { /* the body's exception is the one that matters */ }
+                    throw;
+                }
+                try
+                {
+                    RunText("COMMIT");
+                    return value;
+                }
+                catch (SkaidbTransactionConflictException) when (attempt < attempts)
+                {
+                    // Nothing was applied and the transaction is over, so
+                    // the next run starts clean. Any other COMMIT error, and
+                    // a conflict on the last attempt, passes this filter and
+                    // is thrown: no retry, and no ROLLBACK for a transaction
+                    // that has already ended.
+                }
+            }
+            finally
+            {
+                _inTransaction--;
+            }
+        }
+    }
+
+    /// <summary>
+    /// <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
+    /// for a body that returns nothing.
+    /// </summary>
+    public void Transaction(Action<SkaidbConnection> body, int attempts = 3, string begin = "BEGIN")
+    {
+        if (body is null) throw new ArgumentNullException(nameof(body));
+        Transaction<object?>(c => { body(c); return null; }, attempts, begin);
+    }
+
+    /// <summary>
+    /// The argument checks of a transaction helper, made before anything is
+    /// sent (and, for a pool, before a connection is checked out).
+    /// </summary>
+    internal static void CheckTransaction(Delegate? body, Type result, int attempts, string? begin)
+    {
+        if (body is null) throw new ArgumentNullException(nameof(body));
+        if (begin is null) throw new ArgumentNullException(nameof(begin));
+        if (attempts < 1)
+            throw new ArgumentOutOfRangeException(nameof(attempts), attempts, "a transaction takes at least 1 attempt");
+        // `conn.Transaction(async c => ...)` compiles, with the task as the
+        // body's value: the commit would go out when the body returned its
+        // task, not when it finished, and a failure inside it would reach
+        // nobody in time to roll back.
+        if (typeof(Task).IsAssignableFrom(result) || result == typeof(ValueTask)
+            || (result.IsGenericType && result.GetGenericTypeDefinition() == typeof(ValueTask<>)))
+            throw new ArgumentException(
+                "the body returns a task, and the transaction is committed when the body returns: run its "
+                + "statements synchronously (ExecuteNonQuery(), not ExecuteNonQueryAsync())", nameof(body));
+    }
+
+    /// <summary>One statement of a transaction helper, sent as it is on this connection.</summary>
+    private void RunText(string sql)
+    {
+        using var cmd = CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
 
     /// <summary>
     /// Switch the session database: runs USE now when open, and on every
@@ -795,6 +969,16 @@ public sealed class SkaidbConnection : DbConnection
         // there is no ambiguous write to worry about.
         if (!_broken && _open && SocketDead()) _broken = true;
         if (!_broken) return;
+        // A transaction lives on the socket that opened it. Re-dialling in
+        // the middle of Transaction() would send the rest of the body, and
+        // its COMMIT, to a connection in autocommit: each statement would
+        // apply on its own. So the statement fails, as one in flight when
+        // the transport dies does, and the re-dial waits for the next
+        // statement after the helper has returned.
+        if (_inTransaction > 0)
+            throw new SkaidbException(
+                "connection lost inside a transaction: it is not re-dialed until the transaction is over, "
+                + "because a new connection would run the remaining statements in autocommit");
         _prepared.Clear();
         CleanupSocket();
         // Open() is idempotent and returns early while _open is set, so the
@@ -1219,7 +1403,7 @@ public sealed class SkaidbConnection : DbConnection
                 // One ordinary frame, before any header: nothing is left to
                 // drain, so the connection stays usable.
                 string msg = first.Text();
-                if (!msg.Contains("unknown opcode")) throw new SkaidbException(msg);
+                if (!msg.Contains("unknown opcode")) throw ServerError(msg);
                 throw new SkaidbException(bound
                     ? $"server does not support parameterised streaming (skaidb >= 0.330): {msg}"
                     : $"server does not support streaming: {msg}");
@@ -1283,7 +1467,7 @@ public sealed class SkaidbConnection : DbConnection
                     }
                 }
                 else if (t == 7) { live = false; }
-                else if (t == 3) { live = false; throw new SkaidbException(r.Text()); }
+                else if (t == 3) { live = false; throw ServerError(r.Text()); }
                 else
                 {
                     // As above: an out-of-contract tag says nothing about what
@@ -1458,7 +1642,7 @@ public sealed class SkaidbConnection : DbConnection
             // text binder cannot render and hide the real message.
             if (msg.Contains("cannot be prepared") || msg.Contains("unknown opcode"))
                 throw new UnpreparableException(msg);
-            throw new SkaidbException(msg);
+            throw ServerError(msg);
         }
         throw new SkaidbException($"unexpected prepare response tag {tag}");
     }
@@ -1736,11 +1920,23 @@ public sealed class SkaidbConnection : DbConnection
             case 2: // Ddl
                 return new QueryResult(QueryResultKind.Ddl, null, null, 0);
             case 3: // Error
-                throw new SkaidbException(r.Text());
+                throw ServerError(r.Text());
             default:
                 throw new SkaidbException($"unknown response tag {tag}");
         }
     }
+
+    /// <summary>
+    /// The exception for a server <c>Error</c> frame, the message unchanged:
+    /// a <see cref="SkaidbTransactionConflictException"/> when it starts
+    /// with <c>transaction conflict:</c> (only the prefix is matched; the
+    /// rest of the text may change), a plain <see cref="SkaidbException"/>
+    /// otherwise. Every path that surfaces a server error builds it here.
+    /// </summary>
+    internal static SkaidbException ServerError(string message) =>
+        message.StartsWith(SkaidbTransactionConflictException.Prefix, StringComparison.Ordinal)
+            ? new SkaidbTransactionConflictException(message)
+            : new SkaidbException(message);
 
     /// <summary>
     /// A Rows body (PROTOCOL.md §3.2), also one set of ResultSets;
@@ -2039,14 +2235,17 @@ public sealed class SkaidbCommand : DbCommand
 
     protected override DbParameterCollection DbParameterCollection => Parameters;
 
-    /// <summary>Always null: skaidb has no transactions (setting one throws).</summary>
+    /// <summary>
+    /// Always null: there is no <see cref="System.Data.Common.DbTransaction"/>
+    /// object (setting one throws).
+    /// </summary>
     protected override DbTransaction? DbTransaction
     {
         get => null;
         set
         {
             if (value is not null)
-                throw new NotSupportedException("skaidb connections have no transactions");
+                throw new NotSupportedException("skaidb has no DbTransaction: see SkaidbConnection.Transaction()");
         }
     }
 
@@ -2767,8 +2966,8 @@ public sealed class SkaidbDataReader : DbDataReader
 /// Several statements in one call: an ADO.NET <see cref="DbBatch"/>. Runs of
 /// consecutive commands with the same parameterised statement go to the
 /// server as ONE <c>OP_EXECUTE_BATCH</c> round-trip; everything else runs one
-/// statement at a time. There are no transactions: each statement (each row
-/// of a merged run) autocommits, and a failure leaves earlier ones applied.
+/// statement at a time. A batch is not a transaction: each statement (each
+/// row of a merged run) autocommits, and a failure leaves earlier ones applied.
 /// </summary>
 public sealed class SkaidbBatch : DbBatch
 {
@@ -2807,7 +3006,7 @@ public sealed class SkaidbBatch : DbBatch
         get => null;
         set
         {
-            if (value is not null) throw new NotSupportedException("skaidb connections have no transactions");
+            if (value is not null) throw new NotSupportedException("skaidb has no DbTransaction: see SkaidbConnection.Transaction()");
         }
     }
 
@@ -3915,6 +4114,30 @@ public sealed class SkaidbConnectionPool : IDisposable
         {
             Release(c);
         }
+    }
+
+    /// <summary>
+    /// <see cref="SkaidbConnection.Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
+    /// on one checked-out connection: it is held for the whole transaction,
+    /// every attempt included, and returned afterwards, so the statements
+    /// never spread over several sockets. <paramref name="body"/> runs its
+    /// statements on the connection it is handed, not on the pool.
+    /// </summary>
+    public T Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")
+    {
+        // Checked here too: a bad argument must not cost a checkout (and a dial).
+        SkaidbConnection.CheckTransaction(body, typeof(T), attempts, begin);
+        return WithConnection(c => c.Transaction(body, attempts, begin));
+    }
+
+    /// <summary>
+    /// <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
+    /// for a body that returns nothing.
+    /// </summary>
+    public void Transaction(Action<SkaidbConnection> body, int attempts = 3, string begin = "BEGIN")
+    {
+        if (body is null) throw new ArgumentNullException(nameof(body));
+        Transaction<object?>(c => { body(c); return null; }, attempts, begin);
     }
 
     /// <summary>

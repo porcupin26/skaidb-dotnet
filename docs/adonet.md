@@ -14,7 +14,7 @@ skaidb unchanged.
 | `SkaidbDataReader` | `DbDataReader` |
 | `SkaidbBatch`, `SkaidbBatchCommand`, `SkaidbBatchCommandCollection` | `DbBatch`, `DbBatchCommand`, `DbBatchCommandCollection` |
 | `SkaidbFactory` | `DbProviderFactory` |
-| `SkaidbException` | `DbException` |
+| `SkaidbException`, `SkaidbTransactionConflictException` | `DbException` |
 
 ## Registering the provider
 
@@ -154,9 +154,16 @@ applied.
 
 ## Transactions
 
-`BeginTransaction()` throws `NotSupportedException`, and so does setting a
-non-null `Transaction` on a command or batch: the wire protocol has no
-transactions and every statement autocommits.
+There is no `DbTransaction` object: `BeginTransaction()` throws
+`NotSupportedException`, and so does setting a non-null `Transaction` on a
+command or batch. A transaction is SQL sent on one connection: `BEGIN`, the
+statements (ordinary commands on that connection), then `COMMIT` or
+`ROLLBACK`. `SkaidbConnection.Transaction(body)` runs one, and runs it again
+when the server refuses the `COMMIT` with a
+`SkaidbTransactionConflictException`; see the
+[README](../README.md#transactions) and [api.md](api.md#skaidbconnection).
+It is a `SkaidbConnection` method, so provider-agnostic code holding a
+`DbConnection` casts first, or sends `BEGIN` and `COMMIT` itself.
 
 ## Async
 

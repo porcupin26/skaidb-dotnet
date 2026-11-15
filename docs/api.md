@@ -11,7 +11,8 @@ Everything lives in the `Skaidb` namespace: `SkaidbConnection`,
 `SkaidbConnectionPool`, `SkaidbPoolOptions`, `SkaidbPoolMember`,
 `SkaidbLoadBalancing`, `SkaidbIdleOrder`, `SkaidbMemberState`,
 `SkaidbConsistency`, `SkaidbAuthMechanism`, `SkaidbException`,
-`UnpreparableException`. The ADO.NET types derive from
+`SkaidbTransactionConflictException`, `UnpreparableException`. The ADO.NET
+types derive from
 `System.Data.Common`; [adonet.md](adonet.md) covers how they behave as a
 provider.
 
@@ -107,9 +108,51 @@ A batch bound to this connection; see [adonet.md](adonet.md#dbbatch).
 
 Runs `USE "<name>"` now when open, and on every later dial.
 
+### `Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")` → `T`
+
+Runs `body` inside a transaction on this connection and returns its value;
+`Transaction(Action<SkaidbConnection> body, int attempts = 3, string begin =
+"BEGIN")` is the same for a body that returns nothing. In order:
+
+1. `attempts` below 1 throws `ArgumentOutOfRangeException`, a null `body` or
+   `begin` `ArgumentNullException`, and a body whose value is a `Task` or a
+   `ValueTask` (what an `async` lambda returns) `ArgumentException` — all
+   before anything is sent.
+2. `begin` is sent, as given. If it fails its error is thrown: the body does
+   not run and nothing else is sent (its statements would each autocommit).
+3. `body(this)` runs. It runs its statements on the connection it is handed.
+4. If the body throws, `ROLLBACK` is sent, whatever it answers is ignored,
+   and the body's exception is rethrown unchanged. There is no retry, also
+   when that exception is a `SkaidbTransactionConflictException`.
+5. Otherwise `COMMIT` is sent. On success the body's value is returned. On
+   a `SkaidbTransactionConflictException` with attempts left, the helper
+   goes back to step 2 at once, with no wait: the body runs again from the
+   start, so it must be safe to run more than once and should do nothing
+   outside the database that a second run would repeat; the value returned
+   is the last run's. On the last attempt the conflict is thrown. Any other
+   `COMMIT` error is thrown as it is, with no retry and no `ROLLBACK`: a
+   `COMMIT` that fails has ended the transaction.
+
+Plain `BEGIN` opens a transaction on a standalone server; on a cluster pass
+`BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col = lit)` as `begin`.
+
+A transport failure is the usual connection error and is never retried.
+Between `begin` and the end of the transaction the connection does not
+re-dial: a statement that finds the socket closed (see step 1 under
+[`SkaidbCommand`](#skaidbcommand)) throws `connection lost inside a
+transaction: …` instead, because a new connection is in autocommit and would
+apply the remaining statements one by one. The next statement after the
+helper has returned re-dials as usual.
+
+The body is synchronous. A `Stream()` started in it is enumerated in it, not
+returned from it. Other threads must leave the connection alone meanwhile:
+a statement they ran on it would be part of the transaction.
+
 ### `BeginTransaction()`
 
-Throws `NotSupportedException`: the wire protocol has no transactions.
+Throws `NotSupportedException`: there is no `DbTransaction` object. A
+transaction is the SQL statements `BEGIN` … `COMMIT` sent on one connection,
+which `Transaction()` above runs.
 
 ### `Stream(string sql, SkaidbConsistency? consistency = null)` → `IEnumerable<object?[]>`
 
@@ -160,7 +203,7 @@ with no connection at all throws `InvalidOperationException`.
 | `Connection` | The `SkaidbConnection` it runs on. |
 | `Consistency` | This command's level; defaults to the connection's at creation. |
 | `CommandTimeout` | Stored for ADO.NET callers; the connection's `Timeout` bounds each request. |
-| `Transaction` | Always `null`; setting a non-null value throws `NotSupportedException`. |
+| `Transaction` | Always `null`; setting a non-null value throws `NotSupportedException` (there is no `DbTransaction` object; see `SkaidbConnection.Transaction()`). |
 | `Prepare()` | Prepares on the server now (otherwise it happens on first execution). |
 | `Cancel()` | No-op. |
 | `ExecuteReader()`, `ExecuteReader(CommandBehavior)` | `SkaidbDataReader` over the rows. A non-row statement gives an empty reader (`FieldCount` 0, `Read()` false, `RecordsAffected` the count for a mutation and -1 for DDL). `CommandBehavior.CloseConnection` closes the connection with the reader. |
@@ -180,7 +223,8 @@ Behaviour of the three `Execute*` methods:
    or $N placeholders`. A `?`-only statement passes unchanged.
 1. If the connection's transport died earlier, or the server closed the
    socket while it sat idle, the connection re-dials first (seed walk,
-   handshake, Hello, `USE`), clearing the prepared-statement cache.
+   handshake, Hello, `USE`), clearing the prepared-statement cache. Inside
+   `SkaidbConnection.Transaction()` it throws instead.
 2. With parameters, the statement is prepared on the server (once per SQL
    text per connection, cached up to 240 entries) and executed with the
    values encoded as typed skaidb values. `statement expects N parameters,
@@ -194,7 +238,9 @@ Behaviour of the three `Execute*` methods:
    literal with no parameters is an error (`query has placeholders but no
    parameters given`).
 5. The reply is decoded: `Rows`, `ResultSets`, `Mutation`, `Ddl`, or `Error`
-   → `SkaidbException(message)`.
+   → `SkaidbException(message)`, or its subclass
+   `SkaidbTransactionConflictException(message)` when the message starts
+   with `transaction conflict:`.
 
 `ExecuteBatch`: prepares (a non-preparable statement throws
 `UnpreparableException`, a `SkaidbException` subclass), checks every row's
@@ -242,9 +288,17 @@ SkaidbConnection Acquire(object? affinity);
 void Release(SkaidbConnection c);
 T WithConnection<T>(Func<SkaidbConnection, T> work);
 T WithConnection<T>(object? affinity, Func<SkaidbConnection, T> work);
+T Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN");
+void Transaction(Action<SkaidbConnection> body, int attempts = 3, string begin = "BEGIN");
 IReadOnlyList<SkaidbPoolMember> Members();
 void Dispose();
 ```
+
+`Transaction()` is `SkaidbConnection.Transaction()` on one checked-out
+connection: the argument errors are thrown before the checkout, the
+connection is held for the whole transaction, every attempt included, and
+released afterwards. Under an affinity key, call
+`WithConnection(affinity, c => c.Transaction(body))`.
 
 Thread-safe. The connection string's `Host`/`Seeds` are the starting members
 and every connection is built from it; an invalid connection string or
@@ -290,10 +344,19 @@ See [pooling.md](pooling.md) for what each policy and option does.
 `enum SkaidbConsistency : byte { One = 0, Quorum = 1, All = 2 }` — the wire
 values.
 
-## `SkaidbException`, `UnpreparableException`
+## `SkaidbException`, `SkaidbTransactionConflictException`, `UnpreparableException`
 
 `SkaidbException : DbException` is thrown for every driver and server error;
 `InnerException` carries the socket/IO exception for transport failures.
+`SkaidbTransactionConflictException : SkaidbException` is a server error
+whose message starts with `transaction conflict:` — the server refusing a
+`COMMIT` because another writer changed a row the transaction writes after
+its `BEGIN` — from whichever call received it: a command, a batch or a
+stream. `Message` is the server's message, unchanged; only the prefix is
+matched. Nothing was applied, the transaction is over and the connection is
+back in autocommit and usable (to a pool it is a round trip that succeeded,
+not a failure of the member), so running the whole transaction again is
+safe; `Transaction()` does.
 `UnpreparableException : SkaidbException` is what `ExecuteBatch` throws for a
 statement kind the server will not prepare (the `Execute*` methods handle it
 internally by falling back to text).
