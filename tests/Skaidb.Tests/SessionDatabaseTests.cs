@@ -336,4 +336,35 @@ public class SessionDatabaseTests
         BothStatementsRunInItAfterARedial(srv, d, c, "other");                   // not back in the pool's app, mid-checkout
         pool.Release(c);
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_borrower_s_USE_does_not_reach_the_next_borrower_of_a_pool_with_a_database(bool changed)
+    {
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var pool = new SkaidbConnectionPool(Cs(srv, "Database=app"));
+        pool.WithConnection(c =>
+        {
+            if (changed) c.ChangeDatabase("other");
+            else Exec(c, "USE other");
+            return Rows(c);
+        });
+        // The next borrower gets the same connection, in the pool's database.
+        Assert.Equal(3L, pool.WithConnection(Rows));
+        Assert.Equal("app", d.Log[^1].Database);
+        Assert.Equal(1, srv.Connections);                                        // put back, not thrown away
+        Assert.Equal(1, pool.Members().Sum(m => m.Idle));
+        Assert.Single(d.Log.Select(l => l.Socket).Distinct());
+        Assert.Equal("USE \"app\"", d.Log[^2].Sql);                              // sent when the connection was handed back
+
+        // A connection that cannot be put back is not kept: the pool's
+        // database is gone, and no later borrower runs anything in other.
+        d.Dropped = "app";
+        pool.WithConnection(c => Exec(c, "USE other"));
+        Assert.Equal(0, pool.Members().Sum(m => m.Idle + m.InUse));
+        Assert.Equal("database \"app\" does not exist", Assert.Throws<SkaidbException>(() => pool.WithConnection(Rows)).Message);
+        Assert.NotEqual(Count, d.Log[^1].Sql);
+    }
 }

@@ -171,6 +171,15 @@ warnings. The rules are the same in every skaidb driver
   undisposed, is therefore never handed to another caller. A connection the
   pool did not hand out is disposed. Disposing a checked-out connection
   instead of releasing it is safe: it stops counting against its member.
+- A borrower that changes the database of its connection (`USE other`,
+  `ChangeDatabase()`) changes it for that checkout only when the pool's
+  connection string names a `Database`: `Release()` sends `USE` for the
+  pool's database before the connection goes back, so the next borrower
+  finds it there, and disposes the connection if that fails. A pool whose
+  connection string names no database has none to put a connection back
+  into: there a borrower's `USE` stays on the connection for whoever gets
+  it next, so either give the pool a `Database` or select one on every
+  checkout.
 - `WithConnection()` is `Acquire()` + the callback + `Release()` in a
   `finally`. Do not let a lazy `Stream()` enumerable escape the callback.
 - `Transaction()` is `WithConnection()` around

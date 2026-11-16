@@ -4083,6 +4083,8 @@ public sealed class SkaidbConnectionPool : IDisposable
     }
 
     private readonly string _connectionString;
+    /// <summary>The connection string's <c>Database</c>: what every borrower finds a connection in. Empty when it names none.</summary>
+    private readonly string _database;
     private readonly int _maxsize;
     private readonly SkaidbLoadBalancing _policy;
     private readonly bool _fifo;
@@ -4146,6 +4148,7 @@ public sealed class SkaidbConnectionPool : IDisposable
         // The seeds and the default port, read once (a bad connection string
         // fails here rather than at the first checkout).
         using var template = new SkaidbConnection(connectionString);
+        _database = template.Database;
         _defaultPort = template.Port;
         foreach (var seed in template.Seeds)
         {
@@ -4220,10 +4223,23 @@ public sealed class SkaidbConnectionPool : IDisposable
     /// <summary>
     /// Return a connection. It is disposed instead of kept when it is
     /// broken, its member is ejected, not ready or gone, it is not this
-    /// pool's, or the idle set is full.
+    /// pool's, or the idle set is full. One its borrower left in another
+    /// database than the connection string's <c>Database</c> is put back
+    /// into that one first (one <c>USE</c>), and disposed if that fails.
     /// </summary>
     public void Release(SkaidbConnection c)
     {
+        // The borrower left the connection in another database than the
+        // pool's (USE, ChangeDatabase): the next borrower must not find it
+        // there. One USE puts it back, outside the lock; a connection that
+        // cannot be put back is not kept. A pool whose connection string
+        // names no database has none to put it back into.
+        bool inPlace = true;
+        if (c.Pool == this && _database.Length > 0 && c.Database != _database && c.IsUsable)
+        {
+            try { c.ChangeDatabase(_database); }
+            catch (Exception) { inPlace = false; }
+        }
         lock (_gate)
         {
             Member? m = null;
@@ -4233,7 +4249,7 @@ public sealed class SkaidbConnectionPool : IDisposable
                 c.PoolOut = false;
                 if (m is not null && m.InUse > 0) m.InUse--;
             }
-            if (!_closed && m is not null && Usable(m) && c.IsUsable && _idle.Count < _maxsize)
+            if (inPlace && !_closed && m is not null && Usable(m) && c.IsUsable && _idle.Count < _maxsize)
             {
                 _idle.Add(c);
                 return;
