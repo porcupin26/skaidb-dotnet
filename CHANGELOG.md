@@ -4,6 +4,94 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.5.1] - 2026-11-16
+
+### Fixed
+- **A database entered with a `USE` statement is entered again after a
+  re-dial.** The driver re-entered the database of the connection string,
+  or of `ChangeDatabase()`, on every dial, but not one entered with a `USE`
+  sent as an ordinary statement. After a transparent re-dial — the member
+  restarted while the connection sat idle — the session was in the default
+  database, and the statements that followed ran against the tables of the
+  same names there: a read came back from the wrong table and a write went
+  into it, with no error. A statement the server has accepted that is
+  exactly `USE [DATABASE] <name>` (the name bare or in double quotes, an
+  optional `;` behind it) now sets the connection's `Database`, which every
+  dial enters before anything else is sent, on a pooled connection too. A
+  `USE` written with `--` comments is read the same way, as the server
+  reads it: `USE app -- the app database` is noted, and `USE "a--b"` names
+  the database `a--b`. If the database cannot be entered on the new
+  connection the statement fails with that error and is not sent.
+- **A borrower's `USE` no longer reaches the next borrower of a pool with
+  a `Database`.** A connection whose borrower ran `USE other`, or
+  `ChangeDatabase()`, went back to the pool in that database, and the next
+  borrower's statements ran there. `Release()` now sends `USE` for the
+  database of the pool's connection string before the connection goes
+  back, and disposes it if that fails. A pool whose connection string
+  names no `Database` is unchanged: there a borrower's `USE` stays on the
+  connection.
+- **A connection's prepared statements no longer fill the server's
+  table.** A server holds at most 256 prepared statements per connection.
+  The driver cached the first 240 distinct parameterised texts of a
+  connection; a text past those was prepared again at every execution and
+  never closed, so the 257th prepare was refused, and that statement and
+  every parameterised statement outside the cache after it threw `too many
+  prepared statements (max 256); close some first` until the connection
+  was re-dialed. The connection now keeps up to 240 prepared statements
+  and, when another is needed, closes the one used longest ago on the
+  server; it is prepared again if its text comes back. Any number of
+  distinct parameterised statements can run on one connection, each bound
+  with typed values.
+- **An `Open()` that fails at its `USE` leaves the connection closed.**
+  When the server refused the `USE` of the session database, `Open()`
+  threw but `IsOpen` stayed true and `State` was `Open`, and a second
+  `Open()` returned at once without dialing.
+- **A connection marked broken closes its socket at once.** A transport
+  failure left the dead socket open until the connection's next statement
+  re-dialed, or `Close()`. When the server was still on the other end — a
+  read that timed out, a stream abandoned with more than 64 frames left —
+  it kept the session until then, and with it the transaction a `BEGIN`
+  had opened and the rows that transaction had claimed.
+  `conn.Transaction()` could not end it either: its `ROLLBACK` is refused
+  on a broken connection. The socket is now closed where the connection is
+  marked broken; `IsOpen` stays true and the next statement re-dials, as
+  before. A read that times out in the middle of a stream is also reported
+  after one timeout, not two.
+- **A stream the body of `Transaction()` leaves open no longer leaves its
+  transaction open.** A `Stream()` enumerator the body started and neither
+  ran out nor disposed kept the connection busy, so the helper's `COMMIT`
+  (or `ROLLBACK`) was refused client-side with `connection is busy
+  streaming`: the helper threw, and the transaction stayed open on a
+  working socket. Statements run on that connection once the stream was
+  disposed ran inside it — unseen by other connections, and undone by the
+  next `ROLLBACK` or disconnect. The helper now closes the socket, so the
+  server drops the transaction. It throws what it threw before (the body's
+  exception, else the busy-streaming error), and the connection re-dials
+  on its next statement once the stream has been disposed.
+- **`Open()` inside the body of `Transaction()` is refused.** A body that
+  caught a lost connection's error, called `Close()` and `Open()` and
+  carried on got a connection that never saw the `BEGIN`: its remaining
+  statements were applied one by one, in autocommit, and the helper sent
+  its `COMMIT` there. `Open()` now throws `connection lost inside a
+  transaction: …` until the helper has returned.
+- **A re-dial that fails is tried again.** When a statement found its
+  connection lost and the re-dial failed too — the server still
+  restarting — the connection was left closed: every later statement and
+  every `Transaction()` threw `connection is not open`, also once the
+  server was back, until the application called `Open()`. The connection
+  now stays open and broken, so each statement dials again and the first
+  one after the server is back runs.
+- **A connection opened past a seed that dropped the handshake is
+  usable.** A seed that accepts the socket and closes it (a node at its
+  connection ceiling) left the connection the next seed gave marked
+  broken: `IsUsable` was false right after `Open()`, the first statement
+  dialed a second time, and a pool threw the new connection away and
+  dialed again.
+- **A frame over the 64 MiB limit drops the connection.** `frame too
+  large` was thrown with the frame's payload unread on a connection that
+  stayed usable, so the next statement read its reply out of that payload.
+  The connection is now broken, and the next statement re-dials.
+
 ## [1.5.0] - 2026-11-15
 
 ### Added
@@ -285,6 +373,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.5.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.5.1
 [1.5.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.5.0
 [1.4.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.1
 [1.4.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.0
