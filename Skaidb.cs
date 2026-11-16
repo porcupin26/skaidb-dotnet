@@ -994,10 +994,16 @@ public sealed class SkaidbConnection : DbConnection
     public bool IsUsable => !_disposed && _open && !_broken && _claim is null && !SocketDead();
 
     /// <summary>
-    /// True when the peer has closed the socket while it sat idle: readable
-    /// with nothing to read means EOF. A zero-timeout poll, so cheap enough
-    /// for a pool to ask on every Acquire/Release. Only meaningful between
-    /// requests; while one is in flight the flags above answer first.
+    /// True when the socket, idle between two requests, is readable. The
+    /// server sends nothing to an idle connection, so there are three things
+    /// that can be: the end of the stream (the peer closed it), a reset, or
+    /// bytes nobody asked for — and after any of them the next request
+    /// would not be answered by its own reply. A zero-timeout poll of the
+    /// transport socket (under TLS too: the socket, not the decrypted
+    /// stream), so it costs no round trip and is cheap enough to ask before
+    /// every statement and for a pool on every Acquire/Release. Only
+    /// meaningful between requests; while one is in flight the flags above
+    /// answer first.
     /// </summary>
     private bool SocketDead()
     {
@@ -1007,7 +1013,7 @@ public sealed class SkaidbConnection : DbConnection
         {
             var s = tcp.Client;
             if (!s.Connected) return true;
-            return s.Poll(0, SelectMode.SelectRead) && s.Available == 0;
+            return s.Poll(0, SelectMode.SelectRead);
         }
         catch (Exception)
         {
@@ -1062,7 +1068,10 @@ public sealed class SkaidbConnection : DbConnection
         lock (_lock) ThrowIfStreamingLocked();
         // A peer that closed the socket while it sat idle (a node restart, an
         // idle timeout) is safe to re-dial now: nothing has been sent yet, so
-        // there is no ambiguous write to worry about.
+        // there is no ambiguous write to worry about. Looked for here, not
+        // left to the write: on a real network a write to a connection that
+        // died minutes ago still succeeds, and only the read behind it
+        // fails, with the statement possibly run and never re-sent.
         if (!_broken && _open && SocketDead()) MarkBroken();
         if (!_broken) return;
         // A transaction lives on the socket that opened it. Re-dialling in

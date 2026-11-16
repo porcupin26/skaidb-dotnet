@@ -576,9 +576,14 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   fails with that error and is not sent. Because the failed
   statement *may* have executed, the driver never retries it for you: retry a
   write only if it is idempotent.
-- A connection the server closed while it sat **idle** is detected before
-  the next statement is sent, so that statement simply re-dials and runs —
-  nothing was in flight, so nothing is ambiguous. The exception is inside
+- A connection the server closed while it sat **idle** — a restart, a
+  failover, an idle timeout — is detected before the next statement is
+  sent, so that statement simply re-dials and runs: nothing was in flight,
+  so nothing is ambiguous and no error reaches the application. The driver
+  looks at the socket before every statement (a zero-timeout poll, no round
+  trip; under TLS the transport socket): the end of the stream, a reset or
+  bytes nobody asked for all mean the connection is dead. A pool looks the
+  same way before it hands a connection out. The exception is inside
   `conn.Transaction()`, where that statement throws instead: the new
   connection would not be in the transaction.
 - A **re-dial that fails** — the server is still down — throws its error

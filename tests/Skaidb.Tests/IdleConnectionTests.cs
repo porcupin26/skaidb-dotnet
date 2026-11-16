@@ -232,6 +232,27 @@ public class IdleConnectionTests
     }
 
     [Fact]
+    public void A_frame_nobody_asked_for_on_an_idle_connection_is_not_read_as_the_next_statement_s_reply()
+    {
+        var s = new Standalone();
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        Assert.Equal(7L, Scalar(c, "SELECT 1"));
+        // An idle connection is owed nothing. Bytes that turn up on one mean
+        // the two ends no longer agree where a reply starts: whatever is
+        // asked next would be answered with them.
+        srv.Accepted.Single().Send(F.Ddl());
+        SpinWait.SpinUntil(() => !c.IsUsable, TimeSpan.FromSeconds(2));
+        Assert.Equal(7L, Scalar(c, "SELECT 1"));                                 // its own reply, not the stray frame (no rows)
+        Assert.Equal(1, Exec(c, Update));
+        Assert.Equal(2, srv.Connections);                                        // on a new connection: the other was dropped
+        Assert.Equal(new[] { "SELECT 1", "SELECT 1", Update }, s.Log);
+        Assert.NotSame(s.Sockets[0], s.Sockets[1]);
+        Assert.Same(s.Sockets[1], s.Sockets[2]);
+        WaitFor(() => srv.Live == 1, "the connection with the stray frame on it is still open");
+    }
+
+    [Fact]
     public void A_live_idle_connection_is_looked_at_without_a_round_trip_and_stays()
     {
         var s = new Standalone();

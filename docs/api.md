@@ -63,7 +63,7 @@ The constructor only stores configuration; nothing is dialled until `Open()`.
 | `Consistency` | `SkaidbConsistency` | Read/write. Default for commands created afterwards. |
 | `Timeout` | `TimeSpan` | Read/write; set before `Open()`. |
 | `IsOpen` | `bool` | The handshake completed and neither `Close()` nor `Dispose()` was called since. |
-| `IsUsable` | `bool` | `IsOpen`, and: no transport error pending, no `Stream()` in flight, and the socket not closed by the peer. What a pool checks. |
+| `IsUsable` | `bool` | `IsOpen`, and: no transport error pending, no `Stream()` in flight, and nothing to read on the idle socket (the peer closed or reset it, or sent bytes nobody asked for). What a pool checks. |
 | `StreamColumns` | `IReadOnlyList<string>` | Column names of the most recent `Stream()` call, set once its header arrives; empty when it returned no rows. |
 | `StreamAffected` | `long?` | Affected-row count of the most recent `Stream()` call when it was a mutation; `null` otherwise. |
 | `StreamResultSets` | `SkaidbDataReader?` | Every result set of the most recent `Stream()` call when the server answered it with several in one frame (a `CALL` whose body `EMIT`s), as the reader `ExecuteReader()` returns: on the first set, `NextResult()` walking the rest; `null` otherwise. |
@@ -247,10 +247,12 @@ Behaviour of the three `Execute*` methods:
    Nth parameter. Errors: `no parameter named '@x'`, `placeholder $N has no
    parameter (M given)`, `a statement cannot mix ? placeholders with @name
    or $N placeholders`. A `?`-only statement passes unchanged.
-1. If the connection's transport died earlier, or the server closed the
-   socket while it sat idle, the connection re-dials first (seed walk,
-   handshake, Hello, `USE`), clearing the prepared-statement cache. Inside
-   `SkaidbConnection.Transaction()` it throws instead.
+1. If the connection's transport died earlier, or the look at the idle
+   socket finds it dead (a zero-timeout poll before anything is written:
+   closed or reset by the peer, or holding bytes nobody asked for), the
+   connection re-dials first (seed walk, handshake, Hello, `USE`), clearing
+   the prepared-statement cache. Inside `SkaidbConnection.Transaction()` it
+   throws instead.
 2. With parameters, the statement is prepared on the server (once per SQL
    text per connection; the connection keeps up to 240 prepared, and closes
    the one used longest ago on the server to make room for another) and
