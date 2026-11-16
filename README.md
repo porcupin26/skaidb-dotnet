@@ -544,7 +544,10 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   [Transactions](#transactions).
 - **Transport errors** throw `read failed: …` / `write failed: …` /
   `connection closed by server` from the in-flight statement and mark the
-  connection *broken*, not closed. The next statement **re-dials** (through
+  connection *broken*, not closed: `IsOpen` stays true, `IsUsable` turns
+  false. Its socket is closed there and then, so a server that is still on
+  the other end — a read that timed out — drops the session and whatever
+  transaction a `BEGIN` opened on it. The next statement **re-dials** (through
   the seed walk), re-authenticates, re-sends `USE <database>`, re-sends the
   Hello frame and clears the prepared-statement cache. Because the failed
   statement *may* have executed, the driver never retries it for you: retry a

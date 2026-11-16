@@ -414,6 +414,54 @@ public class ClientTests
         Assert.Equal(2, srv.Hellos.Count);                                // Hello again after the reconnect
     }
 
+    [Theory]
+    [InlineData("a read timeout")]
+    [InlineData("a stream abandoned with too much left to drain")]
+    [InlineData("a frame that is no part of a stream")]
+    [InlineData("a reply that starts no stream")]
+    public void A_connection_marked_broken_closes_its_socket_at_once(string broken)
+    {
+        var chunks = Enumerable.Range(0, 100).Select(i => F.Chunk(new object?[] { (long)i })).ToList();   // > 64-frame drain budget
+        var s = new Scripted()
+            .Answer("SELECT id FROM big", new[] { F.Header("id") }.Concat(chunks).Append(F.End()).ToArray())
+            .Answer("SELECT odd", F.Header("id"), F.Chunk(new object?[] { 1L }), new byte[] { 99 })
+            .Answer("SELECT odder", new byte[] { 99 })
+            .Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }));
+        s.Script["SELECT slow"] = (_, _) => Array.Empty<byte[]>();               // never answered, the socket stays open
+        using var srv = new FakeServer(s.Handle);
+        using var c = new SkaidbConnection($"Host=127.0.0.1;Port={srv.Port};User=ada;Password=secret;Timeout=1");
+        c.Open();
+        switch (broken)
+        {
+            case "a read timeout":
+                Assert.Contains("read failed", Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT slow")).Message);
+                break;
+            case "a stream abandoned with too much left to drain":
+                foreach (var _ in c.Stream("SELECT id FROM big")) break;
+                break;
+            case "a frame that is no part of a stream":
+                Assert.Contains("unexpected frame tag", Assert.Throws<SkaidbException>(() => c.Stream("SELECT odd").ToList()).Message);
+                break;
+            default:
+                Assert.Contains("unexpected response tag", Assert.Throws<SkaidbException>(() => c.Stream("SELECT odder").ToList()).Message);
+                break;
+        }
+        Assert.False(c.IsUsable);
+        // The server is alive on the other end and keeps the session, with
+        // whatever transaction a BEGIN opened on it, until the socket
+        // closes: that must not wait for this connection's next statement.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (srv.Live != 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, broken + ": the socket is still open");
+            Thread.Sleep(20);
+        }
+        Assert.Equal(1, srv.Connections);
+        Assert.True(c.IsOpen);                                            // broken, not closed: the next statement re-dials
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(2, srv.Connections);
+    }
+
     private static byte[] Le32(int v) => new[] { (byte)v, (byte)(v >> 8), (byte)(v >> 16), (byte)(v >> 24) };
 
     [Fact]

@@ -142,7 +142,10 @@ public sealed class SkaidbConnection : DbConnection
     private readonly object _lock = new();
     private readonly Dictionary<string, (uint Id, int Params)> _prepared = new();
 
-    /// <summary>Transport died; the next statement re-dials (see EnsureLive).</summary>
+    /// <summary>
+    /// Transport died: the socket is already closed (see MarkBroken) and the
+    /// next statement re-dials (see EnsureLive).
+    /// </summary>
     private bool _broken;
 
     /// <summary>
@@ -655,6 +658,26 @@ public sealed class SkaidbConnection : DbConnection
         _tcp = null;
     }
 
+    /// <summary>
+    /// The transport is dead, or at an offset nobody can read on from: the
+    /// connection is broken, and its socket is closed NOW (PROTOCOL.md 6,
+    /// rule 4), not when the next statement re-dials.
+    /// </summary>
+    /// <remarks>
+    /// Closing is what tells the server. A socket that timed out, or that an
+    /// abandoned stream gave up on, is alive at the other end, and for as
+    /// long as it stays open the server keeps its session: the transaction a
+    /// BEGIN opened on it, and the rows that transaction claimed. The caller
+    /// may not run another statement on this connection for hours. The
+    /// connection stays open in the ADO.NET sense; the re-dial is still the
+    /// next statement's (see EnsureLive).
+    /// </remarks>
+    private void MarkBroken()
+    {
+        _broken = true;
+        CleanupSocket();
+    }
+
     /// <summary>Create a command bound to this connection.</summary>
     public new SkaidbCommand CreateCommand() => new SkaidbCommand(this);
 
@@ -967,7 +990,7 @@ public sealed class SkaidbConnection : DbConnection
         // A peer that closed the socket while it sat idle (a node restart, an
         // idle timeout) is safe to re-dial now: nothing has been sent yet, so
         // there is no ambiguous write to worry about.
-        if (!_broken && _open && SocketDead()) _broken = true;
+        if (!_broken && _open && SocketDead()) MarkBroken();
         if (!_broken) return;
         // A transaction lives on the socket that opened it. Re-dialling in
         // the middle of Transaction() would send the rest of the body, and
@@ -1050,7 +1073,7 @@ public sealed class SkaidbConnection : DbConnection
         }
         catch (IOException e)
         {
-            _broken = true;
+            MarkBroken();
             throw new SkaidbException($"write failed: {e.Message}", e);
         }
     }
@@ -1081,13 +1104,15 @@ public sealed class SkaidbConnection : DbConnection
             {
                 // The statement may already have executed, so it is NOT
                 // retried here — an ambiguous write must never repeat. The
-                // connection is marked broken and the NEXT statement re-dials.
-                _broken = true;
+                // connection is marked broken, its socket closed (a read
+                // that timed out leaves the server holding the session), and
+                // the NEXT statement re-dials.
+                MarkBroken();
                 throw new SkaidbException($"read failed: {e.Message}", e);
             }
             if (read <= 0)
             {
-                _broken = true;
+                MarkBroken();
                 throw new SkaidbException("connection closed by server");
             }
             got += read;
@@ -1432,7 +1457,7 @@ public sealed class SkaidbConnection : DbConnection
                 // The server is not answering the stream contract, so there is
                 // no telling whether more frames follow; draining could block
                 // on one that never comes. Break the socket instead.
-                _broken = true;
+                MarkBroken();
                 throw new SkaidbException($"unexpected response tag {tag} to stream request");
             }
             uint ncols = first.U32();
@@ -1473,7 +1498,7 @@ public sealed class SkaidbConnection : DbConnection
                     // As above: an out-of-contract tag says nothing about what
                     // still follows, so do not wait around draining for it.
                     live = false;
-                    _broken = true;
+                    MarkBroken();
                     throw new SkaidbException($"unexpected frame tag {t} in stream");
                 }
             }
@@ -1487,14 +1512,14 @@ public sealed class SkaidbConnection : DbConnection
             int budget = StreamDrainFrames;
             while (live)
             {
-                if (budget-- == 0) { _broken = true; break; }
+                if (budget-- == 0) { MarkBroken(); break; }
                 try
                 {
                     BinReader r;
                     lock (_lock) { r = new BinReader(ReadFrame()); }
                     byte t = r.U8();
                     if (t == 7 || t == 3) live = false;
-                    else if (t != 6) { _broken = true; break; }
+                    else if (t != 6) { MarkBroken(); break; }
                 }
                 catch (Exception)
                 {
@@ -1503,7 +1528,7 @@ public sealed class SkaidbConnection : DbConnection
                     // here would bury the caller's own exception, or turn a
                     // plain `break` into one. Break the connection and let
                     // EnsureLive() re-dial on the next statement.
-                    _broken = true;
+                    MarkBroken();
                     break;
                 }
             }

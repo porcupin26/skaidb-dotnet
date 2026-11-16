@@ -575,6 +575,16 @@ public class TransactionTests
     private static string Cs(FakeServer srv, string timeout = "5") =>
         $"Host=127.0.0.1;Port={srv.Port};User=ada;Password=secret;Timeout={timeout}";
 
+    private static void WaitFor(Func<bool> condition, string what)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, what);
+            Thread.Sleep(20);
+        }
+    }
+
     /// <summary>Every way a body can run a statement on its connection, each a statement of its own.</summary>
     private static (string Way, Action Run)[] Ways(SkaidbConnection c)
     {
@@ -751,5 +761,60 @@ public class TransactionTests
         Assert.Single(s.Sockets.Distinct());
         Assert.True(c.IsUsable);
         Assert.Equal(1, srv.Live);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_read_timeout_inside_a_transaction_closes_the_socket_at_once(bool swallowed)
+    {
+        const string slow = "UPDATE accounts SET balance = 0 WHERE id = 9";
+        var s = new Standalone { Hold = sql => sql == slow };                    // never answered, the socket stays open
+        using var srv = new FakeServer(s.Handle);
+        using var c = new SkaidbConnection(Cs(srv, timeout: "1"));
+        c.Open();
+        SkaidbException? timedOut = null;
+        var e = Assert.Throws<SkaidbException>(() => c.Transaction(conn =>
+        {
+            Exec(conn, Update);
+            try { Exec(conn, slow); }
+            catch (SkaidbException x) when (swallowed) { timedOut = x; }
+        }));
+        Assert.Contains(swallowed ? "connection lost inside a transaction" : "read failed", e.Message);
+        if (swallowed) Assert.Contains("read failed", timedOut!.Message);
+        Assert.Equal(new[] { "BEGIN", Update, slow }, s.Log);                    // no ROLLBACK, no COMMIT: there is nowhere to send one
+        // The server is alive and still holds the session, its transaction
+        // and the rows it claimed. Nothing but closing the socket releases
+        // them, and the caller may not touch this connection again for hours.
+        WaitFor(() => srv.Live == 0, "the timed-out socket is still open, and the server still has its transaction");
+        Assert.Equal(1, srv.Connections);
+        Assert.False(c.IsUsable);
+        Assert.True(c.IsOpen);                                                   // broken, not closed: the next statement re-dials
+        Assert.Equal(7L, Scalar(c, "SELECT 1"));
+        Assert.Equal(2, srv.Connections);
+        Assert.True(c.IsUsable);
+    }
+
+    [Fact]
+    public void A_stream_abandoned_past_the_drain_budget_inside_a_transaction_ends_it_and_closes_the_socket()
+    {
+        const string big = "SELECT id FROM big";
+        var frames = new List<byte[]> { F.Header("id") };
+        for (int i = 0; i < 100; i++) frames.Add(F.Chunk(new object?[] { (long)i }));   // > 64-frame drain budget
+        frames.Add(F.End());
+        var s = new Standalone { Stream = _ => frames.ToArray() };
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        var e = Assert.Throws<SkaidbException>(() => c.Transaction(conn =>
+        {
+            Exec(conn, Update);
+            foreach (var _ in conn.Stream(big)) break;                           // gives the connection up: too much to drain
+        }));
+        Assert.Contains("connection lost inside a transaction", e.Message);
+        Assert.Equal(new[] { "BEGIN", Update, big }, s.Log);
+        WaitFor(() => srv.Live == 0, "the socket given up on is still open, and the server still has its transaction");
+        Assert.Equal(1, srv.Connections);
+        Assert.Equal(7L, Scalar(c, "SELECT 1"));
+        Assert.Equal(2, srv.Connections);
     }
 }
