@@ -151,8 +151,8 @@ public sealed class SkaidbConnection : DbConnection
     /// <summary>
     /// Above zero while <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>
     /// has a transaction open on the socket: EnsureLive then refuses to
-    /// re-dial instead of carrying the transaction's remaining statements
-    /// over to a connection that never saw its BEGIN.
+    /// re-dial, and OpenCore to dial, instead of carrying the transaction's
+    /// remaining statements over to a connection that never saw its BEGIN.
     /// </summary>
     private int _inTransaction;
 
@@ -478,6 +478,12 @@ public sealed class SkaidbConnection : DbConnection
     {
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (_open) return;
+        // The body of Transaction() closed the connection and is opening it
+        // again. What it would get is what the transparent re-dial is
+        // refused for (see EnsureLive): a connection that never saw the
+        // BEGIN, where the rest of the body applies statement by statement
+        // and the helper's COMMIT has nothing to commit.
+        if (_inTransaction > 0) throw LostInTransaction();
         _broken = false;   // whatever broke the old socket died with it
         if (AuthMechanism == SkaidbAuthMechanism.Certificate && _tlsClientCert.Length == 0)
             throw new SkaidbException(
@@ -748,7 +754,8 @@ public sealed class SkaidbConnection : DbConnection
     /// instead of re-dialing as it would outside the helper, because a new
     /// connection is in autocommit and would apply the remaining statements
     /// one by one. The connection re-dials on the next statement after the
-    /// helper has returned.</para>
+    /// helper has returned. <see cref="Open"/> is refused the same way for
+    /// a body that closed the connection itself.</para>
     /// <para>The body is synchronous, like the driver's I/O: the commit is
     /// sent when it returns, so a body that returns a task is refused before
     /// anything is sent. A <see cref="Stream(string, SkaidbConsistency?)"/>
@@ -1012,10 +1019,7 @@ public sealed class SkaidbConnection : DbConnection
         // apply on its own. So the statement fails, as one in flight when
         // the transport dies does, and the re-dial waits for the next
         // statement after the helper has returned.
-        if (_inTransaction > 0)
-            throw new SkaidbException(
-                "connection lost inside a transaction: it is not re-dialed until the transaction is over, "
-                + "because a new connection would run the remaining statements in autocommit");
+        if (_inTransaction > 0) throw LostInTransaction();
         _prepared.Clear();
         CleanupSocket();
         // Open() is idempotent and returns early while _open is set, so the
@@ -1034,6 +1038,15 @@ public sealed class SkaidbConnection : DbConnection
             throw;
         }
     }
+
+    /// <summary>
+    /// What a statement, or <see cref="Open"/>, throws when it would need a
+    /// new connection in the middle of <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>.
+    /// </summary>
+    private static SkaidbException LostInTransaction() =>
+        new SkaidbException(
+            "connection lost inside a transaction: it is not re-dialed until the transaction is over, "
+            + "because a new connection would run the remaining statements in autocommit");
 
     /// <summary>
     /// Refuse a request while a <see cref="Stream(string, SkaidbConsistency?)"/>

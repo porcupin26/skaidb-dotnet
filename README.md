@@ -315,7 +315,9 @@ attempt and returns it afterwards; the body uses the connection it is
 handed, never the pool. A transport failure is the usual connection error
 and is not retried — inside `Transaction()` that includes a connection the
 server closed between two statements, where the next statement throws
-instead of re-dialing.
+instead of re-dialing. A body cannot reconnect its way past that either:
+`Open()` inside it throws the same error, since the connection it would
+dial never saw the `BEGIN`.
 
 A [`Stream()`](docs/streaming.md) the body starts must be finished or
 disposed in the body. One it leaves open holds the connection, so neither

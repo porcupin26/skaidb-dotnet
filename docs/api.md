@@ -141,8 +141,10 @@ Between `begin` and the end of the transaction the connection does not
 re-dial: a statement that finds the socket closed (see step 1 under
 [`SkaidbCommand`](#skaidbcommand)) throws `connection lost inside a
 transaction: …` instead, because a new connection is in autocommit and would
-apply the remaining statements one by one. The next statement after the
-helper has returned re-dials as usual.
+apply the remaining statements one by one. `Open()` throws the same when the
+body closed the connection itself: nothing is dialed inside a transaction.
+The next statement after the helper has returned re-dials as usual (after a
+`Close()` in the body, `Open()` comes first, as after any `Close()`).
 
 The body is synchronous. A `Stream()` started in it is enumerated in it, not
 returned from it. One the body leaves open — started, and neither run out

@@ -712,6 +712,43 @@ public class TransactionTests
     }
 
     [Fact]
+    public void A_connection_the_body_closed_cannot_be_opened_again_to_take_the_rest_of_the_transaction()
+    {
+        const string second = "UPDATE accounts SET balance = balance + 100 WHERE id = 2";
+        const string third = "UPDATE audit SET n = n + 1 WHERE id = 1";
+        var s = new Standalone { Drop = sql => sql == second };
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        SkaidbException? reopen = null, three = null;
+        var lost = Assert.Throws<SkaidbException>(() => c.Transaction(conn =>
+        {
+            Exec(conn, Update);
+            try { Exec(conn, second); }
+            catch (SkaidbException)
+            {
+                // "Reconnect and carry on": what Open() would dial never saw
+                // the BEGIN, so the rest of the body would autocommit on it.
+                conn.Close();
+                reopen = Assert.Throws<SkaidbException>(() => conn.Open());
+            }
+            try { Exec(conn, third); }
+            catch (SkaidbException e) { three = e; }
+            return "the body returned";
+        }));
+        Assert.Contains("connection lost inside a transaction", reopen!.Message);
+        Assert.Equal("connection is not open", three!.Message);
+        Assert.Equal("connection is not open", lost.Message);                    // the helper's COMMIT: not the body's value
+        Assert.Equal(new[] { "BEGIN", Update, second }, s.Log);                  // neither the statement nor a COMMIT
+        Assert.Equal(1, srv.Connections);                                        // and nothing was dialed for them
+        // The transaction is over: the connection is closed, as the body
+        // left it, and opens like any other.
+        Assert.False(c.IsOpen);
+        c.Open();
+        Assert.Equal(7L, Scalar(c, "SELECT 1"));
+        Assert.Equal(2, srv.Connections);
+    }
+
+    [Fact]
     public void The_opening_statement_re_dials_a_connection_the_server_closed_while_it_sat_idle()
     {
         var s = new Standalone();
