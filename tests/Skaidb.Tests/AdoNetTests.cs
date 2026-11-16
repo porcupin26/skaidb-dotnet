@@ -171,7 +171,7 @@ public class AdoNetTests
     // ---- transactions + errors ----------------------------------------------------
 
     [Fact]
-    public void Transactions_are_not_supported_and_errors_are_DbExceptions()
+    public void BeginTransaction_is_not_supported_and_errors_are_DbExceptions()
     {
         var s = new Scripted().Answer("SELECT nope", F.Error("unknown column: nope"));
         using var srv = new FakeServer(s.Handle);
