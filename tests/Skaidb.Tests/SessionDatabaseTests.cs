@@ -94,6 +94,12 @@ public class SessionDatabaseTests
         return (long)cmd.ExecuteScalar()!;
     }
 
+    /// <summary>The Async methods complete synchronously (the driver's I/O is synchronous).</summary>
+    private static void Wait(System.Threading.Tasks.Task<int> done)
+    {
+        done.GetAwaiter().GetResult();
+    }
+
     /// <summary>
     /// The server closes every connection while the client sits idle, as a
     /// restart does; returns once <paramref name="c"/>'s socket has seen it.
@@ -199,5 +205,135 @@ public class SessionDatabaseTests
         Assert.Equal(3L, Rows(c));
         Assert.Equal("app", d.Log[^1].Database);
         Assert.True(c.IsUsable);
+    }
+
+    // ---- a USE sent as a statement ----------------------------------------------------
+
+    [Theory]
+    [InlineData("USE app", "app")]
+    [InlineData("use app", "app")]
+    [InlineData("USE DATABASE app", "app")]
+    [InlineData("Use Database \"app\"", "app")]
+    [InlineData("  USE\tapp ;\n", "app")]
+    [InlineData("USE \"app\";", "app")]
+    [InlineData("USE App", "App")]                                               // the name as written: another database than app
+    [InlineData("USE \"we\"\"ird db\"", "we\"ird db")]
+    public void A_database_entered_with_a_USE_statement_is_entered_again_after_a_re_dial(string use, string database)
+    {
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv));
+        c.Open();
+        Assert.Equal(0, Exec(c, use));
+        BothStatementsRunInItAfterARedial(srv, d, c, database);
+    }
+
+    [Theory]
+    [InlineData("ExecuteScalar")]
+    [InlineData("ExecuteReader")]
+    [InlineData("ExecuteNonQueryAsync")]
+    [InlineData("DbBatch")]
+    [InlineData("Stream")]
+    public void A_USE_is_noted_whichever_way_the_statement_is_run(string way)
+    {
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv, "Database=other"));           // and it replaces the connection string's
+        c.Open();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "USE app";
+        switch (way)
+        {
+            case "ExecuteScalar":
+                Assert.Null(cmd.ExecuteScalar());
+                break;
+            case "ExecuteReader":
+                using (var r = cmd.ExecuteReader()) Assert.False(r.Read());
+                break;
+            case "ExecuteNonQueryAsync":
+                Wait(cmd.ExecuteNonQueryAsync());
+                break;
+            case "DbBatch":
+                using (var batch = c.CreateBatch())
+                {
+                    batch.BatchCommands.Add("USE app");
+                    batch.BatchCommands.Add(Count);
+                    Assert.Equal(3L, batch.ExecuteScalar());
+                }
+                break;
+            default:
+                Assert.Empty(c.Stream("USE app").ToList());
+                break;
+        }
+        BothStatementsRunInItAfterARedial(srv, d, c, "app");
+    }
+
+    [Fact]
+    public void The_last_database_entered_is_the_one_entered_again_and_a_refused_USE_changes_nothing()
+    {
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv, "Database=other"));
+        c.Open();
+        Exec(c, "USE app");
+        c.ChangeDatabase("other");
+        Exec(c, "USE app");
+        // The server said no: the session is where it was, and so is the driver.
+        Assert.Equal("database \"nope\" does not exist", Assert.Throws<SkaidbException>(() => Exec(c, "USE nope")).Message);
+        Assert.Equal("database \"nope\" does not exist", Assert.Throws<SkaidbException>(() => c.ChangeDatabase("nope")).Message);
+        BothStatementsRunInItAfterARedial(srv, d, c, "app");
+    }
+
+    [Theory]
+    [InlineData("USE app; SELECT 1")]                                            // two statements
+    [InlineData("USE app extra")]
+    [InlineData("USE a.b")]
+    [InlineData("USE 'app'")]
+    [InlineData("USE \"app")]                                                    // the quote never closes
+    [InlineData("USE \"\"")]                                                     // no name in it
+    [InlineData("USE")]
+    [InlineData("USE DATABASE")]                                                 // a keyword, or a database called database?
+    [InlineData("-- into app\nUSE app")]
+    [InlineData("EXPLAIN USE app")]
+    [InlineData("SELECT 'USE app'")]
+    [InlineData("USEFUL app")]
+    public void A_statement_that_is_not_exactly_one_USE_is_left_alone(string sql)
+    {
+        // The fake answers each of these with success, and still the driver
+        // takes nothing from a text it cannot read as one USE.
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv, "Database=other"));
+        c.Open();
+        Exec(c, sql);
+        Assert.Equal("other", c.Database);
+        LoseWhileIdle(srv, c);
+        Assert.Equal(7L, Rows(c));
+        Assert.Equal(new[] { "USE \"other\"", Count }, d.Log.TakeLast(2).Select(l => l.Sql));
+    }
+
+    [Fact]
+    public void When_a_database_entered_with_USE_cannot_be_entered_again_the_statement_fails_with_that_error()
+    {
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv));
+        c.Open();
+        Exec(c, "USE app");
+        NothingRunsElsewhereWhileItCannotBeEntered(srv, d, c);
+    }
+
+    // ---- a pool and its borrowers -----------------------------------------------------
+
+    [Fact]
+    public void A_pooled_connection_that_re_dials_enters_the_database_its_borrower_entered_with_USE()
+    {
+        var d = new Databases();
+        using var srv = new FakeServer(d.Handle);
+        using var pool = new SkaidbConnectionPool(Cs(srv, "Database=app"));
+        var c = pool.Acquire();
+        Exec(c, "USE other");
+        BothStatementsRunInItAfterARedial(srv, d, c, "other");                   // not back in the pool's app, mid-checkout
+        pool.Release(c);
     }
 }

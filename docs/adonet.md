@@ -74,7 +74,8 @@ The full key table is in [api.md](api.md#constructors).
   `Close()`.
 - `ConnectionString` can be changed only while closed.
 - `ChangeDatabase(name)` runs `USE` and makes it the database for every
-  later dial.
+  later dial; a `USE` statement the server accepted does the same, and
+  `Database` reports it.
 - `ServerVersion` is empty: the protocol does not report it.
 
 ## Commands and parameters

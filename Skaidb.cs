@@ -391,7 +391,12 @@ public sealed class SkaidbConnection : DbConnection
     public IReadOnlyList<string> Seeds { get; private set; } = Array.Empty<string>();
 
     private string _database = "";
-    /// <summary>Session database, selected with USE right after connecting (and after every re-dial).</summary>
+    /// <summary>
+    /// The session database: the connection string's <c>Database</c>, or the
+    /// one entered last since, with <see cref="ChangeDatabase"/> or with a
+    /// <c>USE</c> statement the server accepted. It is selected with USE
+    /// right after connecting, and again after every re-dial.
+    /// </summary>
     public override string Database => _database;
     /// <summary>The seed list, comma-separated.</summary>
     public override string DataSource => string.Join(",", Seeds);
@@ -1777,7 +1782,79 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     private void NoteStatement(string sql)
     {
+        // A USE the server accepted moved the session. The database is
+        // session state, gone with the socket: noted here, the next dial
+        // enters it again before anything else is sent (OpenCore). Not
+        // noted, the statements after a re-dial would run against the
+        // tables of the same names in whatever database a new session
+        // starts in.
+        if (TryReadUse(sql, out string? database)) _database = database;
         if (Pool is not null && SkaidbConnectionPool.IsWrite(sql)) Pool.Wrote(this);
+    }
+
+    /// <summary>
+    /// The database <paramref name="sql"/> enters when it is exactly one
+    /// <c>USE [DATABASE] name</c> statement: the name bare (a letter or
+    /// <c>_</c>, then letters, digits and <c>_</c>) or in double quotes with
+    /// <c>""</c> for a quote inside, an optional <c>;</c> behind it. Any
+    /// other text — a second statement, a comment, a qualified name,
+    /// <c>USE DATABASE</c> with nothing behind it — is not read as one, and
+    /// the session database the connection knows is left alone.
+    /// </summary>
+    internal static bool TryReadUse(string sql, [NotNullWhen(true)] out string? database)
+    {
+        database = null;
+        int i = 0, n = sql.Length;
+        while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        if (n - i < 3 || string.Compare(sql, i, "USE", 0, 3, StringComparison.OrdinalIgnoreCase) != 0) return false;
+        i += 3;
+        // Behind the keyword: whitespace, or the quote that opens the name.
+        if (i >= n || !(char.IsWhiteSpace(sql[i]) || sql[i] == '"')) return false;
+        if (!ReadName(sql, ref i, out string? name, out bool quoted)) return false;
+        if (!quoted && name.Equals("DATABASE", StringComparison.OrdinalIgnoreCase))
+        {
+            // USE DATABASE name. With no name behind it the word is the
+            // keyword or a database called that: not for the driver to say.
+            if (!ReadName(sql, ref i, out name, out _)) return false;
+        }
+        while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        if (i < n && sql[i] == ';') i++;
+        while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        if (i != n) return false;
+        database = name;
+        return true;
+    }
+
+    /// <summary>One identifier at <paramref name="i"/>, past any whitespace: bare, or in double quotes.</summary>
+    private static bool ReadName(string sql, ref int i, [NotNullWhen(true)] out string? name, out bool quoted)
+    {
+        name = null;
+        quoted = false;
+        int n = sql.Length;
+        while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        if (i >= n) return false;
+        if (sql[i] == '"')
+        {
+            quoted = true;
+            var sb = new StringBuilder();
+            i++;
+            while (true)
+            {
+                if (i >= n) return false;                                    // the quote never closes
+                char ch = sql[i++];
+                if (ch != '"') { sb.Append(ch); continue; }
+                if (i < n && sql[i] == '"') { sb.Append('"'); i++; continue; }   // "" is a quote inside the name
+                break;
+            }
+            if (sb.Length == 0) return false;
+            name = sb.ToString();
+            return true;
+        }
+        int start = i;
+        if (!(char.IsLetter(sql[i]) || sql[i] == '_')) return false;
+        while (i < n && (char.IsLetterOrDigit(sql[i]) || sql[i] == '_')) i++;
+        name = sql.Substring(start, i - start);
+        return true;
     }
 
     /// <summary>

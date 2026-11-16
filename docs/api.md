@@ -40,7 +40,7 @@ an invalid value throws `SkaidbException`):
 | `Seeds` | | — | Comma-separated `host:port` list; overrides `Host`/`Port`. Shuffled on every connect. |
 | `Username` | `User`, `UserId`, `User Id`, `Uid` | `anonymous` | |
 | `Password` | `Pwd` | `""` | Empty skips mutual authentication (anonymous). |
-| `Database` | `Db` | `""` | `USE "<database>"` after every (re)connect. |
+| `Database` | `Db` | `""` | `USE "<database>"` after every (re)connect; the property follows `ChangeDatabase()` and `USE` statements (see [`ChangeDatabase`](#changedatabasestring-name)). |
 | `Consistency` | | `Quorum` | `One`/`Quorum`/`All` or `0`/`1`/`2`, case-insensitive. |
 | `Timeout` | `ConnectTimeout`, `Connect Timeout` | `10` | Seconds (decimals allowed). Connect, and every socket read/write. |
 | `Tls` | | `false` | `true`/`1`: TLS with the system trust store. |
@@ -107,6 +107,19 @@ A batch bound to this connection; see [adonet.md](adonet.md#dbbatch).
 ### `ChangeDatabase(string name)`
 
 Runs `USE "<name>"` now when open, and on every later dial.
+
+A `USE` sent as a statement does the same. When the server has accepted a
+statement that is exactly `USE [DATABASE] <name>` — the name bare or in
+double quotes (`""` for a quote inside), an optional `;` behind it —
+`Database` becomes that name, and every later dial enters it before
+anything else is sent: a re-dial does not drop the session back into the
+default database. A text the driver cannot read as one such statement (a
+second statement behind it, a comment, `USE DATABASE` alone) changes
+nothing it knows; use `ChangeDatabase()` there. If the database cannot be
+entered on a new connection (it was dropped meanwhile), the statement that
+needed the dial throws that error and is not sent, and so does every
+statement after it until the database exists again or the connection is
+closed and pointed elsewhere.
 
 ### `Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")` → `T`
 

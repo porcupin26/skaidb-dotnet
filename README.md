@@ -114,7 +114,7 @@ from the builder).
 | `Seeds` | | — | `db1:7000,db2:7000`; an explicit seed list that overrides `Host`/`Port`. Shuffled on every connect. |
 | `Username` | `User`, `User Id`, `UserId`, `Uid` | `anonymous` | User name. |
 | `Password` | `Pwd` | *(empty)* | Password. Empty means anonymous; mutual authentication is skipped. |
-| `Database` | `Db` | — | Selected with `USE` after every (re)connect. |
+| `Database` | `Db` | — | Selected with `USE` after every (re)connect — it, or the database entered last since (`ChangeDatabase()`, a `USE` statement). |
 | `Consistency` | | `Quorum` | `One`, `Quorum` or `All` (or `0`/`1`/`2`); the default for every command. |
 | `Timeout` | `Connect Timeout`, `ConnectTimeout` | `10` | Seconds; applies to the connect and to every socket read and write. |
 | `Tls`, `TlsCa`, `TlsInsecure`, `TlsServerName` | | | See [TLS](#tls). |
@@ -557,8 +557,12 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   false. Its socket is closed there and then, so a server that is still on
   the other end — a read that timed out — drops the session and whatever
   transaction a `BEGIN` opened on it. The next statement **re-dials** (through
-  the seed walk), re-authenticates, re-sends `USE <database>`, re-sends the
-  Hello frame and clears the prepared-statement cache. Because the failed
+  the seed walk), re-authenticates, re-sends the Hello frame, enters the
+  session's database again and clears the prepared-statement cache. That
+  database is the connection string's `Database`, or the one entered last
+  since, with `ChangeDatabase()` or with a `USE` statement the server
+  accepted; if it cannot be entered on the new connection the statement
+  fails with that error and is not sent. Because the failed
   statement *may* have executed, the driver never retries it for you: retry a
   write only if it is idempotent.
 - A connection the server closed while it sat **idle** is detected before

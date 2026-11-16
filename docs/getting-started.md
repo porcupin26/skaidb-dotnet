@@ -74,6 +74,8 @@ is how the array above gets through; it has no SQL literal form.
 
 `Database=app` runs `USE app` right after the handshake (and after every
 reconnect). Without it, statements run in the server's default database.
+`conn.ChangeDatabase("other")` or a `USE other` statement moves the session,
+and from then on that is the database a reconnect enters.
 
 ## Anonymous connections
 
