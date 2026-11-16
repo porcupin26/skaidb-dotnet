@@ -712,6 +712,24 @@ public class ClientTests
     }
 
     [Fact]
+    public void A_frame_over_the_size_limit_drops_the_connection_instead_of_leaving_its_payload_to_the_next_statement()
+    {
+        var s = new Scripted().Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }));
+        s.Script["SELECT huge"] = (_, conn) =>
+        {
+            // A header announcing 256 MiB and the first bytes of that
+            // payload, which happen to read as a whole Ddl frame.
+            conn.Sock.Send(new byte[] { 0x10, 0, 0, 0, 0, 0, 0, 1, 2 });
+            return Array.Empty<byte[]>();
+        };
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        Assert.Contains("frame too large", Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT huge")).Message);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));                         // its own reply, not the bytes left behind
+        Assert.Equal(2, srv.Connections);                                  // read on a new connection: the old one was dropped
+    }
+
+    [Fact]
     public void A_connection_the_server_dropped_is_redialled_and_the_prepared_cache_reset()
     {
         int prepares = 0;

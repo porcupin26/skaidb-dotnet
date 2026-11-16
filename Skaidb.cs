@@ -1119,7 +1119,12 @@ public sealed class SkaidbConnection : DbConnection
         byte[] head = ReadExact(4);
         uint length = BinaryPrimitives.ReadUInt32BigEndian(head); // length is BIG-endian
         if (length > 64 * 1024 * 1024)
+        {
+            // The payload stays on the socket, unread: whatever is read next
+            // would be taken from the middle of it.
+            MarkBroken();
             throw new SkaidbException($"frame too large: {length} bytes");
+        }
         return ReadExact((int)length);
     }
 

@@ -570,7 +570,8 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   (`no reachable endpoint in …`) from the statement that tried it and leaves
   the connection broken, so each statement dials again and the first one
   after the server is back runs.
-- **Protocol desync** (an unexpected frame): the driver drops the connection
+- **Protocol desync** (an unexpected frame in a stream, or a frame over the
+  64 MiB limit, `frame too large: …`): the driver drops the connection
   (`IsUsable` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.
 - `Close()` releases the socket and `Open()` dials again; `Dispose()` is
