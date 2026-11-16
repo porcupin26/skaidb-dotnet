@@ -103,6 +103,18 @@ public sealed class SkaidbTransactionConflictException : SkaidbException
     internal const string Prefix = "transaction conflict:";
 
     public SkaidbTransactionConflictException(string message) : base(message) { }
+
+    /// <summary>
+    /// True: running the transaction again may succeed with nothing else
+    /// changed, which is what a provider-agnostic retry layer asks of a
+    /// <see cref="DbException"/>. The unit to run again is the whole
+    /// transaction; sending only the refused <c>COMMIT</c> again is
+    /// answered with an error (<c>no transaction in progress</c>), never
+    /// with a success. Every other <see cref="SkaidbException"/> is not
+    /// transient: a statement error is not cured by a retry, and a
+    /// statement lost with its connection may have run.
+    /// </summary>
+    public override bool IsTransient => true;
 }
 
 /// <summary>

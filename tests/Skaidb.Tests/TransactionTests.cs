@@ -136,6 +136,39 @@ public class TransactionTests
     // ---- the typed error ---------------------------------------------------------
 
     [Fact]
+    public void A_transaction_conflict_is_transient_and_its_COMMIT_sent_again_alone_cannot_report_success()
+    {
+        // DbException.IsTransient tells a provider-agnostic retry layer
+        // that doing the work again may succeed. For a conflict it does:
+        // the other writer is done, and the transaction run again reads
+        // the rows as they are now.
+        var d = new Sessions { Refuse = (sql, _) => sql == "COMMIT -- refused" ? Conflict : null };
+        using var srv = new FakeServer(d.Handle);
+        using var c = Connect(srv);
+        Exec(c, "BEGIN");
+        Exec(c, "INSERT INTO notes (id, body) VALUES (1, 'x')");
+        DbException conflict = Assert.Throws<SkaidbTransactionConflictException>(() => Exec(c, "COMMIT -- refused"));
+        Assert.True(conflict.IsTransient);
+
+        // What made it safe to say so: a layer that only sends the failed
+        // COMMIT again does not get a success for a transaction that never
+        // committed. The transaction is over, and the server says that.
+        DbException again = Assert.Throws<SkaidbException>(() => Exec(c, "COMMIT"));
+        Assert.Equal("constraint violation: no transaction in progress", again.Message);
+        Assert.False(again.IsTransient);
+        Assert.Empty(d.Ids("default"));
+
+        // No other error claims it: a statement error is not cured by a
+        // retry, and a statement lost with its connection may have run.
+        d.Drop = sql => sql == "SELECT 1";
+        DbException lost = Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT 1"));
+        Assert.Contains("connection closed by server", lost.Message);
+        Assert.False(lost.IsTransient);
+        Assert.False(new SkaidbException("table \"t\" does not exist").IsTransient);
+        Assert.False(new UnpreparableException("statement kind cannot be prepared").IsTransient);
+    }
+
+    [Fact]
     public void A_transaction_conflict_is_typed_on_every_path_stays_a_SkaidbException_and_keeps_the_connection()
     {
         const string prepared = "UPDATE t SET v = ? WHERE id = 1";

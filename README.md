@@ -618,7 +618,9 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
 - A **transaction conflict** (a server error starting with `transaction
   conflict:`, the answer to a refused `COMMIT`) is a statement error with
   its own type, `SkaidbTransactionConflictException`: see
-  [Transactions](#transactions).
+  [Transactions](#transactions). It is the one error whose
+  `DbException.IsTransient` is true — run the transaction again, not just
+  the `COMMIT`.
 - **Transport errors** throw `read failed: …` / `write failed: …` /
   `connection closed by server` from the in-flight statement and mark the
   connection *broken*, not closed: `IsOpen` stays true, `IsUsable` turns

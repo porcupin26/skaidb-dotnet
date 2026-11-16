@@ -457,7 +457,13 @@ stream. `Message` is the server's message, unchanged; only the prefix is
 matched. Nothing was applied, the transaction is over and the connection is
 back in autocommit and usable (to a pool it is a round trip that succeeded,
 not a failure of the member), so running the whole transaction again is
-safe; `Transaction()` does.
+safe; `Transaction()` does. It is the one exception whose
+`DbException.IsTransient` is true: a provider-agnostic retry layer may run
+the unit of work again. The unit is the transaction — the refused `COMMIT`
+sent again alone is answered `no transaction in progress`, an error, never
+a success. Every other `SkaidbException` reports false: a statement error
+is not cured by a retry, and a statement lost with its connection may have
+run.
 `UnpreparableException : SkaidbException` is what `ExecuteBatch` throws for a
 statement kind the server will not prepare (the `Execute*` methods handle it
 internally by falling back to text).
