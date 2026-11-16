@@ -132,6 +132,12 @@ That includes the `COMMIT` and the `ROLLBACK` of
 open makes the helper throw and close the socket, the one way left to end
 the transaction on the server.
 
+A transaction also lives on its connection, so a stream disposed early with
+more than 64 frames still to come ends the transaction it was started in:
+the driver drops the connection, the helper throws `connection lost inside a
+transaction: …` and nothing is committed. Inside `conn.Transaction()` read a
+stream to its end, or bound it with a `LIMIT`.
+
 Do not return the enumerable out of `SkaidbConnectionPool.WithConnection`:
 it is lazy, and the connection would go back to the pool before the first
 row is read. Enumerate inside the callback.
