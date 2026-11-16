@@ -167,6 +167,33 @@ public sealed class SkaidbConnection : DbConnection
     private int _inTransaction;
 
     /// <summary>
+    /// A transaction is open on the socket, as far as the statements that
+    /// went by say: the server accepted a statement whose first word is
+    /// <c>BEGIN</c>, and has not answered a <c>COMMIT</c> or a
+    /// <c>ROLLBACK</c> since (see NoteStatement). Session state like the
+    /// database, with one difference: a new connection cannot be given it
+    /// back. So while it is set a lost connection is not replaced — every
+    /// statement fails instead of running on a session that has no
+    /// transaction (PROTOCOL.md 6, rule 7) — until the application ends the
+    /// transaction (see BeforeStatement). The helper's own BEGIN sets it like
+    /// any other; the helper clears it when it returns.
+    /// </summary>
+    private bool _transaction;
+
+    /// <summary>What a statement is to a transaction.</summary>
+    internal enum TransactionStatement
+    {
+        /// <summary>Nothing: an ordinary statement.</summary>
+        None,
+        /// <summary>Its first word is <c>BEGIN</c>.</summary>
+        Begin,
+        /// <summary>Exactly <c>COMMIT [TRANSACTION]</c>.</summary>
+        Commit,
+        /// <summary>Exactly <c>ROLLBACK [TRANSACTION]</c>.</summary>
+        Rollback,
+    }
+
+    /// <summary>
     /// A <see cref="Stream(string, SkaidbConsistency?)"/> in flight (with or
     /// without parameters): the claim it holds on the socket it was opened
     /// on, until RowsEnd/Error. It reads that socket and no other.
@@ -857,11 +884,13 @@ public sealed class SkaidbConnection : DbConnection
     /// <para>A transport failure is the usual connection error and is not
     /// retried. That includes a connection the server closed between two
     /// statements of the transaction: the statement that finds out throws
-    /// instead of re-dialing as it would outside the helper, because a new
-    /// connection is in autocommit and would apply the remaining statements
-    /// one by one. The connection re-dials on the next statement after the
-    /// helper has returned. <see cref="Open"/> is refused the same way for
-    /// a body that closed the connection itself.</para>
+    /// instead of re-dialing as it would outside a transaction, because a
+    /// new connection is in autocommit and would apply the remaining
+    /// statements one by one. The connection re-dials on the next statement
+    /// after the helper has returned. <see cref="Open"/> is refused the same
+    /// way for a body that closed the connection itself. (A transaction the
+    /// application writes itself, with a <c>BEGIN</c> statement, is held to
+    /// its socket the same way until its <c>COMMIT</c> or <c>ROLLBACK</c>.)</para>
     /// <para>The body is synchronous, like the driver's I/O: the commit is
     /// sent when it returns, so a body that returns a task is refused before
     /// anything is sent. A <see cref="Stream(string, SkaidbConsistency?)"/>
@@ -919,6 +948,9 @@ public sealed class SkaidbConnection : DbConnection
             finally
             {
                 _inTransaction--;
+                // The helper's transaction is over, however this was left:
+                // answered, or gone with a socket closed above or below.
+                if (_inTransaction == 0) _transaction = false;
                 // A stream the body started and neither ran out nor disposed
                 // still holds the connection: no COMMIT and no ROLLBACK could
                 // be sent past it, so the transaction is open on the server,
@@ -1090,6 +1122,9 @@ public sealed class SkaidbConnection : DbConnection
         _setConsistency = null;
         _setScanBudget = null;
         _databasePending = false;
+        // And a transaction a BEGIN opened on it: the server discards it
+        // with the connection, as the application that closes one expects.
+        _transaction = false;
         CleanupSocket();
         // Closed while checked out instead of released: the pool stops
         // counting it against its member.
@@ -1121,7 +1156,17 @@ public sealed class SkaidbConnection : DbConnection
     /// driver can read is sent on a new connection without first entering
     /// the database the session was in.
     /// </param>
-    internal void EnsureLive(string? sql = null)
+    internal void EnsureLive(string? sql = null) => BeforeStatement(sql, mayAnswer: false);
+
+    /// <summary>
+    /// <see cref="EnsureLive"/> for a statement that is about to be run.
+    /// True when it has been answered here, with success, and must not be
+    /// sent: the <c>ROLLBACK</c> of a transaction that was lost with its
+    /// connection.
+    /// </summary>
+    internal bool Answered(string sql) => BeforeStatement(sql, mayAnswer: true);
+
+    private bool BeforeStatement(string? sql, bool mayAnswer)
     {
         // Re-dialling would swap the socket out from under an in-flight
         // stream, so refuse before the caller loses frames. Unlocked
@@ -1143,15 +1188,39 @@ public sealed class SkaidbConnection : DbConnection
             // Live, but dialed for a USE that was then refused: the session
             // is not in its database. Any other statement enters it first.
             if (_databasePending && !use && _open) EnterDatabase();
-            return;
+            return false;
         }
         // A transaction lives on the socket that opened it. Re-dialling in
-        // the middle of Transaction() would send the rest of the body, and
-        // its COMMIT, to a connection in autocommit: each statement would
-        // apply on its own. So the statement fails, as one in flight when
-        // the transport dies does, and the re-dial waits for the next
-        // statement after the helper has returned.
-        if (_inTransaction > 0) throw LostInTransaction();
+        // the middle of one — the helper's, or one the application began
+        // with a BEGIN of its own — would send its remaining statements,
+        // and its COMMIT, to a connection in autocommit: each statement
+        // would apply on its own. So the statement fails, as one in flight
+        // when the transport dies does, and nothing is dialed until the
+        // transaction is over: the helper has returned, or the application
+        // has ended it. Its ROLLBACK is answered here, with success — the
+        // server discarded the transaction with the connection, which is
+        // all a ROLLBACK asks for; its COMMIT fails, saying what became of
+        // the transaction. Neither is sent, and either one ends it.
+        if (_inTransaction > 0 || _transaction)
+        {
+            if (mayAnswer && sql is not null)
+            {
+                switch (ReadTransaction(sql))
+                {
+                    case TransactionStatement.Rollback:
+                        _transaction = false;
+                        return true;
+                    // Only of a transaction still noted open: nothing was
+                    // sent to commit it. (Inside the helper, a body that
+                    // ended the transaction itself leaves nothing to say
+                    // about what a COMMIT of its own became.)
+                    case TransactionStatement.Commit when _transaction:
+                        _transaction = false;
+                        throw NothingCommitted();
+                }
+            }
+            throw LostInTransaction();
+        }
         _prepared.Clear();
         CleanupSocket();
         // Open() is idempotent and returns early while _open is set, so the
@@ -1174,16 +1243,82 @@ public sealed class SkaidbConnection : DbConnection
             _broken = true;
             throw;
         }
+        return false;
     }
 
     /// <summary>
     /// What a statement, or <see cref="Open"/>, throws when it would need a
-    /// new connection in the middle of <see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>.
+    /// new connection in the middle of a transaction: the helper's
+    /// (<see cref="Transaction{T}(Func{SkaidbConnection, T}, int, string)"/>)
+    /// or one the application began itself.
     /// </summary>
     private static SkaidbException LostInTransaction() =>
         new SkaidbException(
             "connection lost inside a transaction: it is not re-dialed until the transaction is over, "
             + "because a new connection would run the remaining statements in autocommit");
+
+    /// <summary>What the <c>COMMIT</c> of a transaction that was lost with its connection throws. It was not sent.</summary>
+    private static SkaidbException NothingCommitted() =>
+        new SkaidbException(
+            "connection lost inside a transaction: nothing was committed, the server discarded the "
+            + "transaction with the connection (the COMMIT was not sent)");
+
+    /// <summary>
+    /// A transaction statement — <paramref name="sent"/>, a <c>COMMIT</c> or
+    /// a <c>ROLLBACK</c> with a transaction noted open — failed with
+    /// <paramref name="failure"/>. Either way the transaction is over.
+    /// Returns what to throw, or null when the failure is the answer the
+    /// statement asked for.
+    /// </summary>
+    /// <remarks>
+    /// An Error the server answered ended the transaction (rule 6: a
+    /// refused COMMIT applied nothing) and is thrown as it is. A connection
+    /// lost under the statement leaves no answer: for a COMMIT the outcome
+    /// is unknown — the server may have applied it before its reply went
+    /// missing — and the error says so; for a ROLLBACK it makes no
+    /// difference whether the server read it or only lost the connection,
+    /// the transaction is discarded, which is success.
+    /// </remarks>
+    private SkaidbException? TransactionOver(string sent, SkaidbException failure)
+    {
+        if (!_transaction) return failure;
+        var word = ReadTransaction(sent);
+        if (word != TransactionStatement.Commit && word != TransactionStatement.Rollback) return failure;
+        _transaction = false;
+        if (!_broken) return failure;
+        if (word == TransactionStatement.Rollback) return null;
+        return new SkaidbException(
+            "connection lost under COMMIT: the outcome is unknown, the server may have committed the "
+            + "transaction before its reply was lost (" + failure.Message + ")", failure);
+    }
+
+    /// <summary>
+    /// What <paramref name="sql"/> is to a transaction, read the way the
+    /// server reads it: keywords in any case, an optional <c>;</c> behind
+    /// the statement, <c>--</c> comments skipped. A statement whose first
+    /// word is <c>BEGIN</c> opens one (<c>BEGIN</c>, <c>BEGIN
+    /// TRANSACTION</c>, <c>BEGIN ATOMIC …</c>); only a text that is exactly
+    /// <c>COMMIT [TRANSACTION]</c> or <c>ROLLBACK [TRANSACTION]</c> ends one.
+    /// </summary>
+    internal static TransactionStatement ReadTransaction(string sql)
+    {
+        int i = 0, n = sql.Length;
+        while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        // Nearly every statement stops here.
+        if (i >= n || !(sql[i] is 'B' or 'b' or 'C' or 'c' or 'R' or 'r' or '-')) return TransactionStatement.None;
+        string text = (sql.IndexOf("--", i, StringComparison.Ordinal) >= 0 ? WithoutLineComments(sql) : sql).Trim();
+        if (text.EndsWith(';')) text = text.Substring(0, text.Length - 1).TrimEnd();
+        int end = 0;
+        while (end < text.Length && !char.IsWhiteSpace(text[end])) end++;
+        string first = text.Substring(0, end);
+        static bool Is(string word, string keyword) => word.Equals(keyword, StringComparison.OrdinalIgnoreCase);
+        if (Is(first, "BEGIN")) return TransactionStatement.Begin;
+        bool commit = Is(first, "COMMIT");
+        if (!commit && !Is(first, "ROLLBACK")) return TransactionStatement.None;
+        string rest = text.Substring(end).Trim();
+        if (rest.Length != 0 && !Is(rest, "TRANSACTION")) return TransactionStatement.None;
+        return commit ? TransactionStatement.Commit : TransactionStatement.Rollback;
+    }
 
     /// <summary>
     /// Refuse a request while a <see cref="Stream(string, SkaidbConsistency?)"/>
@@ -1576,7 +1711,7 @@ public sealed class SkaidbConnection : DbConnection
     private IEnumerable<object?[]> StreamCore(string sql, IReadOnlyList<object?>? parameters,
                                               SkaidbConsistency? consistency)
     {
-        EnsureLive(sql);
+        bool answered = Answered(sql);
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (!_open) throw new SkaidbException("connection is not open");
 
@@ -1585,6 +1720,10 @@ public sealed class SkaidbConnection : DbConnection
         StreamColumns = Array.Empty<string>();
         StreamAffected = null;
         StreamResultSets = null;
+
+        // The ROLLBACK of a transaction that was lost with its connection:
+        // answered, as a Ddl reply would be, and nothing is sent.
+        if (answered) yield break;
 
         // Built before the connection is claimed: a value that cannot be
         // bound throws here, with nothing sent and the connection still free.
@@ -1627,10 +1766,15 @@ public sealed class SkaidbConnection : DbConnection
                     first = new BinReader(ReadFrame(claim));
                 }
             }
-            catch (SkaidbException) when (_broken)
+            catch (SkaidbException e) when (_broken)
             {
                 ObserveFailure();
-                throw;
+                // Lost under a COMMIT or a ROLLBACK: the transaction is
+                // over, and the error says what can be known of it.
+                var thrown = TransactionOver(sql, e);
+                if (thrown is null) yield break;
+                if (ReferenceEquals(thrown, e)) throw;
+                throw thrown;
             }
             ObserveRoundTrip(started);
             byte tag = first.U8();
@@ -1639,7 +1783,12 @@ public sealed class SkaidbConnection : DbConnection
                 // One ordinary frame, before any header: nothing is left to
                 // drain, so the connection stays usable.
                 string msg = first.Text();
-                if (!msg.Contains("unknown opcode")) throw ServerError(msg);
+                if (!msg.Contains("unknown opcode"))
+                {
+                    var refused = ServerError(msg);
+                    TransactionOver(sql, refused);   // a refused COMMIT has ended the transaction too
+                    throw refused;
+                }
                 throw new SkaidbException(bound
                     ? $"server does not support parameterised streaming (skaidb >= 0.330): {msg}"
                     : $"server does not support streaming: {msg}");
@@ -1956,7 +2105,19 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     internal QueryResult RunStatement(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency)
     {
-        var result = RunStatementCore(sql, values, consistency, out string sent);
+        string sent = sql;
+        QueryResult result;
+        try
+        {
+            result = RunStatementCore(sql, values, consistency, ref sent);
+        }
+        catch (SkaidbException e) when (_transaction)
+        {
+            var thrown = TransactionOver(sent, e);
+            if (thrown is null) return QueryResult.Done;
+            if (ReferenceEquals(thrown, e)) throw;
+            throw thrown;
+        }
         NoteStatement(sent);
         return result;
     }
@@ -1968,9 +2129,8 @@ public sealed class SkaidbConnection : DbConnection
     /// prepared, so what is noted of one is a text that can be sent again.
     /// </summary>
     private QueryResult RunStatementCore(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency,
-                                         out string sent)
+                                         ref string sent)
     {
-        sent = sql;
         if (values.Count > 0)
         {
             try
@@ -2039,6 +2199,19 @@ public sealed class SkaidbConnection : DbConnection
         {
             if (scanBudget) _setScanBudget = setting;
             else _setConsistency = setting;
+        }
+        // A BEGIN the server accepted opened a transaction on this socket;
+        // a COMMIT or a ROLLBACK it answered ended it. That cannot be given
+        // to another connection, so it is noted to keep this one.
+        switch (ReadTransaction(sql))
+        {
+            case TransactionStatement.Begin:
+                _transaction = true;
+                break;
+            case TransactionStatement.Commit:
+            case TransactionStatement.Rollback:
+                _transaction = false;
+                break;
         }
         if (Pool is not null && SkaidbConnectionPool.IsWrite(sql)) Pool.Wrote(this);
     }
@@ -2625,6 +2798,9 @@ internal sealed class QueryResult
         Rows = rows;
         Affected = affected;
     }
+
+    /// <summary>What a statement answered Ddl returns: done, no rows, no count.</summary>
+    public static QueryResult Done => new QueryResult(QueryResultKind.Ddl, null, null, 0);
 }
 
 // ---- ADO.NET: commands ------------------------------------------------------
@@ -2827,8 +3003,9 @@ public sealed class SkaidbCommand : DbCommand
         var conn = RequireOpen();
         var (sql, values) = Bound();
         // Recover a transport that died since the last statement, before
-        // anything is prepared on it.
-        conn.EnsureLive(sql);
+        // anything is prepared on it. (The ROLLBACK of a transaction that
+        // died with it is answered there, and not sent.)
+        if (conn.Answered(sql)) return QueryResult.Done;
         return conn.RunStatement(sql, values, Consistency);
     }
 
@@ -3622,8 +3799,7 @@ public sealed class SkaidbBatch : DbBatch
                     // Not a preparable statement kind: run the run one by one.
                 }
             }
-            conn.EnsureLive(sql);
-            var r = conn.RunStatement(sql, values, conn.Consistency);
+            var r = conn.Answered(sql) ? QueryResult.Done : conn.RunStatement(sql, values, conn.Consistency);
             cmds[i].SetRecordsAffected(r.Kind == QueryResultKind.Mutation
                 ? (int)Math.Min(r.Affected, int.MaxValue) : -1);
             results.Add(r);

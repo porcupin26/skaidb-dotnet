@@ -198,6 +198,38 @@ the server; that stream is over with its socket, and the connection re-dials
 on its next statement. Other threads must leave the connection alone meanwhile:
 a statement they ran on it would be part of the transaction.
 
+### A transaction written by hand
+
+`BEGIN`, the statements and `COMMIT` or `ROLLBACK` can also be sent as
+ordinary statements, and the driver notes such a transaction from what goes
+by, as it notes a `USE`:
+
+- a statement the server accepted whose first word is `BEGIN` (`BEGIN`,
+  `BEGIN TRANSACTION`, `BEGIN ATOMIC …`) opens it;
+- a statement that is exactly `COMMIT [TRANSACTION]` or `ROLLBACK
+  [TRANSACTION]` ends it once the server has answered it, with success or
+  with an error (a refused `COMMIT` has ended the transaction).
+
+Keywords in any case, an optional `;`, `--` comments skipped; run through
+a command, a batch or `Stream()` alike. While the transaction is open the
+rule of `Transaction()` holds: the connection does not re-dial. Lost under
+a statement, that statement throws the transport error; found lost before
+one (the look at the idle socket), or on any statement after, it throws
+`connection lost inside a transaction: …` and nothing is sent. The
+application ends it:
+
+| Statement | Answer |
+|---|---|
+| `ROLLBACK` | Success, not sent: the server discarded the transaction with the connection. Also when the connection is lost under the `ROLLBACK` itself. |
+| `COMMIT` | `connection lost inside a transaction: nothing was committed …`, not sent. |
+| `COMMIT`, the connection lost under it | `connection lost under COMMIT: the outcome is unknown …` (the transport error is the inner exception): the server may have committed before its reply was lost. |
+
+Either one ends the transaction, and the next statement re-dials as usual
+(database and `SET` settings restored). `Close()` ends it with the session.
+`Transaction()` opens and ends its transaction with the same statements, so
+the two do not differ here; the helper additionally refuses `Open()` in its
+body and is over when it returns.
+
 ### `BeginTransaction()`
 
 Throws `NotSupportedException`: there is no `DbTransaction` object. A
@@ -281,8 +313,10 @@ Behaviour of the three `Execute*` methods:
    closed or reset by the peer, or holding bytes nobody asked for), the
    connection re-dials first (seed walk, handshake, Hello, `USE`, the
    session's `SET CONSISTENCY` and `SET SCAN BUDGET`), clearing the
-   prepared-statement cache. Inside `SkaidbConnection.Transaction()` it
-   throws instead.
+   prepared-statement cache. Inside a transaction —
+   `SkaidbConnection.Transaction()`'s, or one a `BEGIN` statement opened —
+   it throws instead, and a `ROLLBACK` is answered without being sent (see
+   "A transaction written by hand").
 2. With parameters, the statement is prepared on the server (once per SQL
    text per connection; the connection keeps up to 240 prepared, and closes
    the one used longest ago on the server to make room for another) and

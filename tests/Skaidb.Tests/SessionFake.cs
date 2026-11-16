@@ -113,6 +113,19 @@ public sealed class Sessions
         return kept.ToString();
     }
 
+    /// <summary>A <c>;</c> outside a quoted name or string: another statement follows.</summary>
+    private static bool SecondStatement(string text)
+    {
+        char quote = '\0';
+        foreach (char ch in text)
+        {
+            if (quote != '\0') { if (ch == quote) quote = '\0'; }
+            else if (ch == '"' || ch == '\'') quote = ch;
+            else if (ch == ';') return true;
+        }
+        return false;
+    }
+
     public IEnumerable<byte[]>? Handle(Request req, FakeConnection conn)
     {
         lock (_gate)
@@ -178,7 +191,7 @@ public sealed class Sessions
             if (first == "COMMIT") session.Pending = null;
             return new[] { F.Error(refused) };
         }
-        if (text.Contains(';')) return new[] { F.Ddl() };          // not one statement: nothing of it is applied
+        if (SecondStatement(text)) return new[] { F.Ddl() };       // not one statement: nothing of it is applied
 
         switch (first)
         {

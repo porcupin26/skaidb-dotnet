@@ -361,11 +361,31 @@ stream is over with its socket, and the connection re-dials on its next
 statement.
 
 Written by hand, two rules matter. **One connection for the whole
-transaction**: with a pool, check one out and keep it — and it must stay the
-same socket: a statement run on a connection the server has closed
-[re-dials](#reconnect-and-errors) and carries on outside any transaction.
-**Stop if `BEGIN` fails**: otherwise every statement after it autocommits on
-its own.
+transaction**: with a pool, check one out and keep it. **Stop if `BEGIN`
+fails**: otherwise every statement after it autocommits on its own.
+
+The driver follows a transaction written this way as it follows the
+helper's. A statement the server accepted whose first word is `BEGIN`
+opens it; a statement that is exactly `COMMIT [TRANSACTION]` or `ROLLBACK
+[TRANSACTION]` ends it once the server has answered — with success or
+with an error, since a refused `COMMIT` has ended the transaction too.
+While it is open the connection is **not replaced**. If it is lost, the
+statement under which it is lost throws the transport error and every
+statement after it throws `connection lost inside a transaction: …`
+without being sent: a new connection has no transaction open and would
+apply them one by one. The application then ends the transaction, and the
+driver answers for a server that has nothing of it left:
+
+- `ROLLBACK` succeeds and is not sent — the server discarded the
+  transaction with the connection;
+- `COMMIT` throws `connection lost inside a transaction: nothing was
+  committed …` and is not sent. Only when the connection was lost under
+  the `COMMIT` itself does it throw `connection lost under COMMIT: the
+  outcome is unknown …`: the server may have applied it before its reply
+  went missing.
+
+After either one the next statement [re-dials](#reconnect-and-errors) as
+usual. `Close()` ends a transaction with its session.
 
 ```csharp
 static void Run(SkaidbConnection c, string sql)
@@ -614,9 +634,10 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   looks at the socket before every statement (a zero-timeout poll, no round
   trip; under TLS the transport socket): the end of the stream, a reset or
   bytes nobody asked for all mean the connection is dead. A pool looks the
-  same way before it hands a connection out. The exception is inside
-  `conn.Transaction()`, where that statement throws instead: the new
-  connection would not be in the transaction.
+  same way before it hands a connection out. The exception is inside a
+  transaction — `conn.Transaction()`'s, or one begun with a `BEGIN`
+  statement — where that statement throws instead: the new connection
+  would not be in the transaction ([Transactions](#transactions)).
 - A **re-dial that fails** — the server is still down — throws its error
   (`no reachable endpoint in …`) from the statement that tried it and leaves
   the connection broken, so each statement dials again and the first one

@@ -170,7 +170,11 @@ when the server refuses the `COMMIT` with a
 `SkaidbTransactionConflictException`; see the
 [README](../README.md#transactions) and [api.md](api.md#skaidbconnection).
 It is a `SkaidbConnection` method, so provider-agnostic code holding a
-`DbConnection` casts first, or sends `BEGIN` and `COMMIT` itself.
+`DbConnection` casts first, or sends `BEGIN` and `COMMIT` itself. A
+transaction sent that way is guarded like the helper's: while it is open a
+lost connection is not replaced, its statements throw `connection lost
+inside a transaction: …` instead of running one by one on a new session,
+and `ROLLBACK` ends it (see [api.md](api.md#a-transaction-written-by-hand)).
 
 ## Async
 
