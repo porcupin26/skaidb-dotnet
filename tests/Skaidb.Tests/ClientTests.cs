@@ -669,6 +669,20 @@ public class ClientTests
     }
 
     [Fact]
+    public void A_seed_that_drops_the_handshake_does_not_leave_the_next_seed_s_connection_marked_broken()
+    {
+        using var full = new FakeServer { Refuse = true };                 // closes before the handshake, as a node at its connection ceiling does
+        var s = new Scripted().Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }));
+        using var srv = new FakeServer(s.Handle);
+        using var c = new SkaidbConnection($"Seeds=127.0.0.1:{full.Port},127.0.0.1:{srv.Port};User=ada;Password=secret;Timeout=5");
+        c.OpenAt(new[] { $"127.0.0.1:{full.Port}", $"127.0.0.1:{srv.Port}" });   // the refusing seed first
+        Assert.True(c.IsUsable);                                           // what a pool asks before it hands a new connection out
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(1, srv.Connections);                                  // on the connection Open() made, not on a second dial
+        Assert.Single(srv.Hellos);
+    }
+
+    [Fact]
     public void A_connection_the_server_dropped_is_redialled_and_the_prepared_cache_reset()
     {
         int prepares = 0;

@@ -548,6 +548,10 @@ public sealed class SkaidbConnection : DbConnection
                     ? new SkaidbException(where)
                     : new SkaidbException($"{where}: {last.Message}", last);
             }
+            // An endpoint that failed in the middle of its handshake marked
+            // the connection broken on its way out. That was its socket, not
+            // the one that has just answered.
+            _broken = false;
             _open = true;
             SendHello();
             // USE is per-connection session state, so it runs on every open.
