@@ -121,8 +121,13 @@ second statement behind it, a qualified name) changes nothing it knows;
 use `ChangeDatabase()` there. If the database cannot be
 entered on a new connection (it was dropped meanwhile), the statement that
 needed the dial throws that error and is not sent, and so does every
-statement after it until the database exists again or the connection is
-closed and pointed elsewhere.
+statement after it until the database exists again — or until the session
+is moved. A `USE` statement the driver can read, and `ChangeDatabase()`,
+are the exception to "the database first": on a new connection they are
+sent without entering the database they leave (the session's `SET`
+settings still go first), and their answer decides the session database as
+usual. A `USE` that is refused there leaves `Database` as it was, and the
+next statement that is not a `USE` enters it first, or fails.
 
 ### Session settings: `SET CONSISTENCY`, `SET SCAN BUDGET`
 

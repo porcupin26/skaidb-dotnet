@@ -601,7 +601,10 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   sends `USE`, then the consistency override, then the scan budget, before
   the statement. If one of them is refused on the new connection the
   statement fails with that error and is not sent: it never runs in another
-  database, at another consistency or past a limit the application set.
+  database, at another consistency or past a limit the application set. A
+  session whose database was dropped is left with `USE`: a `USE` statement
+  (or `ChangeDatabase()`) is sent on the new connection without first
+  entering the database it leaves.
   Because the failed statement *may* have executed, the driver never
   retries it for you: retry a write only if it is idempotent.
 - A connection the server closed while it sat **idle** — a restart, a

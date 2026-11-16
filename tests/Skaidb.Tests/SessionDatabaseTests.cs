@@ -402,6 +402,176 @@ public class SessionDatabaseTests
         Assert.NotEqual(Count, d.Log[^1].Sql);
     }
 
+    // ---- leaving a database that is gone ---------------------------------------------------
+
+    /// <summary>
+    /// The session is in <c>app</c>, with a consistency override and a scan
+    /// budget; <c>app</c> is dropped by someone else and the connection is
+    /// lost. Every ordinary statement now fails at the re-dial's USE, which
+    /// is right: it must not run elsewhere.
+    /// </summary>
+    private static int TheSessionDatabaseIsDroppedAndTheConnectionLost(FakeServer srv, Sessions d, SkaidbConnection c)
+    {
+        Exec(c, "USE app");
+        Exec(c, "SET SCAN BUDGET ROWS 5");
+        Exec(c, "SET CONSISTENCY ALL");
+        Assert.Equal(3L, Rows(c));
+        d.Dropped = "app";
+        srv.CloseAll(seenBy: c);
+        int logged = d.Log.Length;
+        Assert.Equal("database \"app\" does not exist", Assert.Throws<SkaidbException>(() => Rows(c)).Message);
+        Assert.Equal(new[] { "USE \"app\"" }, d.Since(logged));
+        return d.Log.Length;
+    }
+
+    [Theory]
+    [InlineData("USE other")]
+    [InlineData("use other -- leave the dropped one")]
+    [InlineData("USE DATABASE \"other\";")]
+    [InlineData("ChangeDatabase")]
+    [InlineData("ExecuteScalar")]
+    [InlineData("Stream")]
+    [InlineData("DbBatch")]
+    public void A_USE_is_not_held_hostage_by_the_database_it_leaves(string way)
+    {
+        var d = new Sessions();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv));
+        c.Open();
+        int logged = TheSessionDatabaseIsDroppedAndTheConnectionLost(srv, d, c);
+
+        // The way out is a USE. It is sent on the new connection as it is:
+        // re-entering the database it leaves first would fail it too, and
+        // with it the one statement that can put the session somewhere.
+        string use = "USE other";
+        switch (way)
+        {
+            case "ChangeDatabase":
+                c.ChangeDatabase("other");
+                use = "USE \"other\"";
+                break;
+            case "ExecuteScalar":
+                using (var cmd = c.CreateCommand())
+                {
+                    cmd.CommandText = use;
+                    Assert.Null(cmd.ExecuteScalar());
+                }
+                break;
+            case "Stream":
+                Assert.Empty(c.Stream(use).ToList());
+                break;
+            case "DbBatch":
+                using (var batch = c.CreateBatch())
+                {
+                    batch.BatchCommands.Add(use);
+                    batch.BatchCommands.Add(Count);
+                    Assert.Equal(7L, batch.ExecuteScalar());
+                }
+                break;
+            default:
+                use = way;
+                Assert.Equal(0, Exec(c, use));
+                break;
+        }
+        Assert.Equal("other", c.Database);
+        // The session's settings first (they are the session's, whichever
+        // database it is in), then the USE — and no USE of app before it.
+        var sent = d.Since(logged);
+        Assert.Equal(new[] { "SET CONSISTENCY ALL", "SET SCAN BUDGET ROWS 5", use }, sent.Take(3));
+        Assert.Equal("default", d.Log[logged + 2].Database);                     // where a new connection starts
+
+        // What follows runs in other, on that connection, under the settings.
+        Assert.Equal(7L, Rows(c));
+        Assert.Equal(1, Exec(c, Insert));
+        Assert.Equal(8, d.Rows("other"));
+        Assert.Equal(0, d.Rows("default"));
+        Assert.Equal(new Sessions.Ran(Insert, "other", "ALL", 5L, false, srv.Accepted[^1]), d.Log[^1]);
+        Assert.Single(d.Log.Skip(logged).Select(l => l.Socket).Distinct());
+        Assert.DoesNotContain("USE \"app\"", d.Since(logged));
+        Assert.True(c.IsUsable);
+
+        // And it is other that the next re-dial enters.
+        logged = d.Log.Length;
+        srv.CloseAll(seenBy: c);
+        Assert.Equal(8L, Rows(c));
+        Assert.Equal(new[] { "USE \"other\"", "SET CONSISTENCY ALL", "SET SCAN BUDGET ROWS 5", Count }, d.Since(logged));
+    }
+
+    [Fact]
+    public void A_USE_refused_on_the_new_connection_leaves_the_session_where_it_was_and_nothing_runs_elsewhere()
+    {
+        var d = new Sessions();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv));
+        c.Open();
+        int logged = TheSessionDatabaseIsDroppedAndTheConnectionLost(srv, d, c);
+
+        // The USE itself is refused. The new connection is in no database
+        // of the session's choosing: the driver still knows it as app, and
+        // a statement must enter app before it runs — or not run.
+        Assert.Equal("database \"nope\" does not exist", Assert.Throws<SkaidbException>(() => Exec(c, "USE nope")).Message);
+        Assert.Equal("app", c.Database);
+        Assert.Equal("database \"app\" does not exist", Assert.Throws<SkaidbException>(() => Rows(c)).Message);
+        Assert.Equal("database \"app\" does not exist", Assert.Throws<SkaidbException>(() => Exec(c, Insert)).Message);
+        Assert.Equal(new[] { "SET CONSISTENCY ALL", "SET SCAN BUDGET ROWS 5", "USE nope", "USE \"app\"", "USE \"app\"" }, d.Since(logged));
+        Assert.Equal(0, d.Rows("default"));                                      // the INSERT went nowhere
+        Assert.Single(d.Log.Skip(logged).Select(l => l.Socket).Distinct());      // one connection: a refused USE breaks nothing
+
+        // The database is back: the next statement enters it, then runs.
+        d.Dropped = null;
+        logged = d.Log.Length;
+        Assert.Equal(3L, Rows(c));
+        Assert.Equal(new[] { "USE \"app\"", Count }, d.Since(logged));
+        Assert.Equal("app", d.Log[^1].Database);
+
+        // Refused again after another loss, then a USE that is accepted.
+        d.Dropped = "app";
+        srv.CloseAll(seenBy: c);
+        Assert.Equal("database \"nope\" does not exist", Assert.Throws<SkaidbException>(() => Exec(c, "USE nope")).Message);
+        Assert.Equal(0, Exec(c, "USE other"));
+        Assert.Equal(7L, Rows(c));
+        Assert.Equal("other", d.Log[^1].Database);
+        Assert.Equal("other", c.Database);
+    }
+
+    [Fact]
+    public void A_USE_that_finds_the_connection_lost_goes_straight_to_its_database()
+    {
+        // Nothing dropped: the USE after a loss still is the first database
+        // statement on the new connection. Entering the one it leaves would
+        // be a round trip for a database the session is done with.
+        var d = new Sessions();
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv, "Database=app"));
+        c.Open();
+        Assert.Equal(3L, Rows(c));
+        int logged = d.Log.Length;
+        srv.CloseAll(seenBy: c);
+        Assert.Equal(0, Exec(c, "USE other"));
+        Assert.Equal(7L, Rows(c));
+        Assert.Equal(new[] { "USE other", Count }, d.Since(logged));
+        Assert.Equal(2, srv.Connections);
+    }
+
+    [Fact]
+    public void A_pooled_connection_whose_borrower_leaves_a_dropped_database_goes_back_into_the_pool_s()
+    {
+        var d = new Sessions();
+        using var srv = new FakeServer(d.Handle);
+        using var pool = new SkaidbConnectionPool(Cs(srv, "Database=other"));
+        var c = pool.Acquire();
+        int logged = TheSessionDatabaseIsDroppedAndTheConnectionLost(srv, d, c);
+        // The borrower's USE is refused: its connection is live, in the
+        // database a new connection starts in, and known to the driver as
+        // app. Handed back like that, it must not reach the next borrower
+        // there.
+        Assert.Equal("database \"nope\" does not exist", Assert.Throws<SkaidbException>(() => Exec(c, "USE nope")).Message);
+        pool.Release(c);
+        Assert.Equal(7L, pool.WithConnection(Rows));
+        Assert.Equal("other", d.Log[^1].Database);
+        Assert.Equal(0, d.Rows("default"));
+    }
+
     // ---- Open() --------------------------------------------------------------------------
 
     [Fact]

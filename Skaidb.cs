@@ -425,6 +425,18 @@ public sealed class SkaidbConnection : DbConnection
     private string? _setConsistency;
     private string? _setScanBudget;
 
+    /// <summary>
+    /// The live socket's session is NOT in <see cref="Database"/> yet: the
+    /// dial that made it was for a <c>USE</c> statement, which is sent
+    /// without first entering the database it leaves (see EnsureLive), and
+    /// that <c>USE</c> has not been accepted. Until one is, a statement
+    /// that is not a <c>USE</c> enters <see cref="Database"/> first, and
+    /// fails if it cannot: it never runs in the database a new connection
+    /// happens to start in.
+    /// </summary>
+    private bool _databasePending;
+    internal bool DatabasePending => _databasePending;
+
     private string _database = "";
     /// <summary>
     /// The session database: the connection string's <c>Database</c>, or the
@@ -514,10 +526,16 @@ public sealed class SkaidbConnection : DbConnection
     internal static string EndpointKey(string host, int port) =>
         (host.Contains(':') ? $"[{host}]" : host) + ":" + port.ToString(CultureInfo.InvariantCulture);
 
-    private void OpenCore(IReadOnlyList<string>? order = null)
+    /// <param name="order">The endpoints to walk; null for the pool's order, else the shuffled seeds.</param>
+    /// <param name="enter">
+    /// False when the dial is for a <c>USE</c> statement: the session
+    /// database is then not entered here, the statement decides it.
+    /// </param>
+    private void OpenCore(IReadOnlyList<string>? order = null, bool enter = true)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (_open) return;
+        _databasePending = false;   // a new socket: decided below
         // The body of Transaction() closed the connection and is opening it
         // again. What it would get is what the transparent re-dial is
         // refused for (see EnsureLive): a connection that never saw the
@@ -594,12 +612,17 @@ public sealed class SkaidbConnection : DbConnection
             _broken = false;
             _open = true;
             SendHello();
-            // USE is per-connection session state, so it runs on every open.
+            // USE is per-connection session state, so it runs on every open
+            // — except on a dial made for a USE statement. That statement
+            // is about to say where the session goes, and entering the
+            // database it leaves first would make it wait on a database
+            // that may no longer exist: the application could then not even
+            // USE its way out. The session is marked as not entered until
+            // a USE is accepted.
             if (Database.Length > 0)
             {
-                using var use = CreateCommand();
-                use.CommandText = "USE \"" + Database.Replace("\"", "\"\"") + "\"";
-                use.ExecuteNonQuery();
+                if (enter) EnterDatabase();
+                else _databasePending = true;
             }
             // So are the settings the application made with SET: behind the
             // database and before the statement this dial is for, the
@@ -699,6 +722,17 @@ public sealed class SkaidbConnection : DbConnection
 #pragma warning restore SYSLIB0057
         }
         return cert;
+    }
+
+    /// <summary>
+    /// Enter <see cref="Database"/> on the live socket, with nothing but the
+    /// USE sent (no look, no re-dial: this is part of a dial, or the step
+    /// before a statement on a socket already found live).
+    /// </summary>
+    private void EnterDatabase()
+    {
+        Query("USE \"" + Database.Replace("\"", "\"\"") + "\"", Consistency);
+        _databasePending = false;
     }
 
     private static List<string> Shuffled(IReadOnlyList<string> seeds)
@@ -1055,6 +1089,7 @@ public sealed class SkaidbConnection : DbConnection
         // starts another, in the connection's Database.
         _setConsistency = null;
         _setScanBudget = null;
+        _databasePending = false;
         CleanupSocket();
         // Closed while checked out instead of released: the pool stops
         // counting it against its member.
@@ -1081,7 +1116,12 @@ public sealed class SkaidbConnection : DbConnection
     /// the connection that created it, so carrying one across a reconnect
     /// would run a different statement (or fail obscurely).
     /// </remarks>
-    internal void EnsureLive()
+    /// <param name="sql">
+    /// The statement this is done for, when there is one. A <c>USE</c> the
+    /// driver can read is sent on a new connection without first entering
+    /// the database the session was in.
+    /// </param>
+    internal void EnsureLive(string? sql = null)
     {
         // Re-dialling would swap the socket out from under an in-flight
         // stream, so refuse before the caller loses frames. Unlocked
@@ -1097,7 +1137,14 @@ public sealed class SkaidbConnection : DbConnection
         // died minutes ago still succeeds, and only the read behind it
         // fails, with the statement possibly run and never re-sent.
         if (!_broken && _open && SocketDead()) MarkBroken();
-        if (!_broken) return;
+        bool use = sql is not null && TryReadUse(sql, out _);
+        if (!_broken)
+        {
+            // Live, but dialed for a USE that was then refused: the session
+            // is not in its database. Any other statement enters it first.
+            if (_databasePending && !use && _open) EnterDatabase();
+            return;
+        }
         // A transaction lives on the socket that opened it. Re-dialling in
         // the middle of Transaction() would send the rest of the body, and
         // its COMMIT, to a connection in autocommit: each statement would
@@ -1115,7 +1162,7 @@ public sealed class SkaidbConnection : DbConnection
         _broken = false;
         try
         {
-            OpenCore();
+            OpenCore(enter: !use);
         }
         catch
         {
@@ -1529,7 +1576,7 @@ public sealed class SkaidbConnection : DbConnection
     private IEnumerable<object?[]> StreamCore(string sql, IReadOnlyList<object?>? parameters,
                                               SkaidbConsistency? consistency)
     {
-        EnsureLive();
+        EnsureLive(sql);
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (!_open) throw new SkaidbException("connection is not open");
 
@@ -1799,7 +1846,7 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     internal (uint Id, int Params) PrepareServer(string sql)
     {
-        EnsureLive();
+        EnsureLive(sql);
         if (_prepared.TryGetValue(sql, out var hit))
         {
             _prepared[sql] = (hit.Id, hit.Params, ++_preparedUses);
@@ -1980,7 +2027,11 @@ public sealed class SkaidbConnection : DbConnection
         // noted, the statements after a re-dial would run against the
         // tables of the same names in whatever database a new session
         // starts in.
-        if (TryReadUse(sql, out string? database)) _database = database;
+        if (TryReadUse(sql, out string? database))
+        {
+            _database = database;
+            _databasePending = false;
+        }
         // So did a SET CONSISTENCY or a SET SCAN BUDGET: the last one of
         // each kind is kept, to be sent again on the next dial, and one
         // that ends in DEFAULT clears what was kept.
@@ -2774,10 +2825,10 @@ public sealed class SkaidbCommand : DbCommand
     internal QueryResult Run()
     {
         var conn = RequireOpen();
+        var (sql, values) = Bound();
         // Recover a transport that died since the last statement, before
         // anything is prepared on it.
-        conn.EnsureLive();
-        var (sql, values) = Bound();
+        conn.EnsureLive(sql);
         return conn.RunStatement(sql, values, Consistency);
     }
 
@@ -3571,7 +3622,7 @@ public sealed class SkaidbBatch : DbBatch
                     // Not a preparable statement kind: run the run one by one.
                 }
             }
-            conn.EnsureLive();
+            conn.EnsureLive(sql);
             var r = conn.RunStatement(sql, values, conn.Consistency);
             cmds[i].SetRecordsAffected(r.Kind == QueryResultKind.Mutation
                 ? (int)Math.Min(r.Affected, int.MaxValue) : -1);
@@ -4538,7 +4589,7 @@ public sealed class SkaidbConnectionPool : IDisposable
         // cannot be put back is not kept. A pool whose connection string
         // names no database has none to put it back into.
         bool inPlace = true;
-        if (c.Pool == this && _database.Length > 0 && c.Database != _database && c.IsUsable)
+        if (c.Pool == this && _database.Length > 0 && (c.Database != _database || c.DatabasePending) && c.IsUsable)
         {
             try { c.ChangeDatabase(_database); }
             catch (Exception) { inPlace = false; }
@@ -5099,7 +5150,7 @@ public sealed class SkaidbConnectionPool : IDisposable
         QueryResult result;
         try
         {
-            conn.EnsureLive();
+            conn.EnsureLive("SHOW ENDPOINTS");
             result = conn.RunStatement("SHOW ENDPOINTS", Array.Empty<object?>(), conn.Consistency);
         }
         catch (SkaidbException) when (conn.IsOpen && !conn.IsBroken)
