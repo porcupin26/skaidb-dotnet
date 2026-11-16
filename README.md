@@ -317,6 +317,13 @@ and is not retried — inside `Transaction()` that includes a connection the
 server closed between two statements, where the next statement throws
 instead of re-dialing.
 
+A [`Stream()`](docs/streaming.md) the body starts must be finished or
+disposed in the body. One it leaves open holds the connection, so neither
+`COMMIT` nor `ROLLBACK` can be sent: `Transaction()` throws — the body's
+exception, else `connection is busy streaming: …` — and closes the socket,
+which ends the transaction on the server. Nothing was committed, and the
+connection re-dials on its next statement once the stream has been disposed.
+
 Written by hand, two rules matter. **One connection for the whole
 transaction**: with a pool, check one out and keep it — and it must stay the
 same socket: a statement run on a connection the server has closed

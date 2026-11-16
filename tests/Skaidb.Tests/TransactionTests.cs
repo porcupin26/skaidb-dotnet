@@ -743,6 +743,64 @@ public class TransactionTests
         Assert.Equal(1, pool.Members().Sum(m => m.Idle));
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void A_stream_the_body_left_open_costs_the_connection_so_nothing_later_joins_the_transaction(
+        bool bodyThrows, bool pooled)
+    {
+        const string big = "SELECT id FROM big";
+        var s = new Standalone();
+        using var srv = new FakeServer(s.Handle);
+        using var pool = new SkaidbConnectionPool(Cs(srv));
+        using var single = new SkaidbConnection(Cs(srv));
+        if (!pooled) single.Open();
+
+        var mine = new InvalidOperationException("mine");
+        IEnumerator<object?[]>? left = null;
+        Func<SkaidbConnection, long> body = conn =>
+        {
+            Exec(conn, Update);
+            // Started, and neither run out nor disposed: the stream holds the
+            // connection, so no COMMIT and no ROLLBACK can be sent on it.
+            left = conn.Stream(big).GetEnumerator();
+            Assert.True(left.MoveNext());
+            if (bodyThrows) throw mine;
+            return (long)left.Current[0]!;
+        };
+        var thrown = Assert.ThrowsAny<Exception>(() => pooled ? pool.Transaction(body) : single.Transaction(body));
+        if (bodyThrows) Assert.Same(mine, thrown);
+        else Assert.Contains("busy streaming", Assert.IsType<SkaidbException>(thrown).Message);
+        Assert.Equal(new[] { "BEGIN", Update, big }, s.Log);
+
+        // The transaction is still open on the server and only closing its
+        // socket ends it: that happens before the helper returns, not when
+        // the caller gets round to the connection again.
+        WaitFor(() => srv.Live == 0, "the socket with the open transaction on it is still open");
+        Assert.Equal(1, srv.Connections);
+        if (pooled)
+        {
+            Assert.Equal(0, pool.Members().Sum(m => m.Idle + m.InUse));
+            left!.Dispose();
+            Assert.Equal(1, pool.WithConnection(c => Exec(c, Update)));
+        }
+        else
+        {
+            Assert.False(single.IsUsable);
+            // Letting go of the stream frees the connection object, and its
+            // next statement runs on a new session, in autocommit: not
+            // inside the transaction nobody ended.
+            left!.Dispose();
+            Assert.Equal(1, Exec(single, Update));
+            Assert.True(single.IsUsable);
+        }
+        Assert.Equal(2, srv.Connections);
+        Assert.Equal(new[] { "BEGIN", Update, big, Update }, s.Log);
+        Assert.NotSame(s.Sockets[0], s.Sockets[^1]);
+    }
+
     [Fact]
     public void A_stream_the_body_closed_itself_leaves_the_transaction_to_commit()
     {

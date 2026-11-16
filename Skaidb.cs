@@ -753,7 +753,12 @@ public sealed class SkaidbConnection : DbConnection
     /// sent when it returns, so a body that returns a task is refused before
     /// anything is sent. A <see cref="Stream(string, SkaidbConsistency?)"/>
     /// started in the body is enumerated in the body, not returned from
-    /// it.</para>
+    /// it. One the body leaves open — started, and neither run out nor
+    /// disposed — holds the connection, so neither <c>COMMIT</c> nor
+    /// <c>ROLLBACK</c> can be sent: the helper throws (the body's exception,
+    /// else the busy-streaming error) and closes the socket, which is what
+    /// ends the transaction on the server. The next statement re-dials, once
+    /// the stream has been disposed.</para>
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="attempts"/> is below 1; nothing is sent.</exception>
     public T Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")
@@ -801,6 +806,15 @@ public sealed class SkaidbConnection : DbConnection
             finally
             {
                 _inTransaction--;
+                // A stream the body started and neither ran out nor disposed
+                // still holds the connection: no COMMIT and no ROLLBACK could
+                // be sent past it, so the transaction is open on the server,
+                // on a socket that works. Left that way, the statements run
+                // once the stream is let go would join it. Closing the socket
+                // is the one way left to end it; the caller already has the
+                // body's exception, or the busy-streaming one of the COMMIT.
+                // Under the lock: the stream may be reading a frame.
+                if (_streaming) lock (_lock) MarkBroken();
             }
         }
     }

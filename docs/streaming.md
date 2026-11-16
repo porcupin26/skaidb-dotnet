@@ -127,6 +127,11 @@ claims the connection for good: .NET runs no iterator `finally` at collection
 time. That connection reports `IsUsable` false, a pool discards it, and every
 statement on it throws. Never let one go out of scope without disposing it.
 
+That includes the `COMMIT` and the `ROLLBACK` of
+[`conn.Transaction()`](api.md#skaidbconnection): a stream its body leaves
+open makes the helper throw and close the socket, the one way left to end
+the transaction on the server.
+
 Do not return the enumerable out of `SkaidbConnectionPool.WithConnection`:
 it is lazy, and the connection would go back to the pool before the first
 row is read. Enumerate inside the callback.

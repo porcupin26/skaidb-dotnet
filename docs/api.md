@@ -145,7 +145,12 @@ apply the remaining statements one by one. The next statement after the
 helper has returned re-dials as usual.
 
 The body is synchronous. A `Stream()` started in it is enumerated in it, not
-returned from it. Other threads must leave the connection alone meanwhile:
+returned from it. One the body leaves open — started, and neither run out
+nor disposed — holds the connection, so neither `COMMIT` nor `ROLLBACK` can
+be sent: the helper throws (the body's exception, else `connection is busy
+streaming: …`) and closes the socket, which is what ends the transaction on
+the server; the connection re-dials on its next statement once that stream
+has been disposed. Other threads must leave the connection alone meanwhile:
 a statement they ran on it would be part of the transaction.
 
 ### `BeginTransaction()`
