@@ -4,6 +4,109 @@ All notable changes to the skaidb C# / .NET driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/). Release dates are UTC.
 
+## [1.5.2] - 2026-11-16
+
+### Fixed
+- **`SET CONSISTENCY` and `SET SCAN BUDGET` are set again after a
+  re-dial.** A consistency override and a scan budget live on the server's
+  session and went with the socket. After a transparent re-dial — the
+  member restarted while the connection sat idle — an application that had
+  sent `SET SCAN BUDGET ROWS 1000` ran its scans with no limit, and one
+  that had sent `SET CONSISTENCY ALL` read at each request's own level,
+  with nothing to tell it. The driver now notes these statements as it
+  notes a `USE`: a statement the server accepted that is exactly one `SET
+  CONSISTENCY …` or `SET SCAN BUDGET …` (any case, an optional `;`, `--`
+  comments skipped) is kept, the last of each kind, and one that ends in
+  `DEFAULT` clears what was kept. Every re-dial sends them again, behind
+  the `USE` and before the statement that needed the dial, on a pooled
+  connection in its borrower's hands too. If the new connection refuses
+  one, the statement fails with that error and is not sent. `Close()` ends
+  the session and forgets them.
+- **A hand-written transaction is not carried over to a new connection.**
+  Only `Transaction()` kept a transaction on the socket that began it.
+  After a `BEGIN` the application sent itself, a lost connection was
+  re-dialed and the rest of the transaction ran on a session that had none
+  open: each statement was applied on its own, and the `COMMIT` was
+  answered `no transaction in progress` with half the transaction in the
+  table. A statement the server accepted whose first word is `BEGIN` now
+  opens a noted transaction, and a `COMMIT [TRANSACTION]` or `ROLLBACK
+  [TRANSACTION]` the server answered ends it. While it is open a lost
+  connection is not replaced: the statement under which it is lost throws
+  the transport error, and every statement after it throws `connection lost
+  inside a transaction: …` without being sent. `ROLLBACK` then succeeds
+  without being sent (the server discarded the transaction with the
+  connection); `COMMIT` throws `connection lost inside a transaction:
+  nothing was committed …`, or, when the connection was lost under the
+  `COMMIT` itself, `connection lost under COMMIT: the outcome is unknown
+  …`. After either one the next statement re-dials as usual.
+  `Transaction()` reports the same two cases with these messages.
+- **A pool hands every borrower its own session.** A pooled connection
+  kept what its borrower did to the session: a `SET CONSISTENCY`, a `SET
+  SCAN BUDGET`, a `BEGIN` without its `COMMIT`, and — in a pool whose
+  connection string names no `Database` — a `USE`. The next borrower read
+  at another consistency, had its scans refused for a limit it never set,
+  ran inside someone else's transaction, or in someone else's database.
+  `Release()` now puts the session back into the pool's own before the
+  connection can be handed out: the connection string's `Database`
+  (`default` when it names none), no consistency override, no scan budget,
+  no transaction. Only what the borrower changed is sent (`ROLLBACK`,
+  `USE`, `SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`); a borrower
+  that changed nothing costs no round trip. A connection that cannot be
+  put back — a server before 0.349 refuses `SET CONSISTENCY DEFAULT` — is
+  disposed, and the next borrower gets a new one.
+- **A `USE` is no longer held hostage by the database it leaves.** When
+  the session's database had been dropped and the connection was lost,
+  every statement failed at the re-dial's `USE` — rightly, it must not run
+  elsewhere — but so did a new `USE other`, and only `Close()`,
+  `ChangeDatabase()`, `Open()` got the connection back. A `USE` statement
+  (and `ChangeDatabase()`) is now sent on the new connection without first
+  entering the database it leaves. If that `USE` is refused, the next
+  statement that is not a `USE` still enters the session's database first,
+  or fails.
+- **Bytes nobody asked for on an idle connection are not read as the next
+  reply.** The look a statement takes at its idle socket before it writes
+  recognised a closed connection, but took a socket with unread bytes on
+  it for a live one, and the next statement read those bytes as its reply.
+  A readable idle socket now means a dead connection, whatever there is to
+  read: the statement runs on a new one.
+- **A stream belongs to the socket it was opened on.** After `Close()` and
+  `Open()` with a `Stream()` enumerator still alive, the new connection
+  was busy streaming before it had sent anything, and disposing the old
+  enumerator drained from the new socket: it blocked for the read timeout
+  and broke the fresh connection. Closing a socket now ends the stream on
+  it: the connection dialed next is free, the old enumerator throws `the
+  stream ended with its connection: …` when advanced, and disposing it
+  touches nothing. A connection broken under a stream left open (as
+  `Transaction()` does to one its body leaves) re-dials on its next
+  statement without waiting for that enumerator to be disposed.
+- **A batch's `…Async` methods answer through their task.**
+  `SkaidbBatch.ExecuteNonQueryAsync`, `ExecuteScalarAsync` and
+  `ExecuteReaderAsync` threw out of the call for a token cancelled
+  beforehand and for a statement that failed, where a command's return a
+  cancelled or a faulted task. They now do the same, and `PrepareAsync`
+  returns a cancelled task for a cancelled token.
+- **A transaction conflict reports `DbException.IsTransient`.**
+  `SkaidbTransactionConflictException.IsTransient` is true, so a
+  provider-agnostic retry layer runs the transaction again; every other
+  `SkaidbException` still reports false.
+
+### Changed
+- **Upgrade note: on a pool without a `Database` a borrower's `USE` no
+  longer carries over to later borrowers**, and neither does a `SET
+  CONSISTENCY` or a `SET SCAN BUDGET` in any pool. Code that entered a
+  database once and relied on finding the pooled connection there names
+  the database in the pool's connection string; a setting that must hold
+  for every checkout is made on every checkout.
+
+### Documentation
+- A batch (`ExecuteBatch`, `DbBatch`) run inside a transaction is part of
+  it: its rows commit or roll back with the transaction, and a failing row
+  leaves the transaction open with the earlier rows in it. The docs said
+  only that rows autocommit one by one.
+- That a connection closed by the server while it sat idle costs no
+  statement is now tested as a real network shows it: the server's end
+  gone, the client's writes still accepted.
+
 ## [1.5.1] - 2026-11-16
 
 ### Fixed
@@ -373,6 +476,7 @@ run against a live server: the fixes below are what that found.
 - The example moved to `examples/Basic`; the library, tests and examples are
   in `Skaidb.sln`.
 
+[1.5.2]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.5.2
 [1.5.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.5.1
 [1.5.0]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.5.0
 [1.4.1]: https://github.com/porcupin26/skaidb-dotnet/releases/tag/v1.4.1

@@ -37,7 +37,7 @@ credential), installs come from the GitHub release: every release at
 a folder and use that folder as a package source:
 
 ```sh
-V=1.5.1
+V=1.5.2
 mkdir -p ~/nuget-local
 curl -L -o ~/nuget-local/Skaidb.$V.nupkg \
   https://github.com/porcupin26/skaidb-dotnet/releases/download/v$V/Skaidb.$V.nupkg
@@ -706,7 +706,7 @@ informational version, which the build derives from the single `<Version>` in
 driver ignores.
 
 ```sql
-SELECT client_name, client_version FROM drivers;   -- dotnet | 1.5.1
+SELECT client_name, client_version FROM drivers;   -- dotnet | 1.5.2
 ```
 
 ## Compatibility
@@ -721,7 +721,9 @@ SELECT client_name, client_version FROM drivers;   -- dotnet | 1.5.1
   `EMIT`, the `drivers` row a server ≥ 0.203.0, pool discovery
   (`SkaidbPoolOptions.Discover`) a server ≥ 0.327 (an older one leaves the
   pool on its seeds), a `COMMIT` refused for a conflict
-  (`SkaidbTransactionConflictException`) a standalone server ≥ 0.346.
+  (`SkaidbTransactionConflictException`) a standalone server ≥ 0.346, `SET
+  CONSISTENCY DEFAULT` a server ≥ 0.349 (on an older one a pooled connection
+  whose borrower set a consistency override is closed instead of kept).
 - **Wire protocol**: <https://skaidb.org/docs/PROTOCOL.html>.
 
 ## Conformance
