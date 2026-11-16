@@ -1856,9 +1856,11 @@ public sealed class SkaidbConnection : DbConnection
     /// The database <paramref name="sql"/> enters when it is exactly one
     /// <c>USE [DATABASE] name</c> statement: the name bare (a letter or
     /// <c>_</c>, then letters, digits and <c>_</c>) or in double quotes with
-    /// <c>""</c> for a quote inside, an optional <c>;</c> behind it. Any
-    /// other text — a second statement, a comment, a qualified name,
-    /// <c>USE DATABASE</c> with nothing behind it — is not read as one, and
+    /// <c>""</c> for a quote inside, an optional <c>;</c> behind it, and
+    /// <c>--</c> comments anywhere a server skips them. <c>USE DATABASE</c>
+    /// with no name behind it names the database called <c>DATABASE</c>, as
+    /// it does to the server. Any other text — a second statement, a
+    /// qualified name, a name left in a comment — is not read as one, and
     /// the session database the connection knows is left alone.
     /// </summary>
     internal static bool TryReadUse(string sql, [NotNullWhen(true)] out string? database)
@@ -1866,6 +1868,20 @@ public sealed class SkaidbConnection : DbConnection
         database = null;
         int i = 0, n = sql.Length;
         while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        // Nearly every statement stops here: it starts with neither the
+        // keyword nor a comment that one could follow.
+        bool comment = n - i >= 2 && sql[i] == '-' && sql[i + 1] == '-';
+        if (!comment && !(n - i >= 3 && string.Compare(sql, i, "USE", 0, 3, StringComparison.OrdinalIgnoreCase) == 0))
+            return false;
+        // The server skips -- comments, so `USE app -- the app database`
+        // enters app there, and must here.
+        if (sql.IndexOf("--", i, StringComparison.Ordinal) >= 0)
+        {
+            sql = WithoutLineComments(sql);
+            n = sql.Length;
+            i = 0;
+            while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        }
         if (n - i < 3 || string.Compare(sql, i, "USE", 0, 3, StringComparison.OrdinalIgnoreCase) != 0) return false;
         i += 3;
         // Behind the keyword: whitespace, or the quote that opens the name.
@@ -1873,9 +1889,12 @@ public sealed class SkaidbConnection : DbConnection
         if (!ReadName(sql, ref i, out string? name, out bool quoted)) return false;
         if (!quoted && name.Equals("DATABASE", StringComparison.OrdinalIgnoreCase))
         {
-            // USE DATABASE name. With no name behind it the word is the
-            // keyword or a database called that: not for the driver to say.
-            if (!ReadName(sql, ref i, out name, out _)) return false;
+            // USE DATABASE name. With no name behind it the word is itself
+            // the name: the server answers `USE DATABASE` for a database
+            // called DATABASE.
+            int behind = i;
+            if (ReadName(sql, ref i, out string? named, out _)) name = named;
+            else i = behind;
         }
         while (i < n && char.IsWhiteSpace(sql[i])) i++;
         if (i < n && sql[i] == ';') i++;
@@ -1883,6 +1902,38 @@ public sealed class SkaidbConnection : DbConnection
         if (i != n) return false;
         database = name;
         return true;
+    }
+
+    /// <summary>
+    /// <paramref name="sql"/> without its <c>--</c> comments. Each runs to
+    /// the end of its line; a <c>--</c> inside a double-quoted name or a
+    /// single-quoted string is no comment (<c>USE "a--b"</c> names the
+    /// database <c>a--b</c>).
+    /// </summary>
+    private static string WithoutLineComments(string sql)
+    {
+        var kept = new StringBuilder(sql.Length);
+        char quote = '\0';
+        for (int i = 0; i < sql.Length; i++)
+        {
+            char ch = sql[i];
+            if (quote != '\0')
+            {
+                kept.Append(ch);
+                if (ch == quote) quote = '\0';
+            }
+            else if (ch == '-' && i + 1 < sql.Length && sql[i + 1] == '-')
+            {
+                while (i < sql.Length && sql[i] != '\n') i++;
+                if (i < sql.Length) kept.Append('\n');
+            }
+            else
+            {
+                kept.Append(ch);
+                if (ch == '"' || ch == '\'') quote = ch;
+            }
+        }
+        return kept.ToString();
     }
 
     /// <summary>One identifier at <paramref name="i"/>, past any whitespace: bare, or in double quotes.</summary>

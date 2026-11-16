@@ -112,12 +112,13 @@ Runs `USE "<name>"` now when open, and on every later dial.
 
 A `USE` sent as a statement does the same. When the server has accepted a
 statement that is exactly `USE [DATABASE] <name>` — the name bare or in
-double quotes (`""` for a quote inside), an optional `;` behind it —
-`Database` becomes that name, and every later dial enters it before
+double quotes (`""` for a quote inside), an optional `;` behind it, `--`
+comments skipped as the server skips them (`USE app -- the app database`)
+— `Database` becomes that name, and every later dial enters it before
 anything else is sent: a re-dial does not drop the session back into the
 default database. A text the driver cannot read as one such statement (a
-second statement behind it, a comment, `USE DATABASE` alone) changes
-nothing it knows; use `ChangeDatabase()` there. If the database cannot be
+second statement behind it, a qualified name) changes nothing it knows;
+use `ChangeDatabase()` there. If the database cannot be
 entered on a new connection (it was dropped meanwhile), the statement that
 needed the dial throws that error and is not sent, and so does every
 statement after it until the database exists again or the connection is

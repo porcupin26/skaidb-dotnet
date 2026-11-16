@@ -15,7 +15,9 @@ namespace Skaidb.Tests;
 /// <summary>
 /// A fake server with databases. Every connection starts in <c>default</c>;
 /// <c>USE [DATABASE] name</c> moves it (an Error for a database that is not
-/// in <see cref="Notes"/>, or that is <see cref="Dropped"/>). Each database
+/// in <see cref="Notes"/>, or that is <see cref="Dropped"/>). <c>--</c>
+/// comments are skipped as a real server skips them: to the end of the
+/// line, unless the dashes are inside a quoted name or string. Each database
 /// holds a table <c>notes</c>: <c>SELECT count(*) FROM notes</c> answers the
 /// row count of the connection's current database and <c>INSERT INTO notes</c>
 /// adds a row to it. Everything else is answered Ddl. <see cref="Log"/> has
@@ -33,7 +35,7 @@ public sealed class Databases
     /// <summary>Rows of <c>notes</c> per database.</summary>
     public readonly Dictionary<string, int> Notes = new()
     {
-        ["default"] = 0, ["app"] = 3, ["other"] = 7, ["App"] = 11, ["we\"ird db"] = 5, ["DATABASE"] = 13,
+        ["default"] = 0, ["app"] = 3, ["other"] = 7, ["App"] = 11, ["we\"ird db"] = 5, ["DATABASE"] = 13, ["a--b"] = 9,
     };
 
     /// <summary>A database that no longer exists: USE of it is refused.</summary>
@@ -43,6 +45,28 @@ public sealed class Databases
 
     public int Rows(string database) { lock (_gate) return Notes[database]; }
 
+    private static string SkipComments(string sql)
+    {
+        var kept = new System.Text.StringBuilder();
+        bool inName = false, inString = false;
+        foreach (string line in sql.Split('\n'))
+        {
+            int end = line.Length;
+            for (int i = 0; i < line.Length; i++)
+            {
+                if (line[i] == '"' && !inString) inName = !inName;
+                else if (line[i] == '\'' && !inName) inString = !inString;
+                else if (!inName && !inString && line[i] == '-' && i + 1 < line.Length && line[i + 1] == '-')
+                {
+                    end = i;
+                    break;
+                }
+            }
+            kept.Append(line, 0, end).Append('\n');
+        }
+        return kept.ToString();
+    }
+
     public IEnumerable<byte[]>? Handle(Request req, FakeConnection conn)
     {
         if (req.Op == 2) return new[] { F.Error("statement kind cannot be prepared") };
@@ -51,7 +75,7 @@ public sealed class Databases
         {
             string db = _current.GetValueOrDefault(conn, "default");
             _log.Add((req.Sql, db, conn));
-            var use = Use.Match(req.Sql);
+            var use = Use.Match(SkipComments(req.Sql));
             if (use.Success)
             {
                 string name = use.Groups[1].Success ? use.Groups[1].Value.Replace("\"\"", "\"") : use.Groups[2].Value;
@@ -218,6 +242,13 @@ public class SessionDatabaseTests
     [InlineData("USE \"app\";", "app")]
     [InlineData("USE App", "App")]                                               // the name as written: another database than app
     [InlineData("USE \"we\"\"ird db\"", "we\"ird db")]
+    [InlineData("USE app -- the app database", "app")]                           // a comment the server skips
+    [InlineData("-- into app\nUSE app", "app")]
+    [InlineData("-- first\nUSE app;  -- then\n", "app")]
+    [InlineData("USE -- which one\napp", "app")]
+    [InlineData("USE \"a--b\" -- named with dashes", "a--b")]                    // dashes inside the quotes are the name
+    [InlineData("USE DATABASE", "DATABASE")]                                     // the database called so, as the server reads it
+    [InlineData("USE DATABASE DATABASE", "DATABASE")]
     public void A_database_entered_with_a_USE_statement_is_entered_again_after_a_re_dial(string use, string database)
     {
         var d = new Databases();
@@ -292,8 +323,11 @@ public class SessionDatabaseTests
     [InlineData("USE \"app")]                                                    // the quote never closes
     [InlineData("USE \"\"")]                                                     // no name in it
     [InlineData("USE")]
-    [InlineData("USE DATABASE")]                                                 // a keyword, or a database called database?
-    [InlineData("-- into app\nUSE app")]
+    [InlineData("USE -- nothing")]                                               // the name is in the comment
+    [InlineData("-- USE app")]                                                   // all of it is
+    [InlineData("SELECT 1 -- USE app")]
+    [InlineData("USE \"a--b")]                                                   // not a comment: an open quote
+    [InlineData("USE DATABASE \"app")]
     [InlineData("EXPLAIN USE app")]
     [InlineData("SELECT 'USE app'")]
     [InlineData("USEFUL app")]
