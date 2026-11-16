@@ -683,6 +683,35 @@ public class ClientTests
     }
 
     [Fact]
+    public void A_re_dial_that_fails_is_tried_again_by_the_next_statement()
+    {
+        var s = new Scripted().Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }))
+            .Answer("BEGIN", F.Ddl()).Answer("COMMIT", F.Ddl());
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        // The server goes down, and is still down for the statement that
+        // finds the connection dead: the re-dial fails.
+        srv.Refuse = true;
+        srv.CloseAll();
+        Thread.Sleep(50);
+        Assert.StartsWith("no reachable endpoint in ", Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT 42")).Message);
+        Assert.True(c.IsOpen);                                             // broken, as it was; not closed
+        Assert.False(c.IsUsable);
+        // Every statement until it is back dials again, a transaction's BEGIN included ...
+        Assert.StartsWith("no reachable endpoint in ", Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT 42")).Message);
+        bool ran = false;
+        Assert.StartsWith("no reachable endpoint in ",
+            Assert.Throws<SkaidbException>(() => c.Transaction(conn => { ran = true; })).Message);
+        Assert.False(ran);
+        // ... and the first one after it is back runs.
+        srv.Refuse = false;
+        Assert.Equal(42L, c.Transaction(conn => (long)Scalar(conn, "SELECT 42")!));
+        Assert.True(c.IsUsable);
+        Assert.Equal(2, srv.Connections);
+    }
+
+    [Fact]
     public void A_connection_the_server_dropped_is_redialled_and_the_prepared_cache_reset()
     {
         int prepares = 0;

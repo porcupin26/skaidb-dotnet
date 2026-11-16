@@ -1038,7 +1038,12 @@ public sealed class SkaidbConnection : DbConnection
         }
         catch
         {
-            _broken = true;   // still down; the next statement retries
+            // Still down. The connection stays what it was, open and broken,
+            // so the next statement dials again; left closed, every later
+            // statement would fail with "connection is not open" although
+            // the server had long come back.
+            _open = true;
+            _broken = true;
             throw;
         }
     }

@@ -566,6 +566,10 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   nothing was in flight, so nothing is ambiguous. The exception is inside
   `conn.Transaction()`, where that statement throws instead: the new
   connection would not be in the transaction.
+- A **re-dial that fails** — the server is still down — throws its error
+  (`no reachable endpoint in …`) from the statement that tried it and leaves
+  the connection broken, so each statement dials again and the first one
+  after the server is back runs.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   (`IsUsable` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.
