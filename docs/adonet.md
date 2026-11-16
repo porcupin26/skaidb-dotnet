@@ -104,7 +104,11 @@ cmd.Parameters.Add("second");
 - `CommandTimeout` is stored but the connection's `Timeout` bounds each
   request; `Cancel()` is a no-op.
 - `Prepare()` prepares the statement on the server now; otherwise that
-  happens on first execution and is cached per connection.
+  happens on first execution and is cached per connection. The prepared
+  statement belongs to the connection, keyed by its text: disposing the
+  command does not close it, and a command moved to another connection is
+  prepared there. The connection keeps up to 240 and closes the one used
+  longest ago when another is needed.
 
 ## Reading results
 

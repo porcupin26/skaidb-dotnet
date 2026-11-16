@@ -140,7 +140,17 @@ public sealed class SkaidbConnection : DbConnection
     private bool _open;
     private bool _disposed;
     private readonly object _lock = new();
-    private readonly Dictionary<string, (uint Id, int Params)> _prepared = new();
+    /// <summary>
+    /// The statements this connection holds prepared on the server, by SQL
+    /// text, with when each was last used. Never more than
+    /// <see cref="PreparedKept"/>: the server caps a connection at 256, and
+    /// refuses the prepare that would pass it.
+    /// </summary>
+    private readonly Dictionary<string, (uint Id, int Params, long Used)> _prepared = new();
+    /// <summary>Counts uses of <see cref="_prepared"/>: the entry with the lowest stamp was used longest ago.</summary>
+    private long _preparedUses;
+    /// <summary>Prepared statements kept per connection, below the server's 256 (PROTOCOL.md 3.3).</summary>
+    private const int PreparedKept = 240;
 
     /// <summary>
     /// Transport died: the socket is already closed (see MarkBroken) and the
@@ -1667,7 +1677,11 @@ public sealed class SkaidbConnection : DbConnection
     internal (uint Id, int Params) PrepareServer(string sql)
     {
         EnsureLive();
-        if (_prepared.TryGetValue(sql, out var hit)) return hit;
+        if (_prepared.TryGetValue(sql, out var hit))
+        {
+            _prepared[sql] = (hit.Id, hit.Params, ++_preparedUses);
+            return (hit.Id, hit.Params);
+        }
         if (_disposed) throw new ObjectDisposedException(nameof(SkaidbConnection));
         if (!_open) throw new SkaidbException("connection is not open");
 
@@ -1702,9 +1716,14 @@ public sealed class SkaidbConnection : DbConnection
         {
             uint id = r.U32();
             int n = r.U16();
-            var v = (id, n);
-            if (_prepared.Count < 240) _prepared[sql] = v;
-            return v;
+            // Every statement prepared is kept, so every one is accounted
+            // for: when the cache is full the one used longest ago gives up
+            // its slot on the server first. A statement prepared and not
+            // kept would hold a slot nobody ever frees, and the 257th of
+            // them is refused by the server.
+            if (_prepared.Count >= PreparedKept) ClosePreparedUsedLongestAgo();
+            _prepared[sql] = (id, n, ++_preparedUses);
+            return (id, n);
         }
         if (tag == 3)
         {
@@ -1720,6 +1739,43 @@ public sealed class SkaidbConnection : DbConnection
             throw ServerError(msg);
         }
         throw new SkaidbException($"unexpected prepare response tag {tag}");
+    }
+
+    /// <summary>
+    /// Make room in <see cref="_prepared"/>: drop the statement used longest
+    /// ago and free its slot on the server with <c>OP_CLOSE</c>
+    /// (<c>u8 4 | u32 id</c>, answered Ddl). It is prepared again if its
+    /// text comes back. No command holds a statement id, only its text, so
+    /// none is left pointing at the closed one.
+    /// </summary>
+    private void ClosePreparedUsedLongestAgo()
+    {
+        string? text = null;
+        uint id = 0;
+        long oldest = long.MaxValue;
+        foreach (var kv in _prepared)
+        {
+            if (kv.Value.Used >= oldest) continue;
+            oldest = kv.Value.Used;
+            text = kv.Key;
+            id = kv.Value.Id;
+        }
+        if (text is null) return;
+        _prepared.Remove(text);
+        var w = new BinWriter();
+        w.U8(4);                          // OP_CLOSE
+        w.U32(id);
+        try
+        {
+            Roundtrip(w.ToArray());
+        }
+        catch (SkaidbException) when (!_broken)
+        {
+            // An Error reply: the server has no such id, or no OP_CLOSE at
+            // all. There is nothing more to free, and the statement being
+            // prepared is not what failed. (A transport failure is thrown:
+            // the connection is gone, and the cache with it.)
+        }
     }
 
     /// <summary>

@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Dapper;
 using Xunit;
 
 namespace Skaidb.Tests;
@@ -93,6 +94,9 @@ public sealed class StatementTable
 
 public class PreparedStatementTests
 {
+    /// <summary>The prepared statements a connection keeps at most: below the server's 256.</summary>
+    private const int Kept = 240;
+
     private static readonly DateTimeOffset At = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_123);
     private static readonly byte[] Raw = { 0x00, 0x01, 0xfe, 0xff };
 
@@ -114,6 +118,121 @@ public class PreparedStatementTests
         At,
         Raw,
     };
+
+    private static void AssertTyped(List<object?> p, int n)
+    {
+        Assert.Equal((long)n, p[0]);
+        Assert.Equal(new object?[] { "tag", (long)n }, Assert.IsType<object?[]>(p[1]));
+        Assert.Equal((long)n, Assert.IsType<Dictionary<string, object?>>(p[2])["n"]);
+        Assert.Equal(At, Assert.IsType<DateTimeOffset>(p[3]));                   // a timestamp, not a number
+        Assert.Equal(Raw, Assert.IsType<byte[]>(p[4]));                          // bytes, not a hex string
+    }
+
+    [Theory]
+    [InlineData("ExecuteNonQuery")]                                              // prepared on first execution
+    [InlineData("Prepare")]                                                      // Prepare() first
+    [InlineData("ExecuteBatch")]
+    public void Three_hundred_distinct_parameterised_statements_on_one_connection_are_all_prepared_and_bound_typed(string how)
+    {
+        var t = new StatementTable();
+        using var srv = new FakeServer(t.Handle);
+        using var c = Connect(srv);
+        void Run(int n)
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = Insert(n);
+            if (how == "ExecuteBatch")
+            {
+                Assert.Equal(1L, cmd.ExecuteBatch(new List<IReadOnlyList<object?>> { Values(n) }));
+                return;
+            }
+            foreach (var v in Values(n)) cmd.Parameters.Add(v);
+            if (how == "Prepare") cmd.Prepare();
+            Assert.Equal(1, cmd.ExecuteNonQuery());
+        }
+        for (int n = 0; n < 300; n++) Run(n);
+
+        // The server never had to refuse one, and none went out as text.
+        Assert.Equal(0, t.Refused);
+        Assert.Empty(t.AsText);
+        Assert.Equal(300, t.Executed.Count);
+        for (int n = 0; n < 300; n++)
+        {
+            Assert.Equal(Insert(n), t.Executed[n].Sql);
+            AssertTyped(t.Executed[n].Params, n);
+        }
+        // The driver keeps at most 240 and closes the one used longest ago
+        // to make room (241 open while it swaps): never the one it is about
+        // to run, and always far from the server's 256.
+        Assert.Equal(Kept + 1, t.MostOpen);
+        Assert.Equal(Enumerable.Range(0, 300).Select(Insert), t.Prepared);
+        Assert.Equal(Enumerable.Range(0, 300 - Kept).Select(Insert), t.Closed);
+
+        // A statement that was closed is prepared again when it comes back;
+        // one still kept is not.
+        Run(0);
+        Assert.Equal(Insert(0), t.Prepared[^1]);
+        Assert.Equal(301, t.Prepared.Count);
+        Run(299);
+        Assert.Equal(301, t.Prepared.Count);
+        AssertTyped(t.Executed[^2].Params, 0);
+        AssertTyped(t.Executed[^1].Params, 299);
+        Assert.Equal(0, t.Refused);
+        Assert.Equal(1, srv.Connections);
+    }
+
+    [Fact]
+    public void A_new_command_per_call_as_Dapper_makes_them_shares_the_cache_and_stays_under_the_limit()
+    {
+        var t = new StatementTable();
+        using var srv = new FakeServer(t.Handle);
+        using var c = Connect(srv);
+        // The same text from a new command each time: prepared once.
+        for (int i = 0; i < 5; i++)
+            Assert.Equal(1, c.Execute("INSERT INTO t (id, at, raw) VALUES (@id, @at, @raw)", new { id = (long)i, at = At, raw = Raw }));
+        Assert.Single(t.Prepared);
+        // 300 distinct texts: all prepared, all typed.
+        for (int n = 0; n < 300; n++)
+            Assert.Equal(1, c.Execute($"INSERT INTO t (id, a{n}, at, raw) VALUES (@id, @a, @at, @raw)", new { id = (long)n, a = "v" + n, at = At, raw = Raw }));
+        Assert.Equal(0, t.Refused);
+        Assert.Empty(t.AsText);
+        Assert.Equal(305, t.Executed.Count);
+        Assert.All(t.Executed.Skip(5), e =>
+        {
+            Assert.IsType<long>(e.Params[0]);
+            Assert.IsType<string>(e.Params[1]);
+            Assert.Equal(At, Assert.IsType<DateTimeOffset>(e.Params[2]));
+            Assert.Equal(Raw, Assert.IsType<byte[]>(e.Params[3]));
+        });
+        Assert.Equal(Kept + 1, t.MostOpen);
+        Assert.Equal(301 - Kept, t.Closed.Count);
+    }
+
+    [Fact]
+    public void A_statement_in_steady_use_is_never_the_one_closed()
+    {
+        const string hot = "UPDATE counters SET n = n + ? WHERE id = ?";
+        var t = new StatementTable();
+        using var srv = new FakeServer(t.Handle);
+        using var c = Connect(srv);
+        void Exec(string sql, params object?[] values)
+        {
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = sql;
+            foreach (var v in values) cmd.Parameters.Add(v);
+            Assert.Equal(1, cmd.ExecuteNonQuery());
+        }
+        for (int n = 0; n < 300; n++)
+        {
+            Exec(hot, 1L, 7L);
+            Exec(Insert(n), Values(n));
+        }
+        Assert.Equal(0, t.Refused);
+        Assert.Single(t.Prepared, sql => sql == hot);                            // once, in 300 uses
+        Assert.DoesNotContain(hot, t.Closed);
+        Assert.Equal(Kept + 1, t.MostOpen);
+        Assert.Equal(301 - Kept, t.Closed.Count);
+    }
 
     [Fact]
     public void A_prepare_refused_for_a_full_table_is_the_statement_s_error_and_nothing_is_sent_as_literals()

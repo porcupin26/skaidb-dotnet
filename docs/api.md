@@ -248,8 +248,9 @@ Behaviour of the three `Execute*` methods:
    handshake, Hello, `USE`), clearing the prepared-statement cache. Inside
    `SkaidbConnection.Transaction()` it throws instead.
 2. With parameters, the statement is prepared on the server (once per SQL
-   text per connection, cached up to 240 entries) and executed with the
-   values encoded as typed skaidb values. `statement expects N parameters,
+   text per connection; the connection keeps up to 240 prepared, and closes
+   the one used longest ago on the server to make room for another) and
+   executed with the values encoded as typed skaidb values. `statement expects N parameters,
    got M` is thrown before anything is sent when the counts differ.
 3. If the server answers the prepare with `statement kind cannot be
    prepared` (DDL, `USE`, `SHOW`, …) the same `?` parameters are rendered as

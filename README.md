@@ -213,12 +213,11 @@ sends the values in placeholder order. One statement uses one style; mixing
 `SkaidbParameter`.
 
 With parameters the driver **prepares the statement on the server** (once per
-distinct SQL text per connection, cached up to 240 entries) and sends the
-values as **typed binary** — no string interpolation, no injection surface,
-and .NET arrays and dictionaries travel as skaidb `Array` and `Document`
-values, which have no SQL literal form. The statement's parameter count must
-match what you add (`statement expects N parameters, got M` is thrown before
-anything is sent).
+distinct SQL text per connection) and sends the values as **typed binary** —
+no string interpolation, no injection surface, and .NET arrays and
+dictionaries travel as skaidb `Array` and `Document` values, which have no
+SQL literal form. The statement's parameter count must match what you add
+(`statement expects N parameters, got M` is thrown before anything is sent).
 
 There is no separate prepare/execute API: preparing is automatic. Statements
 the server declines to prepare (DDL, `USE` and other session statements) fall
@@ -226,6 +225,16 @@ back to safe client-side quoting of the same `?` parameters, so every
 statement kind accepts parameters — except that arrays and documents cannot
 be rendered as text. Prepared ids are scoped to a connection and the cache is
 dropped on reconnect.
+
+A connection keeps up to 240 statements prepared; the server allows 256 per
+connection. When a 241st distinct text arrives, the one used longest ago is
+closed on the server and prepared again if it comes back, so any number of
+distinct statements can run on one connection and every one of them is
+bound typed. A command holds its text, not a server statement: disposing it
+releases nothing, and the next command with the same text reuses the
+prepared statement. A prepare the server refuses for any other reason than
+the statement's kind — `too many prepared statements …` included — is that
+statement's error; it is never answered by sending literals.
 
 ### `ExecuteBatch(rows)` — many rows, one round-trip
 
