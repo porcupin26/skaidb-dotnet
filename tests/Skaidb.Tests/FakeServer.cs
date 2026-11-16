@@ -172,6 +172,12 @@ public sealed class FakeServer : IDisposable
     public readonly List<byte[]> FirstFrames = new();
     private int _connections;
     public int Connections => Volatile.Read(ref _connections);
+    /// <summary>
+    /// Connections the server still holds: one leaves when its client closes
+    /// the socket (the server reads EOF), not when the client merely stops
+    /// using it.
+    /// </summary>
+    public int Live { get { lock (_gate) return _sockets.Count; } }
 
     private readonly TcpListener _listener;
     private readonly List<Socket> _sockets = new();

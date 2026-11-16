@@ -21,7 +21,11 @@ namespace Skaidb.Tests;
 /// statement and how many times that text has arrived so far (1 the first
 /// time); null leaves the default: one row for a SELECT, one affected row
 /// for a mutation, Ddl for everything else (BEGIN, COMMIT, ROLLBACK).
-/// <see cref="Drop"/> closes the socket instead of answering.
+/// <see cref="Drop"/> closes the socket instead of answering;
+/// <see cref="Hold"/> never answers and keeps the socket open. A stream
+/// request (OP_QUERY_STREAM, with or without parameters) is logged the same
+/// way and answered with <see cref="Stream"/>'s frames, by default a header,
+/// two one-row chunks and the end.
 /// </summary>
 public sealed class Standalone
 {
@@ -34,6 +38,8 @@ public sealed class Standalone
 
     public Func<string, int, byte[]?>? Answer;
     public Func<string, bool>? Drop;
+    public Func<string, bool>? Hold;
+    public Func<string, byte[][]?>? Stream;
 
     public string[] Log { get { lock (_gate) return _log.ToArray(); } }
     public FakeConnection[] Sockets { get { lock (_gate) return _sockets.ToArray(); } }
@@ -54,13 +60,16 @@ public sealed class Standalone
                 }
                 case 3:
                     return Statement(_ids[req.Id], conn);
+                case 5:
+                case 9:
+                    return Statement(req.Sql, conn, streamed: true);
                 default:
                     return null;   // Hello -> Ddl
             }
         }
     }
 
-    private IEnumerable<byte[]> Statement(string sql, FakeConnection conn)
+    private IEnumerable<byte[]> Statement(string sql, FakeConnection conn, bool streamed = false)
     {
         _log.Add(sql);
         _sockets.Add(conn);
@@ -70,6 +79,14 @@ public sealed class Standalone
             conn.Sock.Shutdown(SocketShutdown.Both);
             conn.Sock.Close();
             return Array.Empty<byte[]>();
+        }
+        if (Hold?.Invoke(sql) == true) return Array.Empty<byte[]>();
+        if (streamed)
+        {
+            return Stream?.Invoke(sql) ?? new[]
+            {
+                F.Header("v"), F.Chunk(new object?[] { 1L }), F.Chunk(new object?[] { 2L }), F.End(),
+            };
         }
         if (Answer?.Invoke(sql, nth) is byte[] scripted) return new[] { scripted };
         if (sql.StartsWith("SELECT", StringComparison.Ordinal)) return new[] { F.Rows(new[] { "v" }, new object?[] { 7L }) };
@@ -551,5 +568,188 @@ public class TransactionTests
         Assert.Single(s.Sockets.Skip(9).Distinct());
         Assert.Equal(2, pool.Members().Sum(m => m.Idle));
         Assert.Equal(2, srv.Connections);
+    }
+
+    // ---- the transaction's session: a lost connection, a restart, an open stream, a timeout ----
+
+    private static string Cs(FakeServer srv, string timeout = "5") =>
+        $"Host=127.0.0.1;Port={srv.Port};User=ada;Password=secret;Timeout={timeout}";
+
+    /// <summary>Every way a body can run a statement on its connection, each a statement of its own.</summary>
+    private static (string Way, Action Run)[] Ways(SkaidbConnection c)
+    {
+        const string text = "UPDATE audit SET n = n + 1 WHERE id = 1";
+        const string bound = "UPDATE audit SET n = n + ? WHERE id = ?";
+        var rows = new List<IReadOnlyList<object?>> { new object?[] { 1L, 1L }, new object?[] { 1L, 2L } };
+        return new (string, Action)[]
+        {
+            ("ExecuteNonQuery, text", () => Exec(c, text)),
+            ("ExecuteNonQuery, prepared", () => Exec(c, bound, 1L, 1L)),
+            ("ExecuteScalar", () => Scalar(c, "SELECT n FROM audit WHERE id = 1")),
+            ("ExecuteReader", () =>
+            {
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = text;
+                using var r = cmd.ExecuteReader();
+            }),
+            ("ExecuteNonQueryAsync", () =>
+            {
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = text;
+                cmd.ExecuteNonQueryAsync().GetAwaiter().GetResult();
+            }),
+            ("Prepare", () =>
+            {
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = bound;
+                cmd.Parameters.Add(1L);
+                cmd.Parameters.Add(1L);
+                cmd.Prepare();
+            }),
+            ("ExecuteBatch", () =>
+            {
+                using var cmd = c.CreateCommand();
+                cmd.CommandText = bound;
+                cmd.ExecuteBatch(rows);
+            }),
+            ("DbBatch, one statement", () =>
+            {
+                using var batch = c.CreateBatch();
+                batch.BatchCommands.Add(text);
+                batch.ExecuteNonQuery();
+            }),
+            ("DbBatch, a merged run", () =>
+            {
+                using var batch = c.CreateBatch();
+                foreach (var row in rows)
+                {
+                    var one = batch.BatchCommands.Add(bound);
+                    foreach (var v in row) one.Parameters.Add(v);
+                }
+                batch.ExecuteNonQuery();
+            }),
+            ("Stream", () => c.Stream("SELECT n FROM audit").ToList()),
+            ("Stream, parameters", () => c.Stream("SELECT n FROM audit WHERE id = ?", new object?[] { 1L }).ToList()),
+            ("ChangeDatabase", () => c.ChangeDatabase("other")),
+        };
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public void After_a_connection_loss_the_body_swallowed_no_later_statement_and_no_COMMIT_reaches_a_new_connection(
+        bool underAStatement, bool pooled)
+    {
+        const string second = "UPDATE accounts SET balance = balance + 100 WHERE id = 2";
+        // The server goes away under statement 2, or while the connection
+        // sits idle just before it.
+        var s = new Standalone { Drop = sql => underAStatement && sql == second };
+        using var srv = new FakeServer(s.Handle);
+        using var pool = new SkaidbConnectionPool(Cs(srv));
+        using var single = new SkaidbConnection(Cs(srv));
+        if (!pooled) single.Open();
+
+        SkaidbException? two = null;
+        var later = new List<(string Way, string Message)>();
+        Func<SkaidbConnection, string> body = conn =>
+        {
+            Exec(conn, Update);
+            if (!underAStatement)
+            {
+                srv.CloseAll();
+                Thread.Sleep(50);
+            }
+            try { Exec(conn, second); }
+            catch (SkaidbException e) { two = e; }
+            // The body swallowed that and carries on. Whichever way it runs
+            // its next statement, a re-dial would apply it in autocommit.
+            foreach (var (way, run) in Ways(conn))
+                later.Add((way, Assert.Throws<SkaidbException>(run).Message));
+            return "the body returned";
+        };
+        var lost = Assert.Throws<SkaidbException>(() => pooled ? pool.Transaction(body) : single.Transaction(body));
+
+        // Statement 2 fails as it does on any lost connection ...
+        Assert.Contains(underAStatement ? "connection closed by server" : "connection lost inside a transaction", two!.Message);
+        // ... every statement after it is refused ...
+        Assert.Equal(Ways(single).Length, later.Count);
+        Assert.All(later, l => Assert.Contains("connection lost inside a transaction", l.Message));
+        // ... and the helper reports the loss, not the body's value: its
+        // COMMIT has no transaction to commit on another connection.
+        Assert.Contains("connection lost inside a transaction", lost.Message);
+        Assert.Equal(underAStatement ? new[] { "BEGIN", Update, second } : new[] { "BEGIN", Update }, s.Log);
+        Assert.Equal(1, srv.Connections);                                        // nothing was dialed to send them on
+        Assert.DoesNotContain(srv.Requests, q => q.Op != 8 && q.Op != 1);        // not even a PREPARE went out
+
+        // The helper has returned: the connection is what it is after any
+        // connection loss, and the next statement gets a new one.
+        if (pooled)
+        {
+            Assert.Equal(0, pool.Members().Sum(m => m.Idle + m.InUse));          // the pool dropped it
+            Assert.Equal(7L, pool.WithConnection(c => Scalar(c, "SELECT 1")));
+        }
+        else
+        {
+            Assert.False(single.IsUsable);
+            Assert.Equal(7L, Scalar(single, "SELECT 1"));
+            Assert.True(single.IsUsable);
+        }
+        Assert.Equal(2, srv.Connections);
+        Assert.Equal("SELECT 1", s.Log[^1]);
+        Assert.NotSame(s.Sockets[0], s.Sockets[^1]);
+    }
+
+    [Fact]
+    public void The_opening_statement_re_dials_a_connection_the_server_closed_while_it_sat_idle()
+    {
+        var s = new Standalone();
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        Assert.Equal(7L, Scalar(c, "SELECT 1"));
+        // The server restarts while the client sits idle. Any statement
+        // re-dials before it is sent, and so does the helper's BEGIN (nothing
+        // is open yet): the transaction runs, whole, on the new connection.
+        srv.CloseAll();
+        Thread.Sleep(50);
+        Assert.Equal(1, c.Transaction(conn => Exec(conn, Update)));
+        Assert.Equal(new[] { "SELECT 1", "BEGIN", Update, "COMMIT" }, s.Log);
+        Assert.Equal(2, srv.Connections);
+        Assert.NotSame(s.Sockets[0], s.Sockets[1]);
+        Assert.Single(s.Sockets.Skip(1).Distinct());
+        Assert.True(c.IsUsable);
+
+        // A pool finds its idle connection dead at the checkout and dials.
+        using var pool = new SkaidbConnectionPool(Cs(srv));
+        Assert.Equal(7L, pool.WithConnection(p => Scalar(p, "SELECT 1")));
+        Assert.Equal(1, pool.Members().Sum(m => m.Idle));
+        srv.CloseAll();
+        Thread.Sleep(50);
+        Assert.Equal(1, pool.Transaction(conn => Exec(conn, Update)));
+        Assert.Equal(new[] { "SELECT 1", "BEGIN", Update, "COMMIT" }, s.Log.Skip(4));
+        Assert.Equal(4, srv.Connections);
+        Assert.Single(s.Sockets.Skip(5).Distinct());
+        Assert.Equal(1, pool.Members().Sum(m => m.Idle));
+    }
+
+    [Fact]
+    public void A_stream_the_body_closed_itself_leaves_the_transaction_to_commit()
+    {
+        const string big = "SELECT id FROM big";
+        var s = new Standalone();
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        long first = c.Transaction(conn =>
+        {
+            Exec(conn, Update);
+            foreach (var row in conn.Stream(big)) return (long)row[0]!;         // abandoned after one row, and disposed
+            return -1;
+        });
+        Assert.Equal(1L, first);
+        Assert.Equal(new[] { "BEGIN", Update, big, "COMMIT" }, s.Log);
+        Assert.Single(s.Sockets.Distinct());
+        Assert.True(c.IsUsable);
+        Assert.Equal(1, srv.Live);
     }
 }

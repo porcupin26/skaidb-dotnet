@@ -7,6 +7,8 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Dapper;
 using Xunit;
 
@@ -453,6 +455,142 @@ public class AdoNetTests
         Assert.Equal(3L, c.StreamAffected);
         Assert.Empty(c.Stream("CREATE TABLE t (PRIMARY KEY (id))").ToList());
         Assert.Null(c.StreamAffected);
+    }
+
+    // ---- the Async methods and cancellation ----------------------------------------
+
+    [Fact]
+    public async Task A_token_cancelled_between_a_request_and_its_reply_does_not_leave_the_reply_unread()
+    {
+        // The driver's I/O is synchronous: an Async method has read its reply
+        // in full by the time it returns its task, and Cancel() is a no-op. A
+        // token cancelled while the request is out therefore abandons nothing:
+        // the call answers with its own reply and the next statement with its
+        // own. The server cancels the token the moment a request arrives.
+        var armed = new CancellationTokenSource?[1];
+        using var srv = new FakeServer((req, conn) =>
+        {
+            Volatile.Read(ref armed[0])?.Cancel();
+            switch (req.Op)
+            {
+                case 1:
+                    long n = long.Parse(req.Sql.Split(' ')[^1]);
+                    return new[] { req.Sql.StartsWith("UPDATE", StringComparison.Ordinal) ? F.Mutation((ulong)n) : F.Rows(new[] { "v" }, new object?[] { n }) };
+                case 2:
+                    return new[] { F.Prepared(1, 1) };
+                case 3:
+                    return new[] { F.Rows(new[] { "v" }, new object?[] { req.Params[0] }) };
+                case 7:
+                    return new[] { F.Mutation((ulong)req.Rows.Count) };
+                default:
+                    return null;   // Hello -> Ddl
+            }
+        });
+        using var c = Connect(srv);
+
+        async Task<T> CancelledMidFlight<T>(Func<CancellationToken, Task<T>> call)
+        {
+            using var source = new CancellationTokenSource();
+            Volatile.Write(ref armed[0], source);
+            try
+            {
+                T got = await call(source.Token);
+                Assert.True(source.IsCancellationRequested);                    // it was cancelled with the request out
+                return got;
+            }
+            finally
+            {
+                Volatile.Write(ref armed[0], null);
+            }
+        }
+        long next = 100;
+        void NextStatementReadsItsOwnReply()
+        {
+            long n = next++;
+            using var cmd = c.CreateCommand();
+            cmd.CommandText = "SELECT " + n;
+            Assert.Equal(n, cmd.ExecuteScalar());
+            Assert.True(c.IsUsable);
+        }
+
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "SELECT 1";
+            Assert.Equal(1L, await CancelledMidFlight(t => cmd.ExecuteScalarAsync(t)));
+            NextStatementReadsItsOwnReply();
+
+            cmd.CommandText = "UPDATE t SET v = 3";
+            Assert.Equal(3, await CancelledMidFlight(t => cmd.ExecuteNonQueryAsync(t)));
+            NextStatementReadsItsOwnReply();
+
+            cmd.CommandText = "SELECT 5";
+            await using (var r = await CancelledMidFlight(t => cmd.ExecuteReaderAsync(t)))
+            {
+                Assert.True(r.Read());
+                Assert.Equal(5L, r.GetInt64(0));
+            }
+            NextStatementReadsItsOwnReply();
+
+            // Two round trips (prepare, execute); the token goes at the first.
+            cmd.CommandText = "SELECT ?";
+            cmd.Parameters.Add(6L);
+            Assert.Equal(6L, await CancelledMidFlight(t => cmd.ExecuteScalarAsync(t)));
+            NextStatementReadsItsOwnReply();
+        }
+
+        using (var batch = c.CreateBatch())
+        {
+            batch.BatchCommands.Add("UPDATE t SET v = 2");
+            batch.BatchCommands.Add("SELECT 8");
+            Assert.Equal(2, await CancelledMidFlight(t => batch.ExecuteNonQueryAsync(t)));
+            NextStatementReadsItsOwnReply();
+            Assert.Equal(8L, await CancelledMidFlight(t => batch.ExecuteScalarAsync(t)));
+            NextStatementReadsItsOwnReply();
+            await using (var r = await CancelledMidFlight(t => batch.ExecuteReaderAsync(t)))
+            {
+                Assert.True(r.Read());
+                Assert.Equal(8L, r.GetInt64(0));
+            }
+            NextStatementReadsItsOwnReply();
+        }
+
+        // Dapper reads the rows with the same token: its ReadAsync refuses a
+        // cancelled one, after the reply was received whole.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CancelledMidFlight(t =>
+            c.QueryAsync<long>(new CommandDefinition("SELECT 9", cancellationToken: t))));
+        NextStatementReadsItsOwnReply();
+        Assert.Equal(1, srv.Connections);                                       // one socket throughout, never broken
+
+        // Open: the token goes while the Hello is out; the connection opens.
+        using (var d = new SkaidbConnection(Cs(srv)))
+        {
+            await CancelledMidFlight(async t => { await d.OpenAsync(t); return 0; });
+            Assert.True(d.IsUsable);
+            using var cmd = d.CreateCommand();
+            cmd.CommandText = "SELECT 10";
+            Assert.Equal(10L, cmd.ExecuteScalar());
+        }
+
+        // A token cancelled beforehand: nothing is sent at all.
+        int sent = srv.Requests.Count;
+        var already = new CancellationToken(canceled: true);
+        using (var cmd = c.CreateCommand())
+        {
+            cmd.CommandText = "SELECT 11";
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cmd.ExecuteScalarAsync(already));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cmd.ExecuteNonQueryAsync(already));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cmd.ExecuteReaderAsync(already));
+        }
+        using (var batch = c.CreateBatch())
+        {
+            batch.BatchCommands.Add("SELECT 12");
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => batch.ExecuteScalarAsync(already));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => batch.ExecuteNonQueryAsync(already));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => batch.ExecuteReaderAsync(already));
+        }
+        Assert.Equal(sent, srv.Requests.Count);
+        NextStatementReadsItsOwnReply();
+        Assert.Equal(2, srv.Connections);
     }
 
     // ---- Dapper -------------------------------------------------------------------
