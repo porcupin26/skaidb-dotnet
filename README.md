@@ -332,8 +332,9 @@ A [`Stream()`](docs/streaming.md) the body starts must be finished or
 disposed in the body. One it leaves open holds the connection, so neither
 `COMMIT` nor `ROLLBACK` can be sent: `Transaction()` throws — the body's
 exception, else `connection is busy streaming: …` — and closes the socket,
-which ends the transaction on the server. Nothing was committed, and the
-connection re-dials on its next statement once the stream has been disposed.
+which ends the transaction on the server. Nothing was committed; the
+stream is over with its socket, and the connection re-dials on its next
+statement.
 
 Written by hand, two rules matter. **One connection for the whole
 transaction**: with a pool, check one out and keep it — and it must stay the
@@ -455,9 +456,10 @@ Either way the next statement reads its own reply.
 
 A hand-rolled `GetEnumerator()` that is merely dropped half-read is disposed
 by nobody — .NET runs no iterator `finally` at collection time — and that
-connection stays busy for good: `IsUsable` is false, a pool discards it, and
-every statement on it throws `connection is busy streaming`. Always enumerate
-to the end or dispose:
+connection stays busy for as long as its socket is open: `IsUsable` is
+false, a pool discards it, and every statement on it throws `connection is
+busy streaming`. (`Close()` ends the stream with the socket.) Always
+enumerate to the end or dispose:
 
 ```csharp
 using var it = conn.Stream("SELECT ...").GetEnumerator();

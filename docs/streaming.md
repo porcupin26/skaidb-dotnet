@@ -123,9 +123,17 @@ using (var it = conn.Stream("SELECT id FROM big").GetEnumerator())
 ```
 
 An enumerator that is neither exhausted nor disposed — created and dropped —
-claims the connection for good: .NET runs no iterator `finally` at collection
-time. That connection reports `IsUsable` false, a pool discards it, and every
-statement on it throws. Never let one go out of scope without disposing it.
+claims the connection for as long as its socket is open: .NET runs no
+iterator `finally` at collection time. That connection reports `IsUsable`
+false, a pool discards it, and every statement on it throws. Never let one
+go out of scope without disposing it.
+
+A stream belongs to the socket it was opened on. When that socket closes —
+`Close()`, or a transport failure that breaks the connection — the stream is
+over: advancing its enumerator throws `the stream ended with its connection:
+…` (after any rows it had already received), and disposing it does nothing.
+It never reads from the socket the connection dials next, which is free
+from the start: `Close()` then `Open()` gives a connection no stream holds.
 
 That includes the `COMMIT` and the `ROLLBACK` of
 [`conn.Transaction()`](api.md#skaidbconnection): a stream its body leaves

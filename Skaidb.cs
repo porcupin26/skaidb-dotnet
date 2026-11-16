@@ -167,13 +167,26 @@ public sealed class SkaidbConnection : DbConnection
     private int _inTransaction;
 
     /// <summary>
-    /// A <see cref="Stream(string, SkaidbConsistency?)"/> (with or without
-    /// parameters) owns the socket until RowsEnd/Error. Written under
+    /// A <see cref="Stream(string, SkaidbConsistency?)"/> in flight (with or
+    /// without parameters): the claim it holds on the socket it was opened
+    /// on, until RowsEnd/Error. It reads that socket and no other.
+    /// </summary>
+    private sealed class StreamClaim
+    {
+        public readonly Stream Socket;
+        public StreamClaim(Stream socket) { Socket = socket; }
+    }
+
+    /// <summary>
+    /// The stream that owns the live socket, or null. A claim is on ONE
+    /// socket: closing the socket (see CleanupSocket) drops it, so the
+    /// socket dialed next is nobody's, and the enumerator that held the
+    /// claim finds it gone and reads nothing more. Written under
     /// <see cref="_lock"/>, together with the check that guards a request.
     /// Volatile because <see cref="IsUsable"/> reads it from whatever thread a
     /// pool happens to return the connection on.
     /// </summary>
-    private volatile bool _streaming;
+    private volatile StreamClaim? _claim;
 
     /// <summary>
     /// Frames an abandoned stream reads and discards before giving up:
@@ -185,7 +198,7 @@ public sealed class SkaidbConnection : DbConnection
     ///
     /// This bounds FRAMES, not bytes. At the server's current 256 KB
     /// chunking it is ~16 MB, but that is the server's constant and not one
-    /// this driver can see; <see cref="ReadFrame"/> accepts up to 64 MB, so
+    /// this driver can see; <see cref="ReadFrame()"/> accepts up to 64 MB, so
     /// the arithmetic worst case is far larger. Quoting the megabytes as a
     /// guarantee would be asserting a property of a number we do not
     /// control.
@@ -421,7 +434,7 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     public override ConnectionState State =>
         !_open ? ConnectionState.Closed
-        : _streaming ? ConnectionState.Open | ConnectionState.Fetching
+        : _claim is not null ? ConnectionState.Open | ConnectionState.Fetching
         : ConnectionState.Open;
     /// <summary><see cref="Timeout"/> in whole seconds.</summary>
     public override int ConnectionTimeout => (int)Timeout.TotalSeconds;
@@ -685,6 +698,10 @@ public sealed class SkaidbConnection : DbConnection
         try { _tcp?.Dispose(); } catch { /* ignore */ }
         _stream = null;
         _tcp = null;
+        // A stream in flight on that socket ended with it: its frames were
+        // there and nowhere else. Whatever socket is dialed next starts
+        // free, and the old enumerator must not read a byte of it.
+        _claim = null;
     }
 
     /// <summary>
@@ -705,6 +722,18 @@ public sealed class SkaidbConnection : DbConnection
     {
         _broken = true;
         CleanupSocket();
+    }
+
+    /// <summary>
+    /// <see cref="MarkBroken()"/> for a failure met on <paramref name="socket"/>:
+    /// it breaks the connection only while that is still the connection's
+    /// socket. A reader left over from a socket closed since (a stream whose
+    /// connection was closed and opened again) has nothing to say about the
+    /// one that replaced it.
+    /// </summary>
+    private void MarkBroken(Stream? socket)
+    {
+        if (socket is not null && ReferenceEquals(socket, _stream)) MarkBroken();
     }
 
     /// <summary>Create a command bound to this connection.</summary>
@@ -787,8 +816,8 @@ public sealed class SkaidbConnection : DbConnection
     /// disposed — holds the connection, so neither <c>COMMIT</c> nor
     /// <c>ROLLBACK</c> can be sent: the helper throws (the body's exception,
     /// else the busy-streaming error) and closes the socket, which is what
-    /// ends the transaction on the server. The next statement re-dials, once
-    /// the stream has been disposed.</para>
+    /// ends the transaction on the server. The stream is over with its
+    /// socket, and the next statement re-dials.</para>
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="attempts"/> is below 1; nothing is sent.</exception>
     public T Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")
@@ -844,7 +873,7 @@ public sealed class SkaidbConnection : DbConnection
                 // is the one way left to end it; the caller already has the
                 // body's exception, or the busy-streaming one of the COMMIT.
                 // Under the lock: the stream may be reading a frame.
-                if (_streaming) lock (_lock) MarkBroken();
+                if (_claim is not null) lock (_lock) MarkBroken();
             }
         }
     }
@@ -962,7 +991,7 @@ public sealed class SkaidbConnection : DbConnection
     /// abandoned without being disposed still owes unread frames, and handing
     /// it out would desync whoever got it next.
     /// </summary>
-    public bool IsUsable => !_disposed && _open && !_broken && !_streaming && !SocketDead();
+    public bool IsUsable => !_disposed && _open && !_broken && _claim is null && !SocketDead();
 
     /// <summary>
     /// True when the peer has closed the socket while it sat idle: readable
@@ -1083,14 +1112,14 @@ public sealed class SkaidbConnection : DbConnection
     /// The locked check below is the authority, but reaching it means
     /// blocking on the Monitor until the streaming thread is between
     /// frames — so a caller who made a threading mistake waits out a socket
-    /// timeout before learning what they did wrong. `_streaming` is
+    /// timeout before learning what they did wrong. `_claim` is
     /// volatile precisely so it can be read here first. A false negative
     /// (the flag set just after this reads it) is harmless: the locked
     /// check still catches it.
     /// </summary>
     private void ThrowIfStreamingUnlocked()
     {
-        if (_streaming)
+        if (_claim is not null)
             throw new SkaidbException(
                 "connection is busy streaming: the protocol allows no other request until the "
                 + "stream ends, so finish or dispose the Stream() enumerator (or use a second "
@@ -1104,7 +1133,7 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     private void ThrowIfStreamingLocked()
     {
-        if (_streaming)
+        if (_claim is not null)
             throw new SkaidbException(
                 "connection is busy streaming: the protocol allows no other request until the "
                 + "stream ends, so finish or dispose the Stream() enumerator (or use a second "
@@ -1133,24 +1162,43 @@ public sealed class SkaidbConnection : DbConnection
         }
     }
 
-    private byte[] ReadFrame()
+    private byte[] ReadFrame() => ReadFrame(_stream);
+
+    /// <summary>
+    /// The next frame of the stream that holds <paramref name="claim"/>,
+    /// from the socket that stream was opened on, or the error that says the
+    /// socket is gone. Call with <see cref="_lock"/> held.
+    /// </summary>
+    private byte[] ReadFrame(StreamClaim claim)
     {
-        byte[] head = ReadExact(4);
+        if (!ReferenceEquals(_claim, claim)) throw StreamEnded();
+        return ReadFrame(claim.Socket);
+    }
+
+    /// <summary>
+    /// One whole frame from <paramref name="socket"/>. The socket is the
+    /// caller's and is read to the end of the frame, whatever becomes of
+    /// the connection's own meanwhile; a failure breaks the connection only
+    /// if it is still on that socket.
+    /// </summary>
+    private byte[] ReadFrame(Stream? socket)
+    {
+        byte[] head = ReadExact(socket, 4);
         uint length = BinaryPrimitives.ReadUInt32BigEndian(head); // length is BIG-endian
         if (length > 64 * 1024 * 1024)
         {
             // The payload stays on the socket, unread: whatever is read next
             // would be taken from the middle of it.
-            MarkBroken();
+            MarkBroken(socket);
             throw new SkaidbException($"frame too large: {length} bytes");
         }
-        return ReadExact((int)length);
+        return ReadExact(socket, (int)length);
     }
 
     // NetworkStream.Read can return short; loop until N bytes are read.
-    private byte[] ReadExact(int n)
+    private byte[] ReadExact(Stream? socket, int n)
     {
-        if (_stream is null) throw new SkaidbException("connection is not open");
+        if (socket is null) throw new SkaidbException("connection is not open");
         var buf = new byte[n];
         int got = 0;
         while (got < n)
@@ -1158,27 +1206,37 @@ public sealed class SkaidbConnection : DbConnection
             int read;
             try
             {
-                read = _stream.Read(buf, got, n - got);
+                read = socket.Read(buf, got, n - got);
             }
-            catch (IOException e)
+            catch (Exception e) when (e is IOException or ObjectDisposedException)
             {
                 // The statement may already have executed, so it is NOT
                 // retried here — an ambiguous write must never repeat. The
                 // connection is marked broken, its socket closed (a read
                 // that timed out leaves the server holding the session), and
-                // the NEXT statement re-dials.
-                MarkBroken();
+                // the NEXT statement re-dials. (Disposed: the socket was
+                // closed under the read.)
+                MarkBroken(socket);
                 throw new SkaidbException($"read failed: {e.Message}", e);
             }
             if (read <= 0)
             {
-                MarkBroken();
+                MarkBroken(socket);
                 throw new SkaidbException("connection closed by server");
             }
             got += read;
         }
         return buf;
     }
+
+    /// <summary>
+    /// What a <see cref="Stream(string, SkaidbConsistency?)"/> enumerator
+    /// throws when it is advanced after its socket was closed.
+    /// </summary>
+    private static SkaidbException StreamEnded() =>
+        new SkaidbException(
+            "the stream ended with its connection: the socket it was opened on has been closed, and a "
+            + "stream reads no other");
 
     // ---- handshake ---------------------------------------------------------
 
@@ -1385,10 +1443,15 @@ public sealed class SkaidbConnection : DbConnection
     /// paying to receive an export they walked away from.</para>
     /// <para>An enumerator that is neither finished nor disposed — a
     /// hand-rolled <c>GetEnumerator()</c> that is simply dropped — claims the
-    /// connection for good, because nothing in .NET runs an iterator's
-    /// <c>finally</c> at collection time. That connection reports
-    /// <see cref="IsUsable"/> false, so a pool discards it instead of handing
-    /// out a socket with rows still queued on it.</para>
+    /// connection for as long as its socket is open, because nothing in .NET
+    /// runs an iterator's <c>finally</c> at collection time. That connection
+    /// reports <see cref="IsUsable"/> false, so a pool discards it instead of
+    /// handing out a socket with rows still queued on it.</para>
+    /// <para>A stream belongs to the socket it was opened on. When that
+    /// socket is closed — <see cref="Close"/>, or a transport failure — the
+    /// stream is over: its enumerator throws when advanced and its disposal
+    /// does nothing. It never reads the socket the connection dials next,
+    /// and that socket is free from the start.</para>
     /// <para>Do not return the enumerable out of
     /// <see cref="SkaidbConnectionPool.WithConnection{T}(Func{SkaidbConnection, T})"/>: it is lazy, and the
     /// connection would go back to the pool before the first row is read.
@@ -1456,14 +1519,22 @@ public sealed class SkaidbConnection : DbConnection
         // and would be released on whichever thread happened to call
         // MoveNext last. The flag instead makes a concurrent statement fail
         // loudly; _lock keeps its old job of guarding one frame's bytes.
+        //
+        // The claim is on the socket the request goes out on. Every frame of
+        // the stream is read from that socket, and once it is closed — by
+        // Close(), or because the connection broke — the stream is over:
+        // the socket the connection dials next is not this stream's to read
+        // from, to drain, to break or to release.
+        StreamClaim claim;
         lock (_lock)
         {
             ThrowIfStreamingLocked();
-            _streaming = true;
+            if (_stream is null) throw new SkaidbException("connection is not open");
+            claim = new StreamClaim(_stream);
+            _claim = claim;
         }
 
         bool live = false;   // true while the server still owes frames
-        bool released = false;   // the exchange ended in its first frame, before any row was yielded
         try
         {
             BinReader first;
@@ -1473,7 +1544,7 @@ public sealed class SkaidbConnection : DbConnection
                 lock (_lock)
                 {
                     WriteFrame(request);
-                    first = new BinReader(ReadFrame());
+                    first = new BinReader(ReadFrame(claim));
                 }
             }
             catch (SkaidbException) when (_broken)
@@ -1502,13 +1573,13 @@ public sealed class SkaidbConnection : DbConnection
                 // set in ONE frame, streamed or not — the frame ExecuteReader()
                 // receives, decoded by the same code. Nothing follows it, so
                 // the connection is handed back before the first row is
-                // yielded, and the finally below must not release it again:
-                // by then it may belong to a stream the caller started.
+                // yielded. (The finally below releases this stream's claim
+                // only: by then the socket may belong to a stream the caller
+                // started.)
                 var sets = ReadResultSets(first);
                 StreamColumns = sets.Columns!;
                 StreamResultSets = SkaidbDataReader.FromResult(sets, null);
-                lock (_lock) { _streaming = false; }
-                released = true;
+                Release(claim);
                 foreach (var row in sets.Rows!) yield return row;
                 yield break;
             }
@@ -1517,7 +1588,7 @@ public sealed class SkaidbConnection : DbConnection
                 // The server is not answering the stream contract, so there is
                 // no telling whether more frames follow; draining could block
                 // on one that never comes. Break the socket instead.
-                MarkBroken();
+                MarkBroken(claim.Socket);
                 throw new SkaidbException($"unexpected response tag {tag} to stream request");
             }
             uint ncols = first.U32();
@@ -1529,9 +1600,12 @@ public sealed class SkaidbConnection : DbConnection
             while (live)
             {
                 BinReader r;
+                // Its socket closed since the last row: the stream is over.
+                // (Checked again under the lock, by ReadFrame.)
+                if (!ReferenceEquals(_claim, claim)) throw StreamEnded();
                 try
                 {
-                    lock (_lock) { r = new BinReader(ReadFrame()); }
+                    lock (_lock) { r = new BinReader(ReadFrame(claim)); }
                 }
                 catch (SkaidbException) when (_broken)
                 {
@@ -1558,7 +1632,7 @@ public sealed class SkaidbConnection : DbConnection
                     // As above: an out-of-contract tag says nothing about what
                     // still follows, so do not wait around draining for it.
                     live = false;
-                    MarkBroken();
+                    MarkBroken(claim.Socket);
                     throw new SkaidbException($"unexpected frame tag {t} in stream");
                 }
             }
@@ -1568,18 +1642,20 @@ public sealed class SkaidbConnection : DbConnection
             // Abandoned early — break, exception, or an explicit Dispose of
             // the enumerator. Read off what the server still owes, so the next
             // statement on this connection does not decode a leftover
-            // RowsChunk as its own reply.
+            // RowsChunk as its own reply. Only while the socket is still
+            // this stream's: one closed since took the unread frames with
+            // it, and the socket that replaced it never carried any.
             int budget = StreamDrainFrames;
-            while (live)
+            while (live && ReferenceEquals(_claim, claim))
             {
-                if (budget-- == 0) { MarkBroken(); break; }
+                if (budget-- == 0) { MarkBroken(claim.Socket); break; }
                 try
                 {
                     BinReader r;
-                    lock (_lock) { r = new BinReader(ReadFrame()); }
+                    lock (_lock) { r = new BinReader(ReadFrame(claim)); }
                     byte t = r.U8();
                     if (t == 7 || t == 3) live = false;
-                    else if (t != 6) { MarkBroken(); break; }
+                    else if (t != 6) { MarkBroken(claim.Socket); break; }
                 }
                 catch (Exception)
                 {
@@ -1588,13 +1664,27 @@ public sealed class SkaidbConnection : DbConnection
                     // here would bury the caller's own exception, or turn a
                     // plain `break` into one. Break the connection and let
                     // EnsureLive() re-dial on the next statement.
-                    MarkBroken();
+                    MarkBroken(claim.Socket);
                     break;
                 }
             }
             // Released last: until this drops, IsUsable is false and every
             // other statement on the connection is refused.
-            if (!released) lock (_lock) { _streaming = false; }
+            Release(claim);
+        }
+    }
+
+    /// <summary>
+    /// The stream holding <paramref name="claim"/> is over: its socket is
+    /// free for the next request. Nothing happens when the claim is no
+    /// longer the connection's — the socket was closed, or the stream
+    /// released it already.
+    /// </summary>
+    private void Release(StreamClaim claim)
+    {
+        lock (_lock)
+        {
+            if (ReferenceEquals(_claim, claim)) _claim = null;
         }
     }
 

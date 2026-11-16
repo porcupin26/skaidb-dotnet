@@ -167,8 +167,8 @@ returned from it. One the body leaves open — started, and neither run out
 nor disposed — holds the connection, so neither `COMMIT` nor `ROLLBACK` can
 be sent: the helper throws (the body's exception, else `connection is busy
 streaming: …`) and closes the socket, which is what ends the transaction on
-the server; the connection re-dials on its next statement once that stream
-has been disposed. Other threads must leave the connection alone meanwhile:
+the server; that stream is over with its socket, and the connection re-dials
+on its next statement. Other threads must leave the connection alone meanwhile:
 a statement they ran on it would be part of the transaction.
 
 ### `BeginTransaction()`
@@ -207,7 +207,10 @@ See [streaming.md](streaming.md#following-a-stream).
 
 Closes the socket and drops the prepared-statement cache; `IsOpen` and
 `IsUsable` become false and `State` is `Closed`. The settings stay: `Open()`
-dials again. Raises `StateChange` (Open → Closed). A command on a closed
+dials again. A `Stream()` still open ends with the socket: its enumerator
+throws `the stream ended with its connection: …` when advanced, and
+disposing it touches nothing of the connection `Open()` dials next. Raises
+`StateChange` (Open → Closed). A command on a closed
 connection throws `SkaidbException("connection is not open")`; a command
 with no connection at all throws `InvalidOperationException`.
 

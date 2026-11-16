@@ -413,6 +413,103 @@ public class ClientTests
         Assert.Equal(2, srv.Hellos.Count);                                // Hello again after the reconnect
     }
 
+    // ---- a stream and the socket it was opened on ----------------------------------
+
+    private const string Big = "SELECT id FROM big";
+
+    /// <summary>A ten-row stream, one row a chunk, and <c>SELECT 42</c>.</summary>
+    private static Scripted TenRows() =>
+        new Scripted()
+            .Answer(Big, new[] { F.Header("id") }
+                .Concat(Enumerable.Range(0, 10).Select(i => F.Chunk(new object?[] { (long)i }))).Append(F.End()).ToArray())
+            .Answer("SELECT 42", F.Rows(new[] { "v" }, new object?[] { 42L }));
+
+    [Fact]
+    public void Closing_a_connection_ends_the_stream_on_it_and_the_one_opened_next_is_nobody_s()
+    {
+        using var srv = new FakeServer(TenRows().Handle);
+        using var c = new SkaidbConnection($"Host=127.0.0.1;Port={srv.Port};User=ada;Password=secret;Timeout=2");
+        c.Open();
+        var old = c.Stream(Big).GetEnumerator();
+        Assert.True(old.MoveNext());
+        Assert.False(c.IsUsable);                                          // the stream holds the socket
+
+        // Close() ends the session, and the stream with it; Open() dials a
+        // socket no stream was ever opened on.
+        c.Close();
+        c.Open();
+        Assert.Equal(2, srv.Connections);
+        Assert.True(c.IsUsable);
+        Assert.Equal(System.Data.ConnectionState.Open, c.State);           // not Fetching
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+
+        // Letting go of the old enumerator reads nothing off the new socket:
+        // there is nothing of that stream on it to drain, and waiting for
+        // some would cost a read timeout and then the connection.
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        old.Dispose();
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(1), $"disposing the old stream took {clock.Elapsed.TotalMilliseconds:F0} ms");
+        Assert.True(c.IsUsable);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(2, srv.Connections);                                  // the same second connection, never broken
+    }
+
+    [Fact]
+    public void A_stream_whose_socket_is_gone_ends_with_an_error_and_takes_no_frame_of_a_later_stream()
+    {
+        using var srv = new FakeServer(TenRows().Handle);
+        using var c = Connect(srv);
+        var old = c.Stream(Big).GetEnumerator();
+        Assert.True(old.MoveNext());
+        c.Close();
+        c.Open();
+
+        // A new stream, on the new socket, while the old enumerator is
+        // still around.
+        using var fresh = c.Stream(Big).GetEnumerator();
+        Assert.True(fresh.MoveNext());
+        Assert.Equal(0L, fresh.Current[0]);
+
+        // Advancing the old one must not read the new stream's next chunk
+        // as its own: its socket is closed, so it is over.
+        var gone = Assert.Throws<SkaidbException>(() => old.MoveNext());
+        Assert.Contains("the stream ended with its connection", gone.Message);
+        old.Dispose();
+        Assert.False(c.IsUsable);                                          // the new stream still holds the connection ...
+        Assert.Contains("busy streaming", Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT 42")).Message);
+        var rest = new List<long>();
+        while (fresh.MoveNext()) rest.Add((long)fresh.Current[0]!);
+        Assert.Equal(Enumerable.Range(1, 9).Select(i => (long)i), rest);   // ... and got every row of its own, in order
+        Assert.True(c.IsUsable);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(2, srv.Connections);
+    }
+
+    [Fact]
+    public void A_connection_broken_under_an_open_stream_re_dials_without_waiting_for_the_stream_to_be_disposed()
+    {
+        var s = TenRows().Answer("BEGIN", F.Ddl());
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        // Transaction() closes the socket under a stream its body left open
+        // (nothing else can end that transaction). The stream died with the
+        // socket; the connection is free to dial another.
+        IEnumerator<object?[]>? left = null;
+        Assert.Contains("busy streaming", Assert.Throws<SkaidbException>(() => c.Transaction(conn =>
+        {
+            left = conn.Stream(Big).GetEnumerator();
+            Assert.True(left.MoveNext());
+        })).Message);
+        Assert.False(c.IsUsable);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(2, srv.Connections);
+        Assert.Contains("the stream ended with its connection", Assert.Throws<SkaidbException>(() => left!.MoveNext()).Message);
+        left!.Dispose();
+        Assert.True(c.IsUsable);
+        Assert.Equal(42L, Scalar(c, "SELECT 42"));
+        Assert.Equal(2, srv.Connections);
+    }
+
     [Theory]
     [InlineData("a read timeout")]
     [InlineData("a stream abandoned with too much left to drain")]
