@@ -65,9 +65,11 @@ The full key table is in [api.md](api.md#constructors).
 ## Connection lifecycle
 
 - `Open()` dials and authenticates; it is idempotent.
-- `Close()` releases the socket and keeps the settings; `Open()` dials
-  again. This is what lets Dapper and other callers that open and close a
-  connection around each call work.
+- `Close()` releases the socket and keeps the connection's settings,
+  `Database` included; `Open()` dials again. This is what lets Dapper and
+  other callers that open and close a connection around each call work.
+  What a session set with `SET CONSISTENCY` or `SET SCAN BUDGET` ends with
+  it: keep the connection open for as long as such a setting must hold.
 - `Dispose()` is final.
 - `State` is `Closed`, `Open`, or `Open | Fetching` while a
   `Stream()` holds the connection; `StateChange` fires on `Open()` and

@@ -413,6 +413,18 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     public IReadOnlyList<string> Seeds { get; private set; } = Array.Empty<string>();
 
+    /// <summary>
+    /// The session's consistency override and its scan budget, as the
+    /// application set them: the <c>SET CONSISTENCY …</c> and the <c>SET SCAN
+    /// BUDGET …</c> statement the server accepted last (see NoteStatement),
+    /// without their comments; null when there is none, or it was cleared
+    /// with <c>… DEFAULT</c>. Session state like the database: a re-dial
+    /// sends them again before the statement it was made for (OpenCore).
+    /// <see cref="Close"/> ends the session and forgets them.
+    /// </summary>
+    private string? _setConsistency;
+    private string? _setScanBudget;
+
     private string _database = "";
     /// <summary>
     /// The session database: the connection string's <c>Database</c>, or the
@@ -589,6 +601,14 @@ public sealed class SkaidbConnection : DbConnection
                 use.CommandText = "USE \"" + Database.Replace("\"", "\"\"") + "\"";
                 use.ExecuteNonQuery();
             }
+            // So are the settings the application made with SET: behind the
+            // database and before the statement this dial is for, the
+            // consistency override, then the scan budget. One that the new
+            // connection refuses fails the dial, and with it the statement:
+            // it must not read at another consistency, or past a limit,
+            // than the application set.
+            if (_setConsistency is string consistency) Query(consistency, Consistency);
+            if (_setScanBudget is string budget) Query(budget, Consistency);
         }
         catch (SkaidbException)
         {
@@ -1031,6 +1051,10 @@ public sealed class SkaidbConnection : DbConnection
         _open = false;
         _broken = false;
         _prepared.Clear();
+        // The session is over, and what was set in it: the next Open()
+        // starts another, in the connection's Database.
+        _setConsistency = null;
+        _setScanBudget = null;
         CleanupSocket();
         // Closed while checked out instead of released: the pool stops
         // counting it against its member.
@@ -1885,13 +1909,21 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     internal QueryResult RunStatement(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency)
     {
-        var result = RunStatementCore(sql, values, consistency);
-        NoteStatement(sql);
+        var result = RunStatementCore(sql, values, consistency, out string sent);
+        NoteStatement(sent);
         return result;
     }
 
-    private QueryResult RunStatementCore(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency)
+    /// <summary>
+    /// <paramref name="sent"/> is the statement as the server took it: the
+    /// text with its <c>?</c> placeholders when it ran prepared, the text
+    /// with the values in it when it did not. A session statement is never
+    /// prepared, so what is noted of one is a text that can be sent again.
+    /// </summary>
+    private QueryResult RunStatementCore(string sql, IReadOnlyList<object?> values, SkaidbConsistency consistency,
+                                         out string sent)
     {
+        sent = sql;
         if (values.Count > 0)
         {
             try
@@ -1906,7 +1938,8 @@ public sealed class SkaidbConnection : DbConnection
                 // Statement kind the server will not prepare: bind as text.
             }
         }
-        return Query(ParameterBinder.Bind(sql, values), consistency);
+        sent = ParameterBinder.Bind(sql, values);
+        return Query(sent, consistency);
     }
 
     /// <summary>Prepare <paramref name="sql"/> and run it once per row in one OP_EXECUTE_BATCH; the total affected.</summary>
@@ -1948,7 +1981,54 @@ public sealed class SkaidbConnection : DbConnection
         // tables of the same names in whatever database a new session
         // starts in.
         if (TryReadUse(sql, out string? database)) _database = database;
+        // So did a SET CONSISTENCY or a SET SCAN BUDGET: the last one of
+        // each kind is kept, to be sent again on the next dial, and one
+        // that ends in DEFAULT clears what was kept.
+        else if (TryReadSetting(sql, out bool scanBudget, out string? setting))
+        {
+            if (scanBudget) _setScanBudget = setting;
+            else _setConsistency = setting;
+        }
         if (Pool is not null && SkaidbConnectionPool.IsWrite(sql)) Pool.Wrote(this);
+    }
+
+    /// <summary>
+    /// The session setting <paramref name="sql"/> makes when it is exactly
+    /// one <c>SET CONSISTENCY …</c> or one <c>SET SCAN BUDGET …</c>
+    /// statement: the keywords in any case, whitespace as it comes, an
+    /// optional <c>;</c> behind it and <c>--</c> comments anywhere a server
+    /// skips them. The driver reads the words that name the setting and no
+    /// further: <paramref name="setting"/> is the statement without its
+    /// comments, to send again as it is — or null when the next word is
+    /// <c>DEFAULT</c>, which clears the setting. Any other text is not read
+    /// as one, and what the connection knows of its session is left alone.
+    /// </summary>
+    internal static bool TryReadSetting(string sql, out bool scanBudget, out string? setting)
+    {
+        scanBudget = false;
+        setting = null;
+        int i = 0, n = sql.Length;
+        while (i < n && char.IsWhiteSpace(sql[i])) i++;
+        // Nearly every statement stops here: it starts with neither the
+        // keyword nor a comment that one could follow.
+        if (i >= n || !(sql[i] is 'S' or 's' or '-')) return false;
+        string text = (sql.IndexOf("--", i, StringComparison.Ordinal) >= 0 ? WithoutLineComments(sql) : sql).Trim();
+        if (text.EndsWith(';')) text = text.Substring(0, text.Length - 1).TrimEnd();
+        // A `;` inside: more than one statement, and not this reader's.
+        if (text.Contains(';')) return false;
+        string[] words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        static bool Is(string word, string keyword) => word.Equals(keyword, StringComparison.OrdinalIgnoreCase);
+        if (words.Length < 2 || !Is(words[0], "SET")) return false;
+        int next;
+        if (Is(words[1], "CONSISTENCY")) next = 2;
+        else if (words.Length >= 3 && Is(words[1], "SCAN") && Is(words[2], "BUDGET"))
+        {
+            scanBudget = true;
+            next = 3;
+        }
+        else return false;
+        setting = words.Length > next && Is(words[next], "DEFAULT") ? null : text;
+        return true;
     }
 
     /// <summary>

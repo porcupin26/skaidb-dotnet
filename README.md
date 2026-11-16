@@ -170,6 +170,30 @@ foreach (var row in conn.Stream("SELECT ...", SkaidbConsistency.One)) { ... }
 
 `ExecuteBatch` uses the command's level.
 
+### Session settings
+
+A session carries, besides its database, two settings that are made with
+ordinary statements:
+
+```csharp
+using var set = conn.CreateCommand();
+set.CommandText = "SET CONSISTENCY ALL";            // every statement of the session runs at ALL,
+set.ExecuteNonQuery();                              // whatever level its request carries
+set.CommandText = "SET SCAN BUDGET ROWS 100000";    // a statement that would read more is refused:
+set.ExecuteNonQuery();                              // `resource limit: scan budget exceeded …`
+```
+
+`SET CONSISTENCY DEFAULT` (server 0.349 or later) and `SET SCAN BUDGET
+DEFAULT` clear them. The driver notes each such statement the server
+accepted — a text that is exactly one `SET CONSISTENCY …` or one `SET SCAN
+BUDGET …`, keywords in any case, an optional `;`, `--` comments skipped —
+and keeps the last of each kind; one that ends in `DEFAULT` clears what it
+kept. When the connection [re-dials](#reconnect-and-errors) they are sent
+again, behind the `USE` and before the statement that needed the dial, so a
+session outlives the socket it was set up on. `Close()` ends the session:
+the next `Open()` starts one in the connection's `Database` with nothing
+set.
+
 ## Statements
 
 ### `SkaidbCommand`
@@ -568,14 +592,18 @@ Every error the driver raises is a `SkaidbException` (a `DbException`).
   false. Its socket is closed there and then, so a server that is still on
   the other end — a read that timed out — drops the session and whatever
   transaction a `BEGIN` opened on it. The next statement **re-dials** (through
-  the seed walk), re-authenticates, re-sends the Hello frame, enters the
-  session's database again and clears the prepared-statement cache. That
-  database is the connection string's `Database`, or the one entered last
+  the seed walk), re-authenticates, re-sends the Hello frame, restores the
+  session and clears the prepared-statement cache. The session is its
+  database — the connection string's `Database`, or the one entered last
   since, with `ChangeDatabase()` or with a `USE` statement the server
-  accepted; if it cannot be entered on the new connection the statement
-  fails with that error and is not sent. Because the failed
-  statement *may* have executed, the driver never retries it for you: retry a
-  write only if it is idempotent.
+  accepted — and the settings made with `SET CONSISTENCY …` and `SET SCAN
+  BUDGET …` statements ([Session settings](#session-settings)): the driver
+  sends `USE`, then the consistency override, then the scan budget, before
+  the statement. If one of them is refused on the new connection the
+  statement fails with that error and is not sent: it never runs in another
+  database, at another consistency or past a limit the application set.
+  Because the failed statement *may* have executed, the driver never
+  retries it for you: retry a write only if it is idempotent.
 - A connection the server closed while it sat **idle** — a restart, a
   failover, an idle timeout — is detected before the next statement is
   sent, so that statement simply re-dials and runs: nothing was in flight,

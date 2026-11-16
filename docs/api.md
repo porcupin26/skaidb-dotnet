@@ -124,6 +124,28 @@ needed the dial throws that error and is not sent, and so does every
 statement after it until the database exists again or the connection is
 closed and pointed elsewhere.
 
+### Session settings: `SET CONSISTENCY`, `SET SCAN BUDGET`
+
+Two more things live on the session and are noted the same way, from the
+statement that sets them. When the server has accepted a text that is
+exactly one statement whose first words are `SET CONSISTENCY`, or `SET SCAN
+BUDGET` — keywords in any case, free whitespace, an optional `;` behind it,
+`--` comments skipped — the driver keeps that statement, without its
+comments, as the session's consistency override or scan budget: one of each
+kind, the last one accepted. A statement whose next word is `DEFAULT`
+clears what was kept. A statement run with a parameter (`SET SCAN BUDGET
+ROWS @n`) is kept as the text that was sent, the value in it. Any other
+text changes nothing the driver knows.
+
+On every re-dial the driver sends, after the `USE` and before the statement
+that needed the dial, the kept `SET CONSISTENCY …` and then the kept `SET
+SCAN BUDGET …`. If the new connection refuses one, the statement throws
+that error and is not sent — it does not run under other settings than the
+application made — and the next statement dials again.
+
+`Close()` ends the session and forgets both; `Database` is a property of
+the connection and stays.
+
 ### `Transaction<T>(Func<SkaidbConnection, T> body, int attempts = 3, string begin = "BEGIN")` → `T`
 
 Runs `body` inside a transaction on this connection and returns its value;
@@ -206,8 +228,10 @@ See [streaming.md](streaming.md#following-a-stream).
 ### `Close()`
 
 Closes the socket and drops the prepared-statement cache; `IsOpen` and
-`IsUsable` become false and `State` is `Closed`. The settings stay: `Open()`
-dials again. A `Stream()` still open ends with the socket: its enumerator
+`IsUsable` become false and `State` is `Closed`. The connection's settings
+stay, `Database` included: `Open()` dials again. The session is over, and
+with it what `SET CONSISTENCY` and `SET SCAN BUDGET` statements set in it.
+A `Stream()` still open ends with the socket: its enumerator
 throws `the stream ended with its connection: …` when advanced, and
 disposing it touches nothing of the connection `Open()` dials next. Raises
 `StateChange` (Open → Closed). A command on a closed
@@ -250,8 +274,9 @@ Behaviour of the three `Execute*` methods:
 1. If the connection's transport died earlier, or the look at the idle
    socket finds it dead (a zero-timeout poll before anything is written:
    closed or reset by the peer, or holding bytes nobody asked for), the
-   connection re-dials first (seed walk, handshake, Hello, `USE`), clearing
-   the prepared-statement cache. Inside `SkaidbConnection.Transaction()` it
+   connection re-dials first (seed walk, handshake, Hello, `USE`, the
+   session's `SET CONSISTENCY` and `SET SCAN BUDGET`), clearing the
+   prepared-statement cache. Inside `SkaidbConnection.Transaction()` it
    throws instead.
 2. With parameters, the statement is prepared on the server (once per SQL
    text per connection; the connection keeps up to 240 prepared, and closes

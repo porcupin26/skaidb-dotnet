@@ -75,7 +75,9 @@ is how the array above gets through; it has no SQL literal form.
 `Database=app` runs `USE app` right after the handshake (and after every
 reconnect). Without it, statements run in the server's default database.
 `conn.ChangeDatabase("other")` or a `USE other` statement moves the session,
-and from then on that is the database a reconnect enters.
+and from then on that is the database a reconnect enters. A reconnect also
+sets again what the session set with `SET CONSISTENCY …` and `SET SCAN
+BUDGET …` statements.
 
 ## Anonymous connections
 
@@ -108,7 +110,8 @@ new SkaidbConnection("Seeds=db1:7000,db2:7000,db3:7000;User=app;Password=secret"
 
 The seeds are shuffled and tried until one connects. The same walk runs when
 a connection is lost later: the next statement on the connection re-dials,
-re-authenticates, re-selects the database, and runs. A statement that was in
+re-authenticates, restores the session (its database and its `SET`
+settings), and runs. A statement that was in
 flight when the connection died throws and is never retried by the driver
 (it may have executed).
 
