@@ -157,7 +157,8 @@ others report their own count.
 
 There is no transaction around a batch: every statement (and every row of a
 merged run) autocommits, and on an error the statements before it stay
-applied.
+applied. A batch run inside a transaction — one `BEGIN` opened on the
+connection — is part of that transaction, like any other statement of it.
 
 ## Transactions
 

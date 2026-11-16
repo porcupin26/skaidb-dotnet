@@ -11,7 +11,8 @@
 // parameter, SELECT with a bound WHERE and ORDER BY reading every type back,
 // UPDATE row counts, a one-round-trip batch, a streamed result of 2500 rows,
 // a streamed range with bound parameters (server >= 0.330),
-// a server error surfacing as SkaidbException, and the drivers-table row the
+// a server error surfacing as SkaidbException, a batch inside a transaction,
+// a pool's borrowers each in their own session, and the drivers-table row the
 // Hello frame creates (client_name dotnet, client_version = package version).
 
 using System;
@@ -219,6 +220,67 @@ try
     catch (SkaidbException e)
     {
         Check(e.Message.Contains("NaN"), $"NaN refused client-side: {e.Message}");
+    }
+
+    // ---- a batch inside a transaction is part of it -------------------------
+    // (A standalone server: a cluster refuses plain BEGIN, and the check is skipped.)
+    bool began = false;
+    try
+    {
+        Exec(conn, "BEGIN");
+        began = true;
+    }
+    catch (SkaidbException e)
+    {
+        Console.WriteLine($"  skip a batch inside a transaction: this server refuses plain BEGIN ({e.Message})");
+    }
+    if (began)
+    {
+        long inside;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = $"INSERT INTO {T} (id, s) VALUES (?, ?)";
+            inside = cmd.ExecuteBatch(new List<IReadOnlyList<object?>>
+            {
+                new object?[] { 901L, "in a transaction" }, new object?[] { 902L, "in a transaction" },
+            });
+        }
+        Exec(conn, "ROLLBACK");
+        using var left = conn.CreateCommand();
+        left.CommandText = $"SELECT count(*) FROM {T} WHERE id > ?";
+        left.Parameters.Add(900L);
+        object? still = left.ExecuteScalar();
+        Check(inside == 2 && still is long none && none == 0,
+              $"a batch inside a transaction is rolled back with it ({inside} rows in the batch, {still} left)");
+    }
+
+    // ---- a pool hands every borrower its own session -------------------------
+    using (var pool = new SkaidbConnectionPool(connString, maxsize: 1))
+    {
+        bool limited = pool.WithConnection(c =>
+        {
+            Exec(c, "SET SCAN BUDGET ROWS 1");
+            Exec(c, "SET CONSISTENCY ALL");
+            try
+            {
+                Exec(c, $"SELECT id FROM {T}");
+                return false;
+            }
+            catch (SkaidbException e)
+            {
+                return e.Message.Contains("scan budget exceeded");
+            }
+        });
+        Check(limited, "a borrower's SET SCAN BUDGET ROWS 1 refuses its own scan");
+        try
+        {
+            pool.WithConnection(c => Exec(c, $"SELECT id FROM {T}"));
+            Check(true, "the next borrower scans without that borrower's budget");
+        }
+        catch (SkaidbException e)
+        {
+            Check(false, $"the next borrower scans without that borrower's budget: {e.Message}");
+        }
     }
 
     // ---- multiple result sets: a plain SELECT has none ---------------------

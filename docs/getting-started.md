@@ -152,7 +152,8 @@ cmd.CommandText = "INSERT INTO users (id, name) VALUES (?, ?)";
 cmd.ExecuteBatch(new List<IReadOnlyList<object?>> { new object?[] { 1L, "Ada" }, new object?[] { 2L, "Linus" } });
 ```
 
-One round-trip for all rows; each row autocommits on its own.
+One round-trip for all rows; each row autocommits on its own, or, inside a
+transaction, joins it.
 
 ## Transactions
 

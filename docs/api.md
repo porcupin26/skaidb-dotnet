@@ -340,7 +340,10 @@ Behaviour of the three `Execute*` methods:
 arity (`batch row expects N parameters, got M`), sends one
 `OP_EXECUTE_BATCH`, and returns the total. Rows autocommit individually; on
 the first failing row the server's error names the row index and how many
-applied before it. An empty list returns 0 without a round-trip.
+applied before it. With a transaction open on the connection the rows join
+it: they commit or roll back with it, and a failing row leaves the
+transaction open with the earlier rows in it. An empty list returns 0
+without a round-trip.
 
 Statements on a connection are serialized by a lock. While a `Stream()` is
 open, a statement from another thread throws `connection is busy streaming`

@@ -277,7 +277,10 @@ Runs a prepared statement once per row in a single request and returns the
 **total** affected count. Rows **autocommit individually**: on the first
 failing row the server answers with an error naming the row index and how
 many rows applied before it, and those earlier rows stay applied — so use
-idempotent statements. Only preparable statements (`SELECT`/`INSERT`/
+idempotent statements. Inside a [transaction](#transactions) the rows are
+part of it instead: nobody else sees them before the `COMMIT`, a `ROLLBACK`
+undoes them all, and after a failing row the transaction is still open with
+the earlier rows in it. Only preparable statements (`SELECT`/`INSERT`/
 `UPDATE`/`DELETE`) can be batched; the whole request must fit one 64 MiB
 frame. An empty list returns 0 without a round-trip.
 

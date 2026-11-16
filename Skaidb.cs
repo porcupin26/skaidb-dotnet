@@ -2459,7 +2459,8 @@ public sealed class SkaidbConnection : DbConnection
     /// <summary>
     /// Execute a prepared statement once per row in ONE round-trip. Rows
     /// autocommit individually: a failure names the row and earlier rows stay
-    /// applied, so the statement must be idempotent.
+    /// applied, so the statement must be idempotent. With a transaction open
+    /// on the connection the rows are part of it.
     /// </summary>
     internal QueryResult ExecuteBatch(uint id, IReadOnlyList<IReadOnlyList<object?>> rows,
                                       SkaidbConsistency consistency)
@@ -3082,7 +3083,9 @@ public sealed class SkaidbCommand : DbCommand
     /// <summary>
     /// Execute this statement once per row in ONE round-trip. Rows autocommit
     /// individually: a failure names the row and earlier rows stay applied,
-    /// so the statement must be idempotent. Returns total affected rows.
+    /// so the statement must be idempotent. Inside a transaction the rows are
+    /// part of it: they commit or roll back with it, and a failing row
+    /// leaves it open with the earlier rows in it. Returns total affected rows.
     /// </summary>
     public long ExecuteBatch(IReadOnlyList<IReadOnlyList<object?>> rows)
     {
@@ -3699,6 +3702,7 @@ public sealed class SkaidbDataReader : DbDataReader
 /// server as ONE <c>OP_EXECUTE_BATCH</c> round-trip; everything else runs one
 /// statement at a time. A batch is not a transaction: each statement (each
 /// row of a merged run) autocommits, and a failure leaves earlier ones applied.
+/// Run inside a transaction opened on the connection, it is part of that one.
 /// </summary>
 public sealed class SkaidbBatch : DbBatch
 {
