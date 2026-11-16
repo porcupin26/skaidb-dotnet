@@ -434,8 +434,7 @@ public class TransactionTests
         {
             runs++;
             Exec(conn, Update);
-            srv.CloseAll();
-            Thread.Sleep(50);
+            srv.CloseAll(seenBy: conn);
             Exec(conn, second);
         }));
         Assert.Contains("connection lost inside a transaction", e.Message);
@@ -453,8 +452,7 @@ public class TransactionTests
         {
             runs++;
             Exec(conn, Update);
-            srv.CloseAll();
-            Thread.Sleep(50);
+            srv.CloseAll(seenBy: conn);
         }));
         Assert.Contains("connection lost inside a transaction", e.Message);
         Assert.Equal(2, runs);
@@ -666,11 +664,7 @@ public class TransactionTests
         Func<SkaidbConnection, string> body = conn =>
         {
             Exec(conn, Update);
-            if (!underAStatement)
-            {
-                srv.CloseAll();
-                Thread.Sleep(50);
-            }
+            if (!underAStatement) srv.CloseAll(seenBy: conn);
             try { Exec(conn, second); }
             catch (SkaidbException e) { two = e; }
             // The body swallowed that and carries on. Whichever way it runs
@@ -758,8 +752,7 @@ public class TransactionTests
         // The server restarts while the client sits idle. Any statement
         // re-dials before it is sent, and so does the helper's BEGIN (nothing
         // is open yet): the transaction runs, whole, on the new connection.
-        srv.CloseAll();
-        Thread.Sleep(50);
+        srv.CloseAll(seenBy: c);
         Assert.Equal(1, c.Transaction(conn => Exec(conn, Update)));
         Assert.Equal(new[] { "SELECT 1", "BEGIN", Update, "COMMIT" }, s.Log);
         Assert.Equal(2, srv.Connections);
@@ -769,10 +762,10 @@ public class TransactionTests
 
         // A pool finds its idle connection dead at the checkout and dials.
         using var pool = new SkaidbConnectionPool(Cs(srv));
-        Assert.Equal(7L, pool.WithConnection(p => Scalar(p, "SELECT 1")));
+        SkaidbConnection? idle = null;
+        Assert.Equal(7L, pool.WithConnection(p => Scalar(idle = p, "SELECT 1")));
         Assert.Equal(1, pool.Members().Sum(m => m.Idle));
-        srv.CloseAll();
-        Thread.Sleep(50);
+        srv.CloseAll(seenBy: idle!);
         Assert.Equal(1, pool.Transaction(conn => Exec(conn, Update)));
         Assert.Equal(new[] { "SELECT 1", "BEGIN", Update, "COMMIT" }, s.Log.Skip(4));
         Assert.Equal(4, srv.Connections);

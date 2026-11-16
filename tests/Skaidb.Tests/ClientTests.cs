@@ -261,8 +261,7 @@ public class ClientTests
         using var srv = new FakeServer((req, conn) => { if (req.Op == 1) seen.Add(req.Sql); return new[] { F.Ddl() }; });
         using var c = Connect(srv, "Database=my\"db");
         Assert.Equal(new[] { "USE \"my\"\"db\"" }, seen);
-        srv.CloseAll();
-        Thread.Sleep(50);
+        srv.CloseAll(seenBy: c);
         using (var cmd = c.CreateCommand()) { cmd.CommandText = "SELECT 1"; cmd.ExecuteNonQuery(); }
         Assert.Equal(new[] { "USE \"my\"\"db\"", "USE \"my\"\"db\"", "SELECT 1" }, seen);
         Assert.Equal(2, srv.Connections);
@@ -693,8 +692,7 @@ public class ClientTests
         // The server goes down, and is still down for the statement that
         // finds the connection dead: the re-dial fails.
         srv.Refuse = true;
-        srv.CloseAll();
-        Thread.Sleep(50);
+        srv.CloseAll(seenBy: c);
         Assert.StartsWith("no reachable endpoint in ", Assert.Throws<SkaidbException>(() => Scalar(c, "SELECT 42")).Message);
         Assert.True(c.IsOpen);                                             // broken, as it was; not closed
         Assert.False(c.IsUsable);
@@ -757,8 +755,7 @@ public class ClientTests
         Assert.Equal(1, prepares);
         // Closed while IDLE: nothing is in flight, so the next statement
         // re-dials before sending anything, re-prepares and runs.
-        srv.CloseAll();
-        Thread.Sleep(50);
+        srv.CloseAll(seenBy: c);
         Assert.False(c.IsUsable);
         Assert.Equal(9L, Scalar(c, "SELECT ?", 9));
         Assert.True(c.IsUsable);
@@ -803,8 +800,8 @@ public class ClientTests
         pool.Release(x);
         Assert.False(x.IsOpen);
         // An idle connection the server closed is detected on Acquire and discarded.
-        srv.CloseAll();
-        Thread.Sleep(50);
+        Assert.Equal(1, pool.Members().Sum(m => m.Idle));                  // a; x was b
+        srv.CloseAll(seenBy: a);
         int before = srv.Connections;
         Assert.Equal(1L, pool.WithConnection(c => Scalar(c, "SELECT 1")));
         Assert.Equal(before + 1, srv.Connections);

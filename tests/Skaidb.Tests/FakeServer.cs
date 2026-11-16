@@ -197,12 +197,56 @@ public sealed class FakeServer : IDisposable
         t.Start();
     }
 
+    /// <summary>
+    /// Milliseconds between <see cref="CloseAll()"/> returning and its
+    /// connections closing, from <c>SKAIDB_TEST_CLOSE_DELAY_MS</c> (0 when
+    /// unset). A client learns of a close when the kernel has delivered it,
+    /// which on a loaded machine is some time after the server made it; run
+    /// with a delay here, the suite fails every test that sleeps a fixed
+    /// time after a close instead of waiting for its client to see the loss
+    /// (<see cref="CloseAll(SkaidbConnection[])"/>).
+    /// </summary>
+    public static readonly int CloseDelayMs =
+        int.TryParse(Environment.GetEnvironmentVariable("SKAIDB_TEST_CLOSE_DELAY_MS"), out int ms) && ms > 0 ? ms : 0;
+
     /// <summary>Kill every live connection, as a node restart would.</summary>
     public void CloseAll()
     {
         List<Socket> copy;
         lock (_gate) { copy = new List<Socket>(_sockets); _sockets.Clear(); }
-        foreach (var s in copy)
+        if (CloseDelayMs > 0 && !_stopped)
+        {
+            var late = new Thread(() => { Thread.Sleep(CloseDelayMs); Close(copy); }) { IsBackground = true, Name = "fake-server-close" };
+            late.Start();
+            return;
+        }
+        Close(copy);
+    }
+
+    /// <summary>
+    /// <see cref="CloseAll()"/>, returning once every one of
+    /// <paramref name="seenBy"/> has seen its socket close: what a test
+    /// needs before it runs the statement that must find the connection
+    /// gone. A fixed sleep is not that — the close reaches the client when
+    /// the kernel delivers it.
+    /// </summary>
+    public void CloseAll(params SkaidbConnection[] seenBy)
+    {
+        CloseAll();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        foreach (var c in seenBy)
+        {
+            while (c.IsUsable)
+            {
+                if (DateTime.UtcNow > deadline) throw new TimeoutException("the close never reached the client");
+                Thread.Sleep(5);
+            }
+        }
+    }
+
+    private static void Close(List<Socket> sockets)
+    {
+        foreach (var s in sockets)
         {
             try { s.Shutdown(SocketShutdown.Both); } catch { /* ignore */ }
             try { s.Close(); } catch { /* ignore */ }
