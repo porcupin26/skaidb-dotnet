@@ -593,6 +593,73 @@ public class AdoNetTests
         Assert.Equal(2, srv.Connections);
     }
 
+    [Fact]
+    public void A_batch_s_Async_methods_answer_through_their_task_as_a_command_s_do()
+    {
+        // The Async methods of DbCommand never throw out of the call: a
+        // token cancelled beforehand is a cancelled task, a failed statement
+        // a faulted one. Code that starts a call and awaits it later relies
+        // on that, and a batch is no different from a command to it.
+        var s = new Scripted().Answer("SELECT nope", F.Error("unknown column: nope"));
+        using var srv = new FakeServer(s.Handle);
+        using var c = Connect(srv);
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT nope";
+        using var batch = c.CreateBatch();
+        batch.BatchCommands.Add("SELECT nope");
+        var calls = new (string What, Func<CancellationToken, Task> Call)[]
+        {
+            ("DbCommand.ExecuteScalarAsync", t => cmd.ExecuteScalarAsync(t)),
+            ("DbCommand.ExecuteNonQueryAsync", t => cmd.ExecuteNonQueryAsync(t)),
+            ("DbCommand.ExecuteReaderAsync", t => cmd.ExecuteReaderAsync(t)),
+            ("DbBatch.ExecuteScalarAsync", t => batch.ExecuteScalarAsync(t)),
+            ("DbBatch.ExecuteNonQueryAsync", t => batch.ExecuteNonQueryAsync(t)),
+            ("DbBatch.ExecuteReaderAsync", t => batch.ExecuteReaderAsync(t)),
+        };
+
+        // Cancelled beforehand: a cancelled task, and nothing was sent.
+        int sent = srv.Requests.Count;
+        var already = new CancellationToken(canceled: true);
+        foreach (var (what, call) in calls)
+        {
+            Task task = AnsweredNotThrown(what, () => call(already));
+            Assert.True(task.IsCanceled, what + ": the task of a cancelled token is not cancelled");
+        }
+        Assert.True(cmd.PrepareAsync(already).IsCanceled);
+        Assert.True(AnsweredNotThrown("DbBatch.PrepareAsync", () => batch.PrepareAsync(already)).IsCanceled);
+        Assert.Equal(sent, srv.Requests.Count);
+
+        // A statement the server refuses: a faulted task carrying its error.
+        foreach (var (what, call) in calls)
+        {
+            Task task = AnsweredNotThrown(what, () => call(CancellationToken.None));
+            Assert.True(task.IsFaulted, what + ": the task of a failed statement is not faulted");
+            Assert.Equal("unknown column: nope", Assert.IsType<SkaidbException>(task.Exception!.InnerException).Message);
+        }
+        Assert.True(c.IsUsable);
+
+        // And a batch that cannot run at all: no connection.
+        using var unbound = new SkaidbBatch();
+        unbound.BatchCommands.Add("SELECT 1");
+        Task none = AnsweredNotThrown("a batch without a connection", () => unbound.ExecuteNonQueryAsync());
+        Assert.IsType<InvalidOperationException>(none.Exception!.InnerException);
+        using var unboundCmd = new SkaidbCommand("SELECT 1");
+        Assert.IsType<InvalidOperationException>(unboundCmd.ExecuteNonQueryAsync().Exception!.InnerException);
+    }
+
+    private static Task AnsweredNotThrown(string what, Func<Task> call)
+    {
+        try
+        {
+            return call();
+        }
+        catch (Exception e)
+        {
+            Assert.Fail($"{what} threw {e.GetType().Name} out of the call instead of answering with its task");
+            throw;
+        }
+    }
+
     // ---- Dapper -------------------------------------------------------------------
 
     public sealed class Person

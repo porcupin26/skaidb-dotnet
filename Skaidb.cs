@@ -3270,7 +3270,8 @@ public sealed class SkaidbBatch : DbBatch
 
     public override void Prepare() { }
 
-    public override Task PrepareAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    public override Task PrepareAsync(CancellationToken cancellationToken = default) =>
+        cancellationToken.IsCancellationRequested ? Task.FromCanceled(cancellationToken) : Task.CompletedTask;
 
     /// <summary>Run every command; the sum of the rows they changed.</summary>
     public override int ExecuteNonQuery()
@@ -3318,22 +3319,34 @@ public sealed class SkaidbBatch : DbBatch
 
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => ExecuteReader(behavior);
 
-    protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult<DbDataReader>(ExecuteReader(behavior));
-    }
+    protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken) =>
+        Answered<DbDataReader>(() => ExecuteReader(behavior), cancellationToken);
 
-    public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(ExecuteNonQuery());
-    }
+    public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken = default) =>
+        Answered(ExecuteNonQuery, cancellationToken);
 
-    public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken = default)
+    public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken = default) =>
+        Answered(ExecuteScalar, cancellationToken);
+
+    /// <summary>
+    /// An Async method's answer, as <see cref="DbCommand"/>'s give theirs:
+    /// always through the task, never thrown out of the call. A token
+    /// cancelled beforehand is a cancelled task and nothing is sent; a
+    /// failure is a faulted task. The statements themselves run
+    /// synchronously, like all of the driver's I/O, so the task is complete
+    /// when it is returned.
+    /// </summary>
+    private static Task<T> Answered<T>(Func<T> run, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(ExecuteScalar());
+        if (cancellationToken.IsCancellationRequested) return Task.FromCanceled<T>(cancellationToken);
+        try
+        {
+            return Task.FromResult(run());
+        }
+        catch (Exception e)
+        {
+            return Task.FromException<T>(e);
+        }
     }
 
     /// <summary>

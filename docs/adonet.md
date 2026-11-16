@@ -178,6 +178,12 @@ the ADO.NET base implementations, which run the synchronous method and
 return a completed task. They are safe to call; they do not free the thread
 during I/O.
 
+A command's and a batch's `…Async` methods answer through the task they
+return and never throw out of the call: a token already cancelled gives a
+cancelled task and nothing is sent, a statement that fails gives a faulted
+one. A token cancelled once the request is out changes nothing — the reply
+is read and returned.
+
 ## Dapper
 
 Dapper works as-is, with `@name` parameters:
