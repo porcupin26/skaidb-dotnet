@@ -569,11 +569,15 @@ public sealed class SkaidbConnection : DbConnection
         }
         catch (SkaidbException)
         {
+            // Not open: the flag went up before the USE, which may be what
+            // failed. (A re-dial puts it back up itself, see EnsureLive.)
+            _open = false;
             CleanupSocket();
             throw;
         }
         catch (Exception e)
         {
+            _open = false;
             CleanupSocket();
             Exception root = e is AggregateException agg && agg.InnerExceptions.Count == 1
                 ? agg.InnerExceptions[0] : e;

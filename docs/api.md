@@ -93,7 +93,9 @@ a second call on an open connection returns at once. Throws
 `authentication denied: …`, `server signature mismatch (mutual auth failed)`,
 `connect failed: …`, `certificate authentication needs TLS with a client
 certificate …` — and `ObjectDisposedException` after `Dispose()`. Raises
-`StateChange` (Closed → Open).
+`StateChange` (Closed → Open). A call that throws leaves the connection
+closed — also when the handshake succeeded and it was the `USE` that the
+server refused — so `Open()` can simply be called again.
 
 ### `CreateCommand()` → `SkaidbCommand`
 

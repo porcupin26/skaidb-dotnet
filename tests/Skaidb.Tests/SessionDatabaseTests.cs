@@ -367,4 +367,28 @@ public class SessionDatabaseTests
         Assert.Equal("database \"app\" does not exist", Assert.Throws<SkaidbException>(() => pool.WithConnection(Rows)).Message);
         Assert.NotEqual(Count, d.Log[^1].Sql);
     }
+
+    // ---- Open() --------------------------------------------------------------------------
+
+    [Fact]
+    public void An_Open_that_fails_at_its_USE_leaves_the_connection_closed()
+    {
+        var d = new Databases { Dropped = "app" };
+        using var srv = new FakeServer(d.Handle);
+        using var c = new SkaidbConnection(Cs(srv, "Database=app"));
+        var states = new List<(ConnectionState, ConnectionState)>();
+        c.StateChange += (_, e) => states.Add((e.OriginalState, e.CurrentState));
+        Assert.Equal("database \"app\" does not exist", Assert.Throws<SkaidbException>(() => c.Open()).Message);
+        Assert.False(c.IsOpen);
+        Assert.Equal(ConnectionState.Closed, c.State);
+        Assert.Empty(states);
+        Assert.Equal("connection is not open", Assert.Throws<SkaidbException>(() => Rows(c)).Message);
+        Assert.Equal(1, srv.Connections);
+        // Closed, so Open() dials again: it is not taken for already open.
+        d.Dropped = null;
+        c.Open();
+        Assert.Equal(2, srv.Connections);
+        Assert.Equal(3L, Rows(c));
+        Assert.Equal(new[] { (ConnectionState.Closed, ConnectionState.Open) }, states);
+    }
 }
