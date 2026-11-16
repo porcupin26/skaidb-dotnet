@@ -4,9 +4,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 
@@ -24,6 +27,8 @@ public sealed class Request
     public string Name = "";
     public string Version = "";
     public byte[] Raw = Array.Empty<byte>();
+    /// <summary>The connection it arrived on.</summary>
+    public FakeConnection? Via;
 }
 
 /// <summary>Server → client payload builders (§3.2).</summary>
@@ -135,17 +140,59 @@ public static class F
 public sealed class FakeConnection
 {
     internal readonly Socket Sock;
+    /// <summary>The TLS session over <see cref="Sock"/>, on a server with a certificate; null on a plain one.</summary>
+    internal SslStream? Tls;
     internal string State = "start";
     internal byte[]? Salted;
     internal byte[]? AuthMessage;
     public string User = "";
+    private long _received;
+    private long _atHalfClose;
 
     internal FakeConnection(Socket s) { Sock = s; }
 
     public void Send(byte[] payload)
     {
         byte[] f = F.Frame(payload);
-        Sock.Send(f);
+        if (Tls is not null) { Tls.Write(f); Tls.Flush(); }
+        else Sock.Send(f);
+    }
+
+    /// <summary>
+    /// Bytes the client has sent on this connection so far (under TLS: the
+    /// decrypted ones, so a closing alert is not counted as a request).
+    /// </summary>
+    public long Received => Interlocked.Read(ref _received);
+
+    internal void Count(int bytes) => Interlocked.Add(ref _received, bytes);
+
+    /// <summary>
+    /// The server has shut down its sending side (<see cref="HalfClose"/>):
+    /// it answers nothing more here, and reads and discards what arrives.
+    /// </summary>
+    public volatile bool HalfClosed;
+
+    /// <summary>Bytes that arrived after the half-close: what a client wrote to a connection it should have known was dead.</summary>
+    public long ReceivedSinceHalfClose => Received - Interlocked.Read(ref _atHalfClose);
+
+    /// <summary>
+    /// Shut down the SENDING side only and keep the socket open, reading:
+    /// what a client on a real network sees of a connection that died while
+    /// it sat idle. Its reads find EOF; its writes still succeed, because
+    /// the reset that would refuse them has not come back yet.
+    /// </summary>
+    public void HalfClose()
+    {
+        Interlocked.Exchange(ref _atHalfClose, Received);
+        HalfClosed = true;
+        Sock.Shutdown(SocketShutdown.Send);
+    }
+
+    /// <summary>Close with a reset (SO_LINGER 0) instead of an orderly end.</summary>
+    public void Reset()
+    {
+        Sock.LingerState = new LingerOption(true, 0);
+        Sock.Close();
     }
 }
 
@@ -164,6 +211,8 @@ public sealed class FakeServer : IDisposable
     public bool CorruptServerSignature;
     /// <summary>Close every new connection before the handshake, as a node at its connection ceiling does.</summary>
     public volatile bool Refuse;
+    /// <summary>When set, every connection is a TLS session with this server certificate.</summary>
+    public X509Certificate2? Certificate;
 
     /// <summary>Every parsed post-handshake request, in order.</summary>
     public readonly List<Request> Requests = new();
@@ -181,6 +230,9 @@ public sealed class FakeServer : IDisposable
 
     private readonly TcpListener _listener;
     private readonly List<Socket> _sockets = new();
+    private readonly List<FakeConnection> _accepted = new();
+    /// <summary>Every connection accepted, in order.</summary>
+    public FakeConnection[] Accepted { get { lock (_gate) return _accepted.ToArray(); } }
     private readonly object _gate = new();
     private volatile bool _stopped;
 
@@ -233,8 +285,45 @@ public sealed class FakeServer : IDisposable
     public void CloseAll(params SkaidbConnection[] seenBy)
     {
         CloseAll();
+        Seen(seenBy);
+    }
+
+    /// <summary>
+    /// <see cref="FakeConnection.HalfClose"/> on every live connection,
+    /// returning once each of <paramref name="seenBy"/> has seen the end of
+    /// its socket's input. The connections stay open and counted.
+    /// </summary>
+    public void HalfCloseAll(params SkaidbConnection[] seenBy)
+    {
+        foreach (var conn in LiveConnections())
+        {
+            if (conn.HalfClosed) continue;                         // already: its count started then
+            try { conn.HalfClose(); } catch { /* its client closed it meanwhile */ }
+        }
+        Seen(seenBy);
+    }
+
+    /// <summary><see cref="FakeConnection.Reset"/> on every live connection, returning once each of <paramref name="seenBy"/> has seen it.</summary>
+    public void ResetAll(params SkaidbConnection[] seenBy)
+    {
+        var live = LiveConnections();
+        lock (_gate) _sockets.Clear();
+        foreach (var conn in live)
+        {
+            try { conn.Reset(); } catch { /* ignore */ }
+        }
+        Seen(seenBy);
+    }
+
+    private List<FakeConnection> LiveConnections()
+    {
+        lock (_gate) return _accepted.FindAll(conn => _sockets.Contains(conn.Sock));
+    }
+
+    private static void Seen(SkaidbConnection[] by)
+    {
         var deadline = DateTime.UtcNow.AddSeconds(10);
-        foreach (var c in seenBy)
+        foreach (var c in by)
         {
             while (c.IsUsable)
             {
@@ -279,15 +368,16 @@ public sealed class FakeServer : IDisposable
         }
     }
 
-    private static bool ReadExact(Socket s, byte[] buf, int n)
+    private static bool ReadExact(FakeConnection conn, Stream io, byte[] buf, int n)
     {
         int got = 0;
         while (got < n)
         {
             int r;
-            try { r = s.Receive(buf, got, n - got, SocketFlags.None); }
+            try { r = io.Read(buf, got, n - got); }
             catch { return false; }
             if (r <= 0) return false;
+            conn.Count(r);
             got += r;
         }
         return true;
@@ -296,16 +386,25 @@ public sealed class FakeServer : IDisposable
     private void Serve(Socket s)
     {
         var conn = new FakeConnection(s);
+        lock (_gate) _accepted.Add(conn);
         bool first = true;
         try
         {
+            Stream io = new NetworkStream(s, ownsSocket: false);
+            if (Certificate is not null)
+            {
+                conn.Tls = new SslStream(io);
+                conn.Tls.AuthenticateAsServer(Certificate);
+                io = conn.Tls;
+            }
             var head = new byte[4];
             while (true)
             {
-                if (!ReadExact(s, head, 4)) return;
+                if (!ReadExact(conn, io, head, 4)) return;
                 int len = (head[0] << 24) | (head[1] << 16) | (head[2] << 8) | head[3];
                 var payload = new byte[len];
-                if (!ReadExact(s, payload, len)) return;
+                if (!ReadExact(conn, io, payload, len)) return;
+                if (conn.HalfClosed) continue;   // read and discarded: nothing is answered here any more
                 if (first)
                 {
                     first = false;
@@ -376,6 +475,7 @@ public sealed class FakeServer : IDisposable
             return;
         }
         var req = Parse(payload);
+        req.Via = conn;
         lock (_gate)
         {
             Requests.Add(req);

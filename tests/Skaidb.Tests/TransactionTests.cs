@@ -25,7 +25,8 @@ namespace Skaidb.Tests;
 /// <see cref="Hold"/> never answers and keeps the socket open. A stream
 /// request (OP_QUERY_STREAM, with or without parameters) is logged the same
 /// way and answered with <see cref="Stream"/>'s frames, by default a header,
-/// two one-row chunks and the end.
+/// two one-row chunks and the end. A batch (OP_EXECUTE_BATCH) is logged once,
+/// by its statement's text, and answered with its row count.
 /// </summary>
 public sealed class Standalone
 {
@@ -63,6 +64,10 @@ public sealed class Standalone
                 case 5:
                 case 9:
                     return Statement(req.Sql, conn, streamed: true);
+                case 7:
+                    _log.Add(_ids[req.Id]);
+                    _sockets.Add(conn);
+                    return new[] { F.Mutation((ulong)req.Rows.Count) };
                 default:
                     return null;   // Hello -> Ddl
             }
