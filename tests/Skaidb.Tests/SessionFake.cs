@@ -91,6 +91,13 @@ public sealed class Sessions
 
     public int Rows(string database) { lock (_gate) return _notes[database].Count; }
 
+    /// <summary>Put committed rows into <c>notes</c> of <paramref name="database"/>.</summary>
+    public Sessions With(string database, params long[] ids)
+    {
+        lock (_gate) foreach (long id in ids) _notes[database].Add(id);
+        return this;
+    }
+
     private static string SkipComments(string sql)
     {
         var kept = new System.Text.StringBuilder();

@@ -400,7 +400,12 @@ option throws `SkaidbException` from the constructor. `maxsize` caps the
 `Acquire()` never blocks. `affinity` scopes `ReadYourWrites` (any object with
 value equality; null = the pool-wide key). `Release()` disposes a connection
 that is broken, belongs to an ejected/not-ready/departed member, was not
-handed out by this pool, or would exceed `maxsize`. `Dispose()` closes the
+handed out by this pool, or would exceed `maxsize`. Before it keeps one, it
+puts the session back into the pool's own — `ROLLBACK` of a transaction
+left open, `USE` of the pool's database (`default` when the connection
+string names none), `SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`,
+each only if the borrower changed it — and disposes the connection if that
+fails ([pooling.md](pooling.md#semantics)). `Dispose()` closes the
 idle connections and stops the background timer that re-probes ejected
 members and refreshes discovery.
 

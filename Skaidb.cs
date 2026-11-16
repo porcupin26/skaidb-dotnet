@@ -462,7 +462,6 @@ public sealed class SkaidbConnection : DbConnection
     /// happens to start in.
     /// </summary>
     private bool _databasePending;
-    internal bool DatabasePending => _databasePending;
 
     private string _database = "";
     /// <summary>
@@ -758,8 +757,79 @@ public sealed class SkaidbConnection : DbConnection
     /// </summary>
     private void EnterDatabase()
     {
-        Query("USE \"" + Database.Replace("\"", "\"\"") + "\"", Consistency);
+        Query(UseStatement(Database), Consistency);
         _databasePending = false;
+    }
+
+    private static string UseStatement(string database) => "USE \"" + database.Replace("\"", "\"\"") + "\"";
+
+    /// <summary>The database a new connection starts in, and the one a session with no database of its own is in.</summary>
+    private const string DefaultDatabase = "default";
+
+    // ---- a pooled connection between two borrowers ----------------------------
+
+    /// <summary>
+    /// Whether the session is in <paramref name="home"/>, a pool's database
+    /// (empty for a pool that names none: the default database).
+    /// </summary>
+    private bool AtHome(string home) =>
+        !_databasePending && (_database == home || (home.Length == 0 && _database == DefaultDatabase));
+
+    /// <summary>
+    /// Whether the last borrower left the session other than a pool hands
+    /// one out: in another database than <paramref name="home"/>, with a
+    /// consistency override or a scan budget set, or with a transaction
+    /// open. Read from what the driver noted; costs nothing.
+    /// </summary>
+    internal bool SessionMoved(string home) =>
+        _transaction || _setConsistency is not null || _setScanBudget is not null || _databasePending
+        || _database != home;
+
+    /// <summary>
+    /// Put the session back as a pool hands one out, sending only what the
+    /// notes say is needed: <c>ROLLBACK</c> for a transaction left open,
+    /// then <c>USE</c> of <paramref name="home"/> (<c>default</c> for a pool
+    /// that names no database), <c>SET SCAN BUDGET DEFAULT</c> and <c>SET
+    /// CONSISTENCY DEFAULT</c>. The notes go with it, so a later re-dial
+    /// restores the pool's session and not that borrower's. False when one
+    /// of them failed (a server before 0.349 refuses <c>SET CONSISTENCY
+    /// DEFAULT</c>; the connection is gone): the caller closes the
+    /// connection instead of pooling it.
+    /// </summary>
+    /// <remarks>
+    /// Sent on the socket as it is, with no look and no re-dial: a
+    /// connection that died is not worth dialing again only to be reset.
+    /// </remarks>
+    internal bool RestoreSession(string home)
+    {
+        try
+        {
+            if (_transaction)
+            {
+                Query("ROLLBACK", Consistency);
+                _transaction = false;
+            }
+            // (A borrower of a pool with no database that sent `USE default`
+            // moved nothing: no statement, only the name is the pool's again.)
+            if (!AtHome(home)) Query(UseStatement(home.Length > 0 ? home : DefaultDatabase), Consistency);
+            _database = home;
+            _databasePending = false;
+            if (_setScanBudget is not null)
+            {
+                Query("SET SCAN BUDGET DEFAULT", Consistency);
+                _setScanBudget = null;
+            }
+            if (_setConsistency is not null)
+            {
+                Query("SET CONSISTENCY DEFAULT", Consistency);
+                _setConsistency = null;
+            }
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static List<string> Shuffled(IReadOnlyList<string> seeds)
@@ -4753,23 +4823,24 @@ public sealed class SkaidbConnectionPool : IDisposable
     /// <summary>
     /// Return a connection. It is disposed instead of kept when it is
     /// broken, its member is ejected, not ready or gone, it is not this
-    /// pool's, or the idle set is full. One its borrower left in another
-    /// database than the connection string's <c>Database</c> is put back
-    /// into that one first (one <c>USE</c>), and disposed if that fails.
+    /// pool's, or the idle set is full. A session its borrower changed is
+    /// put back first into the pool's own — the connection string's
+    /// <c>Database</c> (<c>default</c> when it names none), no consistency
+    /// override, no scan budget, no transaction open — with the statements
+    /// that takes and no more; a connection that cannot be put back is
+    /// disposed.
     /// </summary>
     public void Release(SkaidbConnection c)
     {
-        // The borrower left the connection in another database than the
-        // pool's (USE, ChangeDatabase): the next borrower must not find it
-        // there. One USE puts it back, outside the lock; a connection that
-        // cannot be put back is not kept. A pool whose connection string
-        // names no database has none to put it back into.
+        // A pooled connection reaches each borrower in the pool's session,
+        // not in the one the borrower before it left: another database (USE,
+        // ChangeDatabase), a SET CONSISTENCY, a SET SCAN BUDGET, a BEGIN
+        // without its COMMIT. What the driver noted of those says what to
+        // send, outside the lock; a borrower that changed nothing costs no
+        // round trip. A connection that cannot be put back is not kept.
         bool inPlace = true;
-        if (c.Pool == this && _database.Length > 0 && (c.Database != _database || c.DatabasePending) && c.IsUsable)
-        {
-            try { c.ChangeDatabase(_database); }
-            catch (Exception) { inPlace = false; }
-        }
+        if (c.Pool == this && c.SessionMoved(_database) && c.IsUsable)
+            inPlace = c.RestoreSession(_database);
         lock (_gate)
         {
             Member? m = null;

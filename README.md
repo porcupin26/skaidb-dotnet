@@ -557,7 +557,17 @@ checked out: a burst opens extras and the surplus is disposed on release.
 one the server closed meanwhile; `Release()` disposes a broken connection
 instead of pooling it. Pooled connections inherit TLS and the session
 database from the connection string, whose seeds are the pool's starting
-members. Do not return a `Stream()` enumerable out of `WithConnection`: it
+members.
+
+Every borrower gets the pool's own session: the connection string's
+`Database` (`default` when it names none), no consistency override, no scan
+budget, no transaction open. What a borrower did to its session — `USE`,
+`SET CONSISTENCY`, `SET SCAN BUDGET`, a `BEGIN` it did not end — lasts for
+its checkout: `Release()` puts the session back (`ROLLBACK`, `USE`, `SET
+SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`, only the ones needed), or
+disposes the connection when it cannot.
+
+Do not return a `Stream()` enumerable out of `WithConnection`: it
 is lazy, and the connection would go back to the pool before the first row
 is read. `pool.Transaction(body)` runs a [transaction](#transactions) on one
 checked-out connection.

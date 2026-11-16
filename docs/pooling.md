@@ -50,7 +50,8 @@ void Dispose();
 ```
 
 Every connection is built from the connection string, so pooled connections
-inherit TLS, the session database, the timeout and the default consistency.
+inherit TLS, the session database, the timeout and the default consistency,
+and every checkout starts in that session (see [Semantics](#semantics)).
 Its `Host`/`Seeds` entries are the pool's starting members (the seeds). A
 pooled connection that loses its transport re-dials in the pool's order:
 usable members first, the one it lost last.
@@ -171,15 +172,22 @@ warnings. The rules are the same in every skaidb driver
   undisposed, is therefore never handed to another caller. A connection the
   pool did not hand out is disposed. Disposing a checked-out connection
   instead of releasing it is safe: it stops counting against its member.
-- A borrower that changes the database of its connection (`USE other`,
-  `ChangeDatabase()`) changes it for that checkout only when the pool's
-  connection string names a `Database`: `Release()` sends `USE` for the
-  pool's database before the connection goes back, so the next borrower
-  finds it there, and disposes the connection if that fails. A pool whose
-  connection string names no database has none to put a connection back
-  into: there a borrower's `USE` stays on the connection for whoever gets
-  it next, so either give the pool a `Database` or select one on every
-  checkout.
+- **Every borrower gets the pool's own session**, whatever the borrower
+  before it did: the database of the pool's connection string (`default`,
+  the one a new connection starts in, when it names none), no consistency
+  override, no scan budget, no transaction open. A borrower's `USE` or
+  `ChangeDatabase()`, its `SET CONSISTENCY …`, its `SET SCAN BUDGET …` and a
+  `BEGIN` it never ended hold for that checkout only. `Release()` puts the
+  session back from what the driver noted of those statements, sending
+  only what is needed, in this order: `ROLLBACK`, `USE` of the pool's
+  database, `SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`. A
+  borrower that changed nothing costs no round trip. If one of them fails
+  — a server before 0.349 refuses `SET CONSISTENCY DEFAULT`, the pool's
+  database was dropped — the connection is disposed instead of kept, and
+  the next borrower gets a new one. While a borrower holds a connection
+  its session is its own: a re-dial in its hands restores what it set.
+  To keep a database or a setting across checkouts, put the database in
+  the connection string and make the setting on each checkout.
 - `WithConnection()` is `Acquire()` + the callback + `Release()` in a
   `finally`. Do not let a lazy `Stream()` enumerable escape the callback.
 - `Transaction()` is `WithConnection()` around
